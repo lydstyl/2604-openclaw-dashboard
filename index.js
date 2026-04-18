@@ -286,6 +286,7 @@ app.get('/', async (req, res) => {
     <div class="row"><span class="label">Total acheté</span><span class="val">${credits.total} $</span></div>
     <div class="row"><span class="label">Consommé</span><span class="val">${credits.used} $</span></div>
     ${tag(parseFloat(credits.balance) > 2, parseFloat(credits.balance) > 0.5, '✓ OK', '⚠ Faible', '✕ Critique')}
+    <div style="margin-top:0.75rem"><a href="https://openrouter.ai/settings/credits" target="_blank" style="color:#60a5fa;font-size:0.8rem">↗ Ajouter du crédit</a></div>
     ` : `<p class="error-note">Erreur API : ${credits.error}</p>`}
   </div>
 
@@ -345,7 +346,7 @@ app.get('/', async (req, res) => {
 
 <!-- Chart Section -->
 <div class="chart-section">
-  <div class="card-header"><span class="icon">📈</span><span class="card-title">Évolution des crédits (7 jours)</span></div>
+  <div class="card-header"><span class="icon">📈</span><span class="card-title">Évolution des crédits (30 jours)</span></div>
   <div id="chart-container" class="chart-container">
     <div id="chart-placeholder" class="chart-placeholder">Collecte de données en cours...</div>
     <canvas id="creditsChart"></canvas>
@@ -368,11 +369,11 @@ app.get('/', async (req, res) => {
       placeholder.style.display = 'none';
 
       // Filtrer les 7 derniers jours
-      const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
       const filtered = data.filter(d => new Date(d.timestamp).getTime() >= cutoff);
 
       if (filtered.length < 2) {
-        placeholder.textContent = 'Pas assez de données sur 7 jours...';
+        placeholder.textContent = 'Pas assez de données sur 30 jours...';
         return;
       }
 
@@ -450,7 +451,7 @@ app.get('/', async (req, res) => {
 
   <!-- DELEGATION STRATEGY -->
   <div class="chart-section" style="margin-top:1.25rem">
-    <div class="card-header"><span class="icon">🎯</span><span class="card-title">Stratégie de délégation — 7 niveaux</span></div>
+    <div class="card-header"><span class="icon">🎯</span><span class="card-title">Stratégie de délégation — 8 niveaux</span></div>
     <p style="color:#555;font-size:0.8rem;margin-bottom:1rem">Pour parler directement à un modèle dans Discord : <code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model &lt;alias&gt;</code></p>
     <table style="width:100%;border-collapse:collapse;font-size:0.8rem">
       <thead>
@@ -464,6 +465,14 @@ app.get('/', async (req, res) => {
         </tr>
       </thead>
       <tbody>
+        <tr style="border-bottom:1px solid #1a1a1a;background:#0d1a0d">
+          <td style="padding:0.5rem 0.75rem;color:#4ade80;font-weight:700">0</td>
+          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">Gemini 3 Flash</td>
+          <td style="padding:0.5rem 0.75rem;color:#888">Défaut : résumés, dreaming, compaction, batch</td>
+          <td style="padding:0.5rem 0.75rem;color:#4ade80;font-weight:600">0$</td>
+          <td style="padding:0.5rem 0.75rem;color:#4ade80;font-weight:600">gratuit</td>
+          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model gemini-flash</code></td>
+        </tr>
         <tr style="border-bottom:1px solid #1a1a1a">
           <td style="padding:0.5rem 0.75rem;color:#4ade80;font-weight:700">1</td>
           <td style="padding:0.5rem 0.75rem;color:#e0e0e0">Gemma 4 26B A4B</td>

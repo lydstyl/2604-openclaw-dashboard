@@ -301,15 +301,6 @@ app.get('/', async (req, res) => {
     ${tag(parseFloat(sys.cpuPct) < 50, parseFloat(sys.cpuPct) < 80, '✓ Normal', '⚠ Élevé', '✕ Critique')}
   </div>
 
-  <!-- OLLAMA CLOUD -->
-  <div class="card">
-    <div class="card-header"><span class="icon">🦙</span><span class="card-title">Ollama Cloud</span></div>
-    <div class="big-value" style="color:#a78bfa">${ollama.plan}<span> plan</span></div>
-    <hr class="divider">
-    <a href="https://ollama.com/settings" target="_blank" style="color:#60a5fa;font-size:0.8rem">↗ Voir l'usage sur ollama.com</a>
-    ${!ollama.ok ? `<p class="error-note">Erreur API : ${ollama.error}</p>` : ''}
-  </div>
-
   <!-- RAM -->
   <div class="card">
     <div class="card-header"><span class="icon">🧠</span><span class="card-title">Mémoire RAM</span></div>
@@ -340,6 +331,15 @@ app.get('/', async (req, res) => {
     <div class="row"><span class="label">Capacité totale</span><span class="val">${disk.total} GB</span></div>
     <div class="row"><span class="label">Utilisation</span><span class="val">${disk.usedPct}%</span></div>
     ${tag(parseFloat(disk.usedPct) < 60, parseFloat(disk.usedPct) < 85, '✓ OK', '⚠ Rempli', '✕ Critique')}
+  </div>
+
+  <!-- OLLAMA CLOUD -->
+  <div class="card">
+    <div class="card-header"><span class="icon">🦙</span><span class="card-title">Ollama Cloud</span></div>
+    <div class="big-value" style="color:#a78bfa">${ollama.plan}<span> plan</span></div>
+    <hr class="divider">
+    <a href="https://ollama.com/settings" target="_blank" style="color:#60a5fa;font-size:0.8rem">↗ Voir l'usage sur ollama.com</a>
+    ${!ollama.ok ? `<p class="error-note">Erreur API : ${ollama.error}</p>` : ''}
   </div>
 
 </div>

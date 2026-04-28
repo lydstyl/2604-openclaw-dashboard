@@ -47,7 +47,7 @@ function purgeOldEntries(entries) {
   return entries.filter(e => new Date(e.timestamp).getTime() >= cutoff);
 }
 
-function recordCreditBalance(balance) {
+function recordCreditBalance(allCredits) {
   const entries = purgeOldEntries(loadHistory());
   const now = Date.now();
   // Vérifier qu'il n'y a pas déjà un point récent (moins de 4h)
@@ -57,21 +57,26 @@ function recordCreditBalance(balance) {
       return; // doublon trop récent
     }
   }
+  const total = parseFloat(allCredits.total || '0');
+  const orBal = allCredits.or && allCredits.or.ok ? parseFloat(allCredits.or.balance) : null;
+  const kimiBal = allCredits.kimi && allCredits.kimi.ok ? parseFloat(allCredits.kimi.balance) : null;
+  const dsBal = allCredits.deepseek && allCredits.deepseek.ok ? parseFloat(allCredits.deepseek.balance) : null;
   entries.push({
     timestamp: new Date().toISOString(),
-    balance: parseFloat(balance)
+    total: total,
+    balances: { or: orBal, kimi: kimiBal, deepseek: dsBal }
   });
   saveHistory(entries);
-  console.log(`[credits-history] point enregistré: ${balance}$ (${entries.length} points)`);
+  console.log(`[credits-history] point enregistré: total=${total}$ (${entries.length} pts)`);
 }
 
 async function collectCreditsPeriodically() {
   try {
-    const credits = await getCredits();
-    if (credits.ok && credits.balance !== '—') {
-      recordCreditBalance(credits.balance);
+    const credits = await getAllCredits();
+    if (credits.ok) {
+      recordCreditBalance(credits);
     } else {
-      console.log(`[credits-history] API échec, point non enregistré: ${credits.error || 'ok=false'}`);
+      console.log(`[credits-history] collecte échouée, point non enregistré`);
     }
   } catch (e) {
     console.error('[credits-history] erreur collecte:', e.message);
@@ -111,6 +116,46 @@ async function getCredits() {
   } catch (e) {
     return { balance: '—', total: '—', used: '—', ok: false, error: e.message };
   }
+}
+
+async function getKimiCredits() {
+  try {
+    const r = await axios.get('https://api.moonshot.cn/v1/users/me/balance', {
+      headers: { Authorization: `Bearer ${KIMI_API_KEY}` },
+      timeout: 5000,
+    });
+    const cash = parseFloat(r.data.data?.cash_balance || 0);
+    const voucher = parseFloat(r.data.data?.voucher_balance || 0);
+    return { balance: (cash + voucher).toFixed(2), ok: true };
+  } catch (e) {
+    return { balance: '—', ok: false, error: e.message };
+  }
+}
+
+async function getDeepSeekCredits() {
+  try {
+    const r = await axios.get('https://api.deepseek.com/user/balance', {
+      headers: { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+      timeout: 5000,
+    });
+    const bal = parseFloat(r.data.balance_infos?.[0]?.total_balance || r.data.balance || 0);
+    return { balance: bal.toFixed(2), ok: true };
+  } catch (e) {
+    return { balance: '—', ok: false, error: e.message };
+  }
+}
+
+async function getAllCredits() {
+  const [or, kimi, deepseek] = await Promise.all([getCredits(), getKimiCredits(), getDeepSeekCredits()]);
+  let total = 0;
+  if (or.ok && or.balance !== '—') total += parseFloat(or.balance);
+  if (kimi.ok && kimi.balance !== '—') total += parseFloat(kimi.balance);
+  if (deepseek.ok && deepseek.balance !== '—') total += parseFloat(deepseek.balance);
+  return {
+    or, kimi, deepseek,
+    total: total.toFixed(2),
+    ok: or.ok || kimi.ok || deepseek.ok
+  };
 }
 
 // ─── Disk ──────────────────────────────────────────────────────────────────
@@ -226,150 +271,18 @@ app.get('/api/delegation-stats', (req, res) => {
 
 // Main dashboard
 app.get('/', async (req, res) => {
-  const [credits, sys, ollama] = await Promise.all([getCredits(), Promise.resolve(getSystem()), getOllamaUsage()]);
+  const [credits, sys, ollama] = await Promise.all([getAllCredits(), Promise.resolve(getSystem()), getOllamaUsage()]);
   const mem = sys.mem;
   const disk = getDisk();
   const cc  = cpuColor(parseFloat(sys.cpuPct));
   const rc  = ramColor(parseFloat(mem.appsPct));
   const dc  = diskColor(parseFloat(disk.usedPct));
-  const kc  = creditColor(credits.balance);
+  const kc  = creditColor(credits.total);
   const ts  = new Date().toLocaleTimeString('fr-FR');
   const cachePct = ((parseFloat(mem.cache) / parseFloat(mem.total)) * 100).toFixed(1);
 
   // ─── Delegation Tracker (server-rendered) ────────────────────────────
   let delegationHtml = '';
-  try {
-    const statsFile = path.join(__dirname, 'data', 'delegation-stats.json');
-    if (fs.existsSync(statsFile)) {
-      const delData = JSON.parse(fs.readFileSync(statsFile, 'utf8'));
-      const ds = delData.summary;
-      const fmt$ = v => v < 0.01 ? '$' + v.toFixed(4) : '$' + v.toFixed(2);
-      const fmtK = v => v >= 1000 ? (v/1000).toFixed(1) + 'K' : v;
-      const levelColors = {0:'#4ade80','0.5':'#4ade80',1:'#4ade80',2:'#86efac',3:'#facc15',4:'#fbbf24',5:'#fb923c',6:'#f97316',7:'#60a5fa',8:'#818cf8',9:'#f87171'};
-
-      // Summary cards
-      const summaryCards = [
-        { icon: '💰', label: 'Coût total', value: fmt$(ds.totalCost), color: '#4ade80' },
-        { icon: '📞', label: 'Appels total', value: ds.totalCalls, color: '#60a5fa' },
-        { icon: '⚡', label: '24h coût', value: fmt$(ds.last24hCost), color: '#facc15' },
-        { icon: '🔄', label: '24h appels', value: ds.last24hCalls, color: '#a78bfa' },
-        { icon: '📥', label: 'Tokens in', value: fmtK(ds.totalTokensIn), color: '#888' },
-        { icon: '📤', label: 'Tokens out', value: fmtK(ds.totalTokensOut), color: '#888' },
-        { icon: '❌', label: 'Erreurs', value: ds.errors, color: ds.errors > 0 ? '#f87171' : '#4ade80' },
-      ].map(c => '<div style="background:#161616;border:1px solid #1e1e1e;border-radius:8px;padding:0.75rem 1rem;text-align:center">' +
-        '<div style="font-size:1.2rem">' + c.icon + '</div>' +
-        '<div style="font-size:1.4rem;font-weight:700;color:' + c.color + ';margin:0.25rem 0">' + c.value + '</div>' +
-        '<div style="font-size:0.7rem;color:#555;text-transform:uppercase">' + c.label + '</div>' +
-      '</div>').join('');
-
-      // Model table rows
-      const modelRows = (delData.byModel || []).map(m => {
-        const pct = ds.totalCost > 0 ? ((m.cost / ds.totalCost) * 100).toFixed(1) : '0';
-        const lc = levelColors[m.level] || '#888';
-        const errColor = m.errors > 0 ? '#f87171' : '#4ade80';
-        return '<tr style="border-bottom:1px solid #1a1a1a">' +
-          '<td style="padding:0.5rem 0.75rem;color:' + lc + ';font-weight:700">' + m.level + '</td>' +
-          '<td style="padding:0.5rem 0.75rem;color:#e0e0e0">' + m.name + '</td>' +
-          '<td style="padding:0.5rem 0.75rem;text-align:right;color:#aaa">' + m.calls + '</td>' +
-          '<td style="padding:0.5rem 0.75rem;text-align:right;color:#aaa">' + fmtK(m.tokensIn) + '</td>' +
-          '<td style="padding:0.5rem 0.75rem;text-align:right;color:#aaa">' + fmtK(m.tokensOut) + '</td>' +
-          '<td style="padding:0.5rem 0.75rem;text-align:right;color:' + lc + ';font-weight:600">' + fmt$(m.cost) + '</td>' +
-          '<td style="padding:0.5rem 0.75rem;text-align:right;color:#555">' + pct + '%</td>' +
-          '<td style="padding:0.5rem 0.75rem;text-align:right;color:' + errColor + '">' + m.errors + '</td>' +
-        '</tr>';
-      }).join('');
-
-      // Recent calls table rows
-      const recentRows = ((delData.recentRecords || []).slice(-30).reverse()).map(r => {
-        const info = (delData.byModel || []).find(m => m.model === r.model);
-        const mName = info ? info.name : r.model;
-        const shortTime = r.timestamp ? r.timestamp.slice(11, 16) : '?';
-        const statusIcon = r.stopReason === 'error' ? '❌' : r.stopReason === 'length' ? '⚠️' : '✅';
-        return '<tr style="border-bottom:1px solid #1a1a1a">' +
-          '<td style="padding:0.4rem 0.5rem;color:#555">' + shortTime + '</td>' +
-          '<td style="padding:0.4rem 0.5rem;color:#888">' + r.agent + '</td>' +
-          '<td style="padding:0.4rem 0.5rem;color:#aaa">' + mName + '</td>' +
-          '<td style="padding:0.4rem 0.5rem;text-align:right;color:#555">' + fmtK(r.totalTokens) + '</td>' +
-          '<td style="padding:0.4rem 0.5rem;text-align:right;color:#aaa">' + fmt$(r.costTotal) + '</td>' +
-          '<td style="padding:0.4rem 0.5rem;text-align:center">' + statusIcon + '</td>' +
-        '</tr>';
-      }).join('');
-
-      // Optimization suggestions
-      const suggestions = [];
-      const glmModel = (delData.byModel || []).find(m => m.model === 'z-ai/glm-5.1');
-      if (glmModel && ds.totalCost > 0) {
-        const glmPct = (glmModel.cost / ds.totalCost) * 100;
-        if (glmPct > 80 && glmModel.calls > 50) {
-          suggestions.push({ icon: '⚠️', text: 'GLM-5.1 représente ' + glmPct.toFixed(0) + '% du coût (' + glmModel.calls + ' appels). Beaucoup de tâches pourraient être déléguées aux niveaux 0-2 (Gemini Flash, Gemma) pour diviser le coût par 5-10.', severity: 'high' });
-        }
-      }
-      (delData.byModel || []).filter(m => m.errors > 0).forEach(em => {
-        suggestions.push({ icon: '🔴', text: em.name + ' a ' + em.errors + ' erreur(s) sur ' + em.calls + ' appels (' + ((em.errors/em.calls)*100).toFixed(0) + '%). Vérifier le routing.', severity: 'medium' });
-      });
-      const expensiveRecent = (delData.recentRecords || []).filter(r => r.costTotal > 0.1);
-      if (expensiveRecent.length > 0) {
-        suggestions.push({ icon: '💸', text: expensiveRecent.length + ' appel(s) >$0.10 ces dernières 24h. Vérifier si des tâches simples utilisent un modèle trop cher.', severity: 'medium' });
-      }
-      if (suggestions.length === 0) {
-        suggestions.push({ icon: '✅', text: 'Aucune optimisation urgente détectée. Le routing semble efficace.', severity: 'ok' });
-      }
-      const sevColors = { high: '#f87171', medium: '#facc15', low: '#60a5fa', ok: '#4ade80' };
-      const suggestionHtml = suggestions.map(sug =>
-        '<div style="background:#161616;border-left:3px solid ' + sevColors[sug.severity] + ';padding:0.75rem 1rem;margin-bottom:0.5rem;border-radius:0 8px 8px 0;font-size:0.85rem;color:#aaa">' +
-          '<span style="margin-right:0.5rem">' + sug.icon + '</span>' + sug.text +
-        '</div>'
-      ).join('');
-
-      delegationHtml =
-        '<div class="chart-section" style="margin-top:1.25rem">' +
-          '<div class="card-header"><span class="icon">📊</span><span class="card-title">Orchestration LLM — Tracker</span></div>' +
-          '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0.75rem;margin-bottom:1.25rem">' + summaryCards + '</div>' +
-        '</div>' +
-        '<div class="chart-section" style="margin-top:1rem">' +
-          '<div class="card-header"><span class="icon">🤖</span><span class="card-title">Coût par modèle</span></div>' +
-          '<table style="width:100%;border-collapse:collapse;font-size:0.8rem">' +
-            '<thead><tr style="border-bottom:1px solid #222">' +
-              '<th style="text-align:left;padding:0.5rem 0.75rem;color:#666;font-weight:600">Niv</th>' +
-              '<th style="text-align:left;padding:0.5rem 0.75rem;color:#666;font-weight:600">Modèle</th>' +
-              '<th style="text-align:right;padding:0.5rem 0.75rem;color:#666;font-weight:600">Appels</th>' +
-              '<th style="text-align:right;padding:0.5rem 0.75rem;color:#666;font-weight:600">Tokens In</th>' +
-              '<th style="text-align:right;padding:0.5rem 0.75rem;color:#666;font-weight:600">Tokens Out</th>' +
-              '<th style="text-align:right;padding:0.5rem 0.75rem;color:#666;font-weight:600">Coût</th>' +
-              '<th style="text-align:right;padding:0.5rem 0.75rem;color:#666;font-weight:600">% coût</th>' +
-              '<th style="text-align:right;padding:0.5rem 0.75rem;color:#666;font-weight:600">Erreurs</th>' +
-            '</tr></thead>' +
-            '<tbody>' + modelRows + '</tbody>' +
-          '</table>' +
-          '<div style="position:relative;height:300px;width:100%;margin-top:1rem"><canvas id="modelCostChart"></canvas></div>' +
-        '</div>' +
-        '<div class="chart-section" style="margin-top:1rem">' +
-          '<div class="card-header"><span class="icon">📈</span><span class="card-title">Coût quotidien (7 derniers jours)</span></div>' +
-          '<div style="position:relative;height:250px;width:100%"><canvas id="dailyCostChart"></canvas></div>' +
-        '</div>' +
-        '<div class="chart-section" style="margin-top:1rem">' +
-          '<div class="card-header"><span class="icon">🔍</span><span class="card-title">Derniers appels (24h)</span></div>' +
-          '<table style="width:100%;border-collapse:collapse;font-size:0.75rem">' +
-            '<thead><tr style="border-bottom:1px solid #222">' +
-              '<th style="text-align:left;padding:0.4rem 0.5rem;color:#666;font-weight:600">Heure</th>' +
-              '<th style="text-align:left;padding:0.4rem 0.5rem;color:#666;font-weight:600">Agent</th>' +
-              '<th style="text-align:left;padding:0.4rem 0.5rem;color:#666;font-weight:600">Modèle</th>' +
-              '<th style="text-align:right;padding:0.4rem 0.5rem;color:#666;font-weight:600">Tokens</th>' +
-              '<th style="text-align:right;padding:0.4rem 0.5rem;color:#666;font-weight:600">Coût</th>' +
-              '<th style="text-align:center;padding:0.4rem 0.5rem;color:#666;font-weight:600">Status</th>' +
-            '</tr></thead>' +
-            '<tbody>' + recentRows + '</tbody>' +
-          '</table>' +
-        '</div>' +
-        '<div class="chart-section" style="margin-top:1rem">' +
-          '<div class="card-header"><span class="icon">💡</span><span class="card-title">Suggestions d\'optimisation</span></div>' +
-          suggestionHtml +
-        '</div>';
-    }
-  } catch(e) {
-    console.error('[delegation-tracker] error:', e.message);
-    delegationHtml = '<div class="chart-section" style="margin-top:1.25rem"><div class="card-header"><span class="icon">📊</span><span class="card-title">Orchestration LLM — Tracker</span></div><p style="color:#f87171;font-size:0.85rem">Erreur de chargement: ' + e.message + '</p></div>';
-  }
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.end(`<!DOCTYPE html>
@@ -430,15 +343,12 @@ app.get('/', async (req, res) => {
 
   <!-- CREDITS -->
   <div class="card">
-    <div class="card-header"><span class="icon">💳</span><span class="card-title">Crédits OpenRouter</span></div>
-    <div class="big-value" style="color:${kc}">${credits.balance}<span>$</span></div>
-    ${credits.ok ? `
+    <div class="card-header"><span class="icon">💳</span><span class="card-title">Crédits — Tous providers</span></div>
+    <div class="big-value" style="color:${kc}">${credits.total}<span>$</span></div>
     <hr class="divider">
-    <div class="row"><span class="label">Total acheté</span><span class="val">${credits.total} $</span></div>
-    <div class="row"><span class="label">Consommé</span><span class="val">${credits.used} $</span></div>
-    ${tag(parseFloat(credits.balance) > 2, parseFloat(credits.balance) > 0.5, '✓ OK', '⚠ Faible', '✕ Critique')}
-    <div style="margin-top:0.75rem"><a href="https://openrouter.ai/settings/credits" target="_blank" style="color:#60a5fa;font-size:0.8rem">↗ Ajouter du crédit</a></div>
-    ` : `<p class="error-note">Erreur API : ${credits.error}</p>`}
+    <div class="row"><span class="label">OpenRouter</span><span class="val" style="color:${credits.or && credits.or.ok ? '#60a5fa' : '#888'}">${credits.or && credits.or.ok ? credits.or.balance + ' $' : '—'}</span></div>
+    <div class="row"><span class="label">Kimi</span><span class="val" style="color:${credits.kimi && credits.kimi.ok ? '#a78bfa' : '#888'}">${credits.kimi && credits.kimi.ok ? credits.kimi.balance + ' $' : '—'}</span></div>
+    <div class="row"><span class="label">DeepSeek</span><span class="val" style="color:${credits.deepseek && credits.deepseek.ok ? '#4ade80' : '#888'}">${credits.deepseek && credits.deepseek.ok ? credits.deepseek.balance + ' $' : '—'}</span></div>
   </div>
 
   <!-- CPU -->
@@ -532,7 +442,7 @@ app.get('/', async (req, res) => {
         const dt = new Date(d.timestamp);
         return dt.toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit' });
       });
-      const values = filtered.map(d => d.balance);
+      const values = filtered.map(d => { const v = d.total !== undefined ? d.total : d.balance; return (typeof v === 'number') ? v : parseFloat(v || 0); });
 
       const ctx = document.getElementById('creditsChart').getContext('2d');
       const gradient = ctx.createLinearGradient(0, 0, 0, 250);
@@ -600,176 +510,10 @@ app.get('/', async (req, res) => {
 })();
 </script>
 
-  <!-- DELEGATION STRATEGY -->
-  <div class="chart-section" style="margin-top:1.25rem">
-    <div class="card-header"><span class="icon">🎯</span><span class="card-title">Stratégie de délégation — 8 niveaux</span></div>
-    <p style="color:#555;font-size:0.8rem;margin-bottom:1rem">Pour parler directement à un modèle dans Discord : <code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model &lt;alias&gt;</code></p>
-    <table style="width:100%;border-collapse:collapse;font-size:0.8rem">
-      <thead>
-        <tr style="border-bottom:1px solid #222">
-          <th style="text-align:left;padding:0.5rem 0.75rem;color:#666;font-weight:600">Niv</th>
-          <th style="text-align:left;padding:0.5rem 0.75rem;color:#666;font-weight:600">Modèle</th>
-          <th style="text-align:left;padding:0.5rem 0.75rem;color:#666;font-weight:600">Rôle</th>
-          <th style="text-align:left;padding:0.5rem 0.75rem;color:#666;font-weight:600">Prix $/1M</th>
-          <th style="text-align:left;padding:0.5rem 0.75rem;color:#666;font-weight:600">% Claude</th>
-          <th style="text-align:left;padding:0.5rem 0.75rem;color:#666;font-weight:600">Commande Discord</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr style="border-bottom:1px solid #1a1a1a;background:#0d1a0d">
-          <td style="padding:0.5rem 0.75rem;color:#4ade80;font-weight:700">0</td>
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">Gemini 3 Flash</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Défaut : résumés, dreaming, compaction, batch</td>
-          <td style="padding:0.5rem 0.75rem;color:#4ade80;font-weight:600">0$</td>
-          <td style="padding:0.5rem 0.75rem;color:#4ade80;font-weight:600">gratuit</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model gemini-flash</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#4ade80;font-weight:700">1</td>
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">Gemma 4 26B A4B</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Résumés, traductions, formatage, batch</td>
-          <td style="padding:0.5rem 0.75rem;color:#aaa">0.20$</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">2.6%</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model gemma26b</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#4ade80;font-weight:700">2</td>
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">Gemma 4 31B</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Code simple, images, analyse basique</td>
-          <td style="padding:0.5rem 0.75rem;color:#aaa">0.23$</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">2.9%</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model gemma31b</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#facc15;font-weight:700">3</td>
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">DeepSeek V3.2</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Code intermédiaire + reasoning + tools</td>
-          <td style="padding:0.5rem 0.75rem;color:#aaa">0.32$</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">4.1%</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model deepseek</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#facc15;font-weight:700">4</td>
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">KAT-Coder-Pro V2</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Code complexe, refactoring, intégration</td>
-          <td style="padding:0.5rem 0.75rem;color:#aaa">0.66$</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">8.5%</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model katcoder</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#facc15;font-weight:700">5</td>
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">MiniMax M2.7</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Analyse data, tâches intermédiaires</td>
-          <td style="padding:0.5rem 0.75rem;color:#aaa">0.66$</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">8.5%</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model minimax</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#facc15;font-weight:700">6</td>
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">Kimi K2.5</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Finance, immobilier, raisonnement</td>
-          <td style="padding:0.5rem 0.75rem;color:#aaa">0.92$</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">11.8%</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model kimi</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a;background:#141414">
-          <td style="padding:0.5rem 0.75rem;color:#60a5fa;font-weight:700">7</td>
-          <td style="padding:0.5rem 0.75rem;color:#fff;font-weight:600">GLM-5.1 (orchestrateur)</td>
-          <td style="padding:0.5rem 0.75rem;color:#aaa">Orchestration + raisonnement complet</td>
-          <td style="padding:0.5rem 0.75rem;color:#aaa">1.83$</td>
-          <td style="padding:0.5rem 0.75rem;color:#aaa">23.5%</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model glm</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#f87171;font-weight:700">8</td>
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">Kimi K2.6</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Coding long-horizon, multi-agent — buffer avant Claude</td>
-          <td style="padding:0.5rem 0.75rem;color:#facc15">2.28$</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">29.2%</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model kimi-k2.6</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a;background:#1a0a0a">
-          <td style="padding:0.5rem 0.75rem;color:#f87171;font-weight:700">9</td>
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">Claude Sonnet 4.6</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Dernier recours — critique uniquement</td>
-          <td style="padding:0.5rem 0.75rem;color:#aaa">7.80$</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">100%</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model claude</code></td>
-        </tr>
-      </tbody>
-    </table>
-    <div class="note" style="margin-top:1rem">
-      <strong>Escalade progressive :</strong> on commence toujours au niveau le plus bas possible. Si le modèle n'y arrive pas → on monte d'un niveau. Objectif : maximiser l'usage du moins cher.<br>
-      <strong>Exemple :</strong> <code style="color:#aaa">/model gemma26b</code> → tester → si insuffisant → <code style="color:#aaa">/model gemma31b</code> → etc.
-    </div>
-  </div>
-
-  <!-- OFF-STRATEGY MODELS -->
-  <div class="chart-section" style="margin-top:1.25rem">
-    <div class="card-header"><span class="icon">🔧</span><span class="card-title">Modèles hors stratégie — accès manuel uniquement</span></div>
-    <p style="color:#555;font-size:0.8rem;margin-bottom:1rem">Ces modèles sont configurés et disponibles via <code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model &lt;alias&gt;</code> mais ne sont pas dans la cascade de délégation automatique.</p>
-    <table style="width:100%;border-collapse:collapse;font-size:0.8rem">
-      <thead>
-        <tr style="border-bottom:1px solid #222">
-          <th style="text-align:left;padding:0.5rem 0.75rem;color:#666;font-weight:600">Modèle</th>
-          <th style="text-align:left;padding:0.5rem 0.75rem;color:#666;font-weight:600">Spécialité / Raison</th>
-          <th style="text-align:left;padding:0.5rem 0.75rem;color:#666;font-weight:600">Prix $/1M</th>
-          <th style="text-align:left;padding:0.5rem 0.75rem;color:#666;font-weight:600">Commande Discord</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">Step 3.5 Flash</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Fallback rapide 262K ctx — doublon avec Gemma 26B</td>
-          <td style="padding:0.5rem 0.75rem;color:#aaa">0.15$</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model step-flash</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">Gemini 3.1 Pro</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Plus puissant que Flash — usage ponctuel pour tâches complexes</td>
-          <td style="padding:0.5rem 0.75rem;color:#aaa">variable</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model gemini-pro</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">Gemma 31B (free)</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Version gratuite limitée (32K output) — tests rapides</td>
-          <td style="padding:0.5rem 0.75rem;color:#4ade80">0$</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model gemma31b-free</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#e0e0e0">OpenRouter Auto</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Routeur automatique — laisse OpenRouter choisir</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">auto</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model OpenRouter</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#a78bfa">Gemma 4 local (Ollama)</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Local, pas de coût API — privacy-sensitive</td>
-          <td style="padding:0.5rem 0.75rem;color:#4ade80">0$</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model gemma4-local</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#a78bfa">Gemma 4 e2b (Ollama)</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Local e2b sandbox — code safe</td>
-          <td style="padding:0.5rem 0.75rem;color:#4ade80">0$</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model gemma4-e2b</code></td>
-        </tr>
-        <tr style="border-bottom:1px solid #1a1a1a">
-          <td style="padding:0.5rem 0.75rem;color:#a78bfa">GLM-5.1 cloud (Ollama)</td>
-          <td style="padding:0.5rem 0.75rem;color:#888">Cloud via Ollama — fallback si OpenRouter KO</td>
-          <td style="padding:0.5rem 0.75rem;color:#4ade80">0$</td>
-          <td style="padding:0.5rem 0.75rem"><code style="background:#1a1a1a;padding:0.15rem 0.4rem;border-radius:4px;color:#aaa">/model glm-cloud</code></td>
-        </tr>
-      </tbody>
-    </table>
-    <div class="note" style="margin-top:1rem">
-      <strong>⚠️ Attention :</strong> Ces modèles ne sont pas dans l'escalade automatique. Utilisez-les manuellement quand vous avez un besoin spécifique (ex: tester Kimi K2.6 sur du code, utiliser un modèle local pour la privacy, etc.).
-    </div>
-  </div>
+ </div>
 
 <footer><a href="http://192.168.3.102:8081">→ Tableau de bord des sites</a></footer>
 
-${delegationHtml}
 
 <script>
 // Delegation tracker charts — loads data via API, no nested template literals

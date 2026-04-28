@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  openclaw-dash:
+    build: .
+    container_name: openclaw-dash
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3015:3015"
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro

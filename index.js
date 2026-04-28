@@ -10,6 +10,8 @@ const app  = express();
 const PORT = 3015;
 const OPENROUTER_KEY = process.env.OPENROUTER_KEY || '';
 const OLLAMA_KEY = process.env.OLLAMA_KEY || '';
+const KIMI_API_KEY = process.env.KIMI_API_KEY || '';
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
 const CPU_COUNT = os.cpus().length;
 const GB = 1048576; // kB → GB
 
@@ -104,7 +106,83 @@ async function getOllamaUsage() {
   }
 }
 
-// ─── OpenRouter Credits ────────────────────────────────────────────────────
+// ─── Model Config (from openclaw.json) ──────────────────────────────────────
+const OPENCLAW_CONFIG_PATH = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+function getModelConfig() {
+  try {
+    const raw = fs.readFileSync(OPENCLAW_CONFIG_PATH, 'utf8');
+    const cfg = JSON.parse(raw);
+    const model = cfg.agents?.defaults?.model || {};
+    const list = cfg.agents?.list || [];
+    const mainAgent = list.find(a => a.id === 'main');
+    return {
+      primary: model.primary || (mainAgent ? mainAgent.model : '—'),
+      fallbacks: model.fallbacks || [],
+      models: cfg.agents?.defaults?.models || {},
+    };
+  } catch (e) {
+    return { primary: '—', fallbacks: [], models: {} };
+  }
+}
+
+function resolveModelName(modelId, models) {
+  // Normaliser: enlever le préfixe de provider si présent pour chercher
+  const alias = models[modelId]?.alias;
+  if (alias) return `${modelId} → ${alias}`;
+  // Chercher parmi les workers
+  const list = JSON.parse(fs.readFileSync(OPENCLAW_CONFIG_PATH, 'utf8')).agents?.list || [];
+  const worker = list.find(a => a.model === modelId);
+  if (worker) return worker.name || modelId;
+  return modelId;
+}
+
+// ─── Spending calculation ──────────────────────────────────────────────────
+function calcSpending() {
+  try {
+    const entries = loadHistory();
+    const withBalances = entries.filter(e => e.balances && e.balances.or != null);
+    const withOldFormat = entries.filter(e => e.balance != null);
+    
+    // OpenRouter: utiliser l'historique existant (ancien + nouveau format)
+    let or = 0;
+    const orSource = withBalances.length >= 2 ? withBalances
+                  : withOldFormat.length >= 2 ? withOldFormat
+                  : [];
+    if (orSource.length >= 2) {
+      const first = orSource[0].balances?.or ?? orSource[0].balance;
+      const last = orSource[orSource.length - 1].balances?.or ?? orSource[orSource.length - 1].balance;
+      or = Math.max(0, first - last);
+    }
+    
+    // Kimi/DeepSeek: uniquement depuis le nouveau format
+    let kimi = 0, deepseek = 0;
+    if (withBalances.length >= 2) {
+      const fb = withBalances[0].balances;
+      const lb = withBalances[withBalances.length - 1].balances;
+      kimi = Math.max(0, (fb.kimi ?? 0) - (lb.kimi ?? 0));
+      deepseek = Math.max(0, (fb.deepseek ?? 0) - (lb.deepseek ?? 0));
+    }
+    
+    return { or, kimi, deepseek, total: or + kimi + deepseek, orLive: '?' };
+  } catch (e) {
+    return { or: 0, kimi: 0, deepseek: 0, total: 0, orLive: '—' };
+  }
+}
+
+// ─── OpenRouter live usage (from /auth/key) ──────────────────────────────
+async function getLiveUsage() {
+  try {
+    const r = await axios.get('https://openrouter.ai/api/v1/auth/key', {
+      headers: { Authorization: `Bearer ${OPENROUTER_KEY}` },
+      timeout: 5000,
+    });
+    const d = r.data.data;
+    return { usage: d.usage || 0, usageMonthly: d.usage_monthly || 0, ok: true };
+  } catch (e) {
+    return { usage: 0, usageMonthly: 0, ok: false };
+  }
+}
+
 async function getCredits() {
   try {
     const r = await axios.get('https://openrouter.ai/api/v1/credits', {
@@ -120,7 +198,7 @@ async function getCredits() {
 
 async function getKimiCredits() {
   try {
-    const r = await axios.get('https://api.moonshot.cn/v1/users/me/balance', {
+    const r = await axios.get('https://api.moonshot.ai/v1/users/me/balance', {
       headers: { Authorization: `Bearer ${KIMI_API_KEY}` },
       timeout: 5000,
     });
@@ -271,7 +349,9 @@ app.get('/api/delegation-stats', (req, res) => {
 
 // Main dashboard
 app.get('/', async (req, res) => {
-  const [credits, sys, ollama] = await Promise.all([getAllCredits(), Promise.resolve(getSystem()), getOllamaUsage()]);
+  const modelCfg = getModelConfig();
+  const spending = calcSpending();
+  const [credits, sys, ollama, live] = await Promise.all([getAllCredits(), Promise.resolve(getSystem()), getOllamaUsage(), getLiveUsage()]);
   const mem = sys.mem;
   const disk = getDisk();
   const cc  = cpuColor(parseFloat(sys.cpuPct));
@@ -349,6 +429,28 @@ app.get('/', async (req, res) => {
     <div class="row"><span class="label">OpenRouter</span><span class="val" style="color:${credits.or && credits.or.ok ? '#60a5fa' : '#888'}">${credits.or && credits.or.ok ? credits.or.balance + ' $' : '—'}</span></div>
     <div class="row"><span class="label">Kimi</span><span class="val" style="color:${credits.kimi && credits.kimi.ok ? '#a78bfa' : '#888'}">${credits.kimi && credits.kimi.ok ? credits.kimi.balance + ' $' : '—'}</span></div>
     <div class="row"><span class="label">DeepSeek</span><span class="val" style="color:${credits.deepseek && credits.deepseek.ok ? '#4ade80' : '#888'}">${credits.deepseek && credits.deepseek.ok ? credits.deepseek.balance + ' $' : '—'}</span></div>
+  </div>
+
+  <!-- MODÈLE ACTIF -->
+  <div class="card">
+    <div class="card-header"><span class="icon">🤖</span><span class="card-title">Modèle LLM actif</span></div>
+    <div class="big-value" style="font-size:1.1rem;color:#818cf8;word-break:break-all">${modelCfg.primary}</div>
+    ${modelCfg.fallbacks.length > 0 ? `
+    <hr class="divider">
+    <div style="font-size:0.75rem;color:#555;margin-bottom:0.5rem">Fallbacks :</div>
+    ${modelCfg.fallbacks.map((fb, i) => `<div class="row"><span class="val" style="color:#666;font-size:0.75rem">${i + 1}.</span><span class="val" style="color:#999;font-size:0.75rem;text-align:right;word-break:break-all">${fb}</span></div>`).join('')}` : ''}
+  </div>
+
+  <!-- DÉPENSES 30 JOURS -->
+  <div class="card">
+    <div class="card-header"><span class="icon">📊</span><span class="card-title">Dépenses — 30 derniers jours</span></div>
+    <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending.total.toFixed(2)}<span>$</span></div>
+    <hr class="divider">
+    <div class="row"><span class="label">OpenRouter (solde)</span><span class="val" style="color:#60a5fa">${spending.or.toFixed(2)} $</span></div>
+    <div class="row"><span class="label">OpenRouter (total live)</span><span class="val" style="color:#60a5fa">${live.ok ? live.usage.toFixed(2) + ' $' : '—'}</span></div>
+    <div class="row"><span class="label">Kimi</span><span class="val" style="color:#a78bfa">${spending.kimi.toFixed(2)} $</span></div>
+    <div class="row"><span class="label">DeepSeek</span><span class="val" style="color:#4ade80">${spending.deepseek.toFixed(2)} $</span></div>
+    <div class="note">Basé sur la différence de solde entre le 1er et le dernier relevé.</div>
   </div>
 
   <!-- CPU -->

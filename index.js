@@ -240,10 +240,12 @@ async function getAllCredits() {
 function getDisk() {
   try {
     const { execSync } = require('child_process');
-    const output = execSync('df -B1 /', { encoding: 'utf8' });
+    const output = execSync('df -B1 /host', { encoding: 'utf8' });
     const lines = output.trim().split('\n');
     if (lines.length < 2) throw new Error('df output unexpected');
-    const parts = lines[1].split(/\s+/);
+    // Alpine df peut wrapper → joindre toutes les lignes après le header
+    const dataLine = lines.slice(1).join(' ');
+    const parts = dataLine.trim().split(/\s+/);
     const totalBytes  = parseInt(parts[1]);
     const usedBytes   = parseInt(parts[2]);
     const availBytes  = parseInt(parts[3]);
@@ -349,7 +351,6 @@ app.get('/api/delegation-stats', (req, res) => {
 
 // Main dashboard
 app.get('/', async (req, res) => {
-  const modelCfg = getModelConfig();
   const spending = calcSpending();
   const [credits, sys, ollama, live] = await Promise.all([getAllCredits(), Promise.resolve(getSystem()), getOllamaUsage(), getLiveUsage()]);
   const mem = sys.mem;
@@ -429,16 +430,6 @@ app.get('/', async (req, res) => {
     <div class="row"><span class="label">OpenRouter</span><span class="val" style="color:${credits.or && credits.or.ok ? '#60a5fa' : '#888'}">${credits.or && credits.or.ok ? credits.or.balance + ' $' : '—'}</span></div>
     <div class="row"><span class="label">Kimi</span><span class="val" style="color:${credits.kimi && credits.kimi.ok ? '#a78bfa' : '#888'}">${credits.kimi && credits.kimi.ok ? credits.kimi.balance + ' $' : '—'}</span></div>
     <div class="row"><span class="label">DeepSeek</span><span class="val" style="color:${credits.deepseek && credits.deepseek.ok ? '#4ade80' : '#888'}">${credits.deepseek && credits.deepseek.ok ? credits.deepseek.balance + ' $' : '—'}</span></div>
-  </div>
-
-  <!-- MODÈLE ACTIF -->
-  <div class="card">
-    <div class="card-header"><span class="icon">🤖</span><span class="card-title">Modèle LLM actif</span></div>
-    <div class="big-value" style="font-size:1.1rem;color:#818cf8;word-break:break-all">${modelCfg.primary}</div>
-    ${modelCfg.fallbacks.length > 0 ? `
-    <hr class="divider">
-    <div style="font-size:0.75rem;color:#555;margin-bottom:0.5rem">Fallbacks :</div>
-    ${modelCfg.fallbacks.map((fb, i) => `<div class="row"><span class="val" style="color:#666;font-size:0.75rem">${i + 1}.</span><span class="val" style="color:#999;font-size:0.75rem;text-align:right;word-break:break-all">${fb}</span></div>`).join('')}` : ''}
   </div>
 
   <!-- DÉPENSES 30 JOURS -->
@@ -697,4 +688,4 @@ app.get('/', async (req, res) => {
 
 // ─── Start ─────────────────────────────────────────────────────────────────
 startCreditsCollector();
-app.listen(PORT, '127.0.0.1', () => console.log(`openclaw-dash sur le port ${PORT}`));
+app.listen(PORT, () => console.log(`openclaw-dash sur le port ${PORT}`));

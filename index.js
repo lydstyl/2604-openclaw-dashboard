@@ -140,32 +140,72 @@ function resolveModelName(modelId, models) {
 function calcSpending() {
   try {
     const entries = loadHistory();
-    const withBalances = entries.filter(e => e.balances && e.balances.or != null);
-    const withOldFormat = entries.filter(e => e.balance != null);
-    
-    // OpenRouter: utiliser l'historique existant (ancien + nouveau format)
-    let or = 0;
-    const orSource = withBalances.length >= 2 ? withBalances
-                  : withOldFormat.length >= 2 ? withOldFormat
-                  : [];
-    if (orSource.length >= 2) {
-      const first = orSource[0].balances?.or ?? orSource[0].balance;
-      const last = orSource[orSource.length - 1].balances?.or ?? orSource[orSource.length - 1].balance;
-      or = Math.max(0, first - last);
+    const periodMs = 30 * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - periodMs;
+    const recent = entries.filter(e => new Date(e.timestamp).getTime() >= cutoff);
+
+    if (recent.length < 2) return { or: 0, kimi: 0, deepseek: 0, total: 0 };
+
+    // Somme des baisses de solde entre points consécutifs
+    // → les rechargements (hausses) sont ignorés
+    let orSpent = 0, kimiSpent = 0, dsSpent = 0;
+
+    for (let i = 1; i < recent.length; i++) {
+      const prev = recent[i - 1], curr = recent[i];
+
+      // OpenRouter : balance (ancien format) ou balances.or (nouveau)
+      const prevOR = parseFloat(prev.balances?.or ?? prev.balance ?? 0);
+      const currOR = parseFloat(curr.balances?.or ?? curr.balance ?? 0);
+      if (!isNaN(prevOR) && !isNaN(currOR)) orSpent += Math.max(0, prevOR - currOR);
+
+      // Kimi : uniquement nouveau format
+      const prevK = parseFloat(prev.balances?.kimi ?? 0);
+      const currK = parseFloat(curr.balances?.kimi ?? 0);
+      if (!isNaN(prevK) && !isNaN(currK) && (prev.balances?.kimi != null)) kimiSpent += Math.max(0, prevK - currK);
+
+      // DeepSeek : uniquement nouveau format
+      const prevD = parseFloat(prev.balances?.deepseek ?? 0);
+      const currD = parseFloat(curr.balances?.deepseek ?? 0);
+      if (!isNaN(prevD) && !isNaN(currD) && (prev.balances?.deepseek != null)) dsSpent += Math.max(0, prevD - currD);
     }
-    
-    // Kimi/DeepSeek: uniquement depuis le nouveau format
-    let kimi = 0, deepseek = 0;
-    if (withBalances.length >= 2) {
-      const fb = withBalances[0].balances;
-      const lb = withBalances[withBalances.length - 1].balances;
-      kimi = Math.max(0, (fb.kimi ?? 0) - (lb.kimi ?? 0));
-      deepseek = Math.max(0, (fb.deepseek ?? 0) - (lb.deepseek ?? 0));
-    }
-    
-    return { or, kimi, deepseek, total: or + kimi + deepseek, orLive: '?' };
+
+    return { or: orSpent, kimi: kimiSpent, deepseek: dsSpent, total: orSpent + kimiSpent + dsSpent };
   } catch (e) {
-    return { or: 0, kimi: 0, deepseek: 0, total: 0, orLive: '—' };
+    return { or: 0, kimi: 0, deepseek: 0, total: 0 };
+  }
+}
+
+// ─── Spending calculation (last 24 hours) ────────────────────────────────
+function calcSpendingLast24h() {
+  try {
+    const entries = loadHistory();
+    const periodMs = 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - periodMs;
+    const recent = entries.filter(e => new Date(e.timestamp).getTime() >= cutoff);
+
+    if (recent.length < 2) return { or: 0, kimi: 0, deepseek: 0, total: 0 };
+
+    let orSpent = 0, kimiSpent = 0, dsSpent = 0;
+
+    for (let i = 1; i < recent.length; i++) {
+      const prev = recent[i - 1], curr = recent[i];
+
+      const prevOR = parseFloat(prev.balances?.or ?? prev.balance ?? 0);
+      const currOR = parseFloat(curr.balances?.or ?? curr.balance ?? 0);
+      if (!isNaN(prevOR) && !isNaN(currOR)) orSpent += Math.max(0, prevOR - currOR);
+
+      const prevK = parseFloat(prev.balances?.kimi ?? 0);
+      const currK = parseFloat(curr.balances?.kimi ?? 0);
+      if (!isNaN(prevK) && !isNaN(currK) && (prev.balances?.kimi != null)) kimiSpent += Math.max(0, prevK - currK);
+
+      const prevD = parseFloat(prev.balances?.deepseek ?? 0);
+      const currD = parseFloat(curr.balances?.deepseek ?? 0);
+      if (!isNaN(prevD) && !isNaN(currD) && (prev.balances?.deepseek != null)) dsSpent += Math.max(0, prevD - currD);
+    }
+
+    return { or: orSpent, kimi: kimiSpent, deepseek: dsSpent, total: orSpent + kimiSpent + dsSpent };
+  } catch (e) {
+    return { or: 0, kimi: 0, deepseek: 0, total: 0 };
   }
 }
 
@@ -352,6 +392,7 @@ app.get('/api/delegation-stats', (req, res) => {
 // Main dashboard
 app.get('/', async (req, res) => {
   const spending = calcSpending();
+  const spending24h = calcSpendingLast24h();
   const [credits, sys, ollama, live] = await Promise.all([getAllCredits(), Promise.resolve(getSystem()), getOllamaUsage(), getLiveUsage()]);
   const mem = sys.mem;
   const disk = getDisk();
@@ -372,7 +413,7 @@ app.get('/', async (req, res) => {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="30">
-<title>OpenClaw — Dashboard</title>
+<title>Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -414,7 +455,7 @@ app.get('/', async (req, res) => {
 <body>
 <header>
   <div>
-    <h1>OpenClaw Dashboard</h1>
+    <h1>Dashboard</h1>
     <div class="subtitle">192.168.3.102 &nbsp;·&nbsp; uptime ${sys.uptime}</div>
   </div>
   <div class="refresh-info">Auto-refresh 30s &nbsp;·&nbsp; ${ts}</div>
@@ -430,6 +471,7 @@ app.get('/', async (req, res) => {
     <div class="row"><span class="label">OpenRouter</span><span class="val" style="color:${credits.or && credits.or.ok ? '#60a5fa' : '#888'}">${credits.or && credits.or.ok ? credits.or.balance + ' $' : '—'}</span></div>
     <div class="row"><span class="label">Kimi</span><span class="val" style="color:${credits.kimi && credits.kimi.ok ? '#a78bfa' : '#888'}">${credits.kimi && credits.kimi.ok ? credits.kimi.balance + ' $' : '—'}</span></div>
     <div class="row"><span class="label">DeepSeek</span><span class="val" style="color:${credits.deepseek && credits.deepseek.ok ? '#4ade80' : '#888'}">${credits.deepseek && credits.deepseek.ok ? credits.deepseek.balance + ' $' : '—'}</span></div>
+    <a href="https://platform.deepseek.com/top_up" target="_blank" style="color:#4ade80;font-size:0.75rem;display:inline-block;margin-top:0.6rem">↗ Recharger DeepSeek</a>
   </div>
 
   <!-- DÉPENSES 30 JOURS -->
@@ -437,11 +479,22 @@ app.get('/', async (req, res) => {
     <div class="card-header"><span class="icon">📊</span><span class="card-title">Dépenses — 30 derniers jours</span></div>
     <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending.total.toFixed(2)}<span>$</span></div>
     <hr class="divider">
-    <div class="row"><span class="label">OpenRouter (solde)</span><span class="val" style="color:#60a5fa">${spending.or.toFixed(2)} $</span></div>
-    <div class="row"><span class="label">OpenRouter (total live)</span><span class="val" style="color:#60a5fa">${live.ok ? live.usage.toFixed(2) + ' $' : '—'}</span></div>
+    <div class="row"><span class="label">OpenRouter (30j)</span><span class="val" style="color:#60a5fa">${spending.or.toFixed(2)} $</span></div>
+    <div class="row"><span class="label">OpenRouter (ce mois, API)</span><span class="val" style="color:#60a5fa">${live.ok ? live.usageMonthly.toFixed(2) + ' $' : '—'}</span></div>
     <div class="row"><span class="label">Kimi</span><span class="val" style="color:#a78bfa">${spending.kimi.toFixed(2)} $</span></div>
     <div class="row"><span class="label">DeepSeek</span><span class="val" style="color:#4ade80">${spending.deepseek.toFixed(2)} $</span></div>
-    <div class="note">Basé sur la différence de solde entre le 1er et le dernier relevé.</div>
+    <div class="note">Basé sur la somme des baisses de solde. Les rechargements ne sont pas comptés comme dépenses.</div>
+  </div>
+
+  <!-- DÉPENSES 24H -->
+  <div class="card">
+    <div class="card-header"><span class="icon">⏰</span><span class="card-title">Dépenses — 24 dernières heures</span></div>
+    <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending24h.total.toFixed(2)}<span>$</span></div>
+    <hr class="divider">
+    <div class="row"><span class="label">OpenRouter (24h)</span><span class="val" style="color:#60a5fa">${spending24h.or.toFixed(3)} $</span></div>
+    <div class="row"><span class="label">Kimi (24h)</span><span class="val" style="color:#a78bfa">${spending24h.kimi.toFixed(3)} $</span></div>
+    <div class="row"><span class="label">DeepSeek (24h)</span><span class="val" style="color:#4ade80">${spending24h.deepseek.toFixed(3)} $</span></div>
+    <div class="note">Basé sur les relevés de solde ~toutes les 6h.</div>
   </div>
 
   <!-- CPU -->

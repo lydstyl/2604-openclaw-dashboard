@@ -5,6 +5,7 @@ RUN npm install --production
 
 FROM node:22-alpine
 WORKDIR /app
+RUN apk add --no-cache openssh-client
 COPY --from=builder /app/node_modules ./node_modules
 COPY . .
 

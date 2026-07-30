@@ -12,4 +12,8 @@ services:
       - ./data:/app/data
       - ./.env:/app/.env:ro
       - /:/host:ro
-      - ~/.ssh:/root/.ssh:ro
+      - ~/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
+      - ~/.ssh/id_ed25519.pub:/root/.ssh/id_ed25519.pub:ro
+      - ~/.ssh/id_ed25519_marie:/root/.ssh/id_ed25519_marie:ro
+      - ~/.ssh/id_ed25519_marie.pub:/root/.ssh/id_ed25519_marie.pub:ro
+      - ~/.ssh/known_hosts:/root/.ssh/known_hosts:ro

@@ -13,6 +13,7 @@ const OPENROUTER_KEY = process.env.OPENROUTER_KEY || '';
 const OLLAMA_KEY = process.env.OLLAMA_KEY || '';
 const KIMI_API_KEY = process.env.KIMI_API_KEY || '';
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
+const HA_TOKEN = process.env.HA_TOKEN || '';
 const CPU_COUNT = os.cpus().length;
 const GB = 1048576; // kB → GB
 
@@ -498,6 +499,44 @@ app.post('/api/card-visibility', (req, res) => {
   }
 });
 
+// ─── Home Assistant Smart Plug Control ───────────────────────────
+const HA_BASE = 'http://192.168.3.167:8123';
+const HA_HEADERS = { Authorization: `Bearer ${HA_TOKEN}`, 'Content-Type': 'application/json' };
+
+function getPlugEntity(name) {
+  if (name === 'louis') return 'switch.bouilloire_commutateur';
+  if (name === 'marie') return 'switch.prise3';
+  return null;
+}
+
+// API: get plug state
+app.get('/api/pc-plug-state/:name', async (req, res) => {
+  const entityId = getPlugEntity(req.params.name);
+  if (!entityId) return res.json({ ok: false, error: 'PC inconnu' });
+  try {
+    const r = await axios.get(`${HA_BASE}/api/states/${entityId}`, { headers: HA_HEADERS, timeout: 5000 });
+    res.json({ ok: true, state: r.data.state, entity_id: entityId });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// API: toggle PC smart plug
+app.post('/api/pc-toggle-plug', async (req, res) => {
+  const { name } = req.body;
+  const entityId = getPlugEntity(name);
+  if (!entityId) return res.json({ ok: false, error: 'PC inconnu' });
+  try {
+    const stateR = await axios.get(`${HA_BASE}/api/states/${entityId}`, { headers: HA_HEADERS, timeout: 5000 });
+    const currentState = stateR.data.state;
+    const newAction = currentState === 'on' ? 'turn_off' : 'turn_on';
+    await axios.post(`${HA_BASE}/api/services/switch/${newAction}`, { entity_id: entityId }, { headers: HA_HEADERS, timeout: 5000 });
+    res.json({ ok: true, state: newAction.replace('turn_', ''), entity_id: entityId });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
 // Main dashboard
 app.get('/', async (req, res) => {
   const spending = calcSpending();
@@ -521,12 +560,16 @@ app.get('/', async (req, res) => {
   function visHidden(id) { return !vis(id) ? 'card-hidden' : ''; }
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
   res.end(`<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="30">
+<meta http-equiv="Cache-Control" content="no-store">
 <title>Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
@@ -598,6 +641,16 @@ app.get('/', async (req, res) => {
   .pc-btn:disabled{opacity:0.4;cursor:not-allowed}
   .pc-btn-danger{background:#2a0a0a;color:#f87171;border-color:#7f1d1d}
   .pc-btn-danger:hover{background:#3b0a0a;border-color:#dc2626}
+  .pc-plug-toggle{display:inline-flex;align-items:center;gap:0.3rem;cursor:pointer;font-size:0.72rem;color:#888;padding:0.15rem 0.35rem;user-select:none}
+  .pc-plug-slider{width:28px;height:14px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;position:relative;transition:all 0.2s;flex-shrink:0;display:inline-block}
+  .pc-plug-slider::after{content:'';position:absolute;top:1.5px;left:2px;width:8px;height:8px;background:#555;border-radius:50%;transition:all 0.2s}
+  .pc-plug-toggle.on .pc-plug-slider{background:#14532d;border-color:#22c55e}
+  .pc-plug-toggle.on .pc-plug-slider::after{background:#4ade80;left:17px}
+  .pc-plug-toggle.off .pc-plug-slider{background:#2a0a0a;border-color:#7f1d1d}
+  .pc-plug-toggle.off .pc-plug-slider::after{background:#f87171;left:2px}
+  .pc-plug-status{font-weight:600;font-size:0.68rem;min-width:2.5rem}
+  .pc-plug-toggle.on .pc-plug-status{color:#4ade80}
+  .pc-plug-toggle.off .pc-plug-status{color:#f87171}
   .pc-auto-label{display:inline-flex;align-items:center;gap:0.3rem;cursor:pointer;font-size:0.65rem;color:#666;margin-left:auto;user-select:none}
   .pc-auto-label input{display:none}
   .pc-auto-label .slider{width:24px;height:12px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;position:relative;transition:background 0.2s;flex-shrink:0}
@@ -771,6 +824,8 @@ app.get('/', async (req, res) => {
     <div class="pc-actions" id="pc-louis-actions" style="display:none">
       <button class="pc-btn" onclick="pcAction('louis','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('louis','kill_llm')">⏹ Kill LLM</button>
+      <button class="pc-btn pc-btn-danger" onclick="pcAction('louis','shutdown')">⏻ Éteindre</button>
+      <label class="pc-plug-toggle" id="pc-louis-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-louis-plug-slider"></span><span class="pc-plug-status" id="pc-louis-plug-status">❓</span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
         <input type="checkbox" id="auto-kill-louis">
         <span>Auto-kill RAM &gt;90%</span>
@@ -787,6 +842,8 @@ app.get('/', async (req, res) => {
     <div class="pc-actions" id="pc-marie-actions" style="display:none">
       <button class="pc-btn" onclick="pcAction('marie','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('marie','kill_llm')">⏹ Kill LLM</button>
+      <button class="pc-btn pc-btn-danger" onclick="pcAction('marie','shutdown')">⏻ Éteindre</button>
+      <label class="pc-plug-toggle" id="pc-marie-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-marie-plug-slider"></span><span class="pc-plug-status" id="pc-marie-plug-status">❓</span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
         <input type="checkbox" id="auto-kill-marie">
         <span>Auto-kill RAM &gt;90%</span>
@@ -1009,6 +1066,16 @@ app.get('/', async (req, res) => {
       });
     });
     localStorage.setItem('dash_alerts', JSON.stringify(cfg));
+
+    // Plug toggle click handlers
+    ['louis','marie'].forEach(function(name) {
+      var plugEl = document.getElementById('pc-' + name + '-plug-toggle');
+      if (!plugEl) return;
+      plugEl.addEventListener('click', function(e) {
+        e.preventDefault();
+        togglePlug(name);
+      });
+    });
   }
 
   function updateAlertBanner() {
@@ -1050,6 +1117,12 @@ app.get('/', async (req, res) => {
     // Keep data for alert banner
     window['_pc_' + name] = data;
 
+    // Toujours montrer les actions (switch prise compris) — même si SSH échoue
+    var actionsEl = document.getElementById('pc-' + name + '-actions');
+    if (actionsEl) {
+      actionsEl.style.display = (name === 'marie' || name === 'louis' || name === 'gabriel') ? 'flex' : 'none';
+    }
+
     if (!data || data.error) {
       body.innerHTML = '<div class="error-note" style="padding:0.5rem 0;text-align:center">⚠️ ' + (data ? data.error : 'Données indisponibles') + '</div>';
       return;
@@ -1066,8 +1139,19 @@ app.get('/', async (req, res) => {
     var vramPct = parseFloat(data.vram_pct) || 0;
     var vramDetail = data.vram_used ? (data.vram_used / 1024).toFixed(1) + 'G / ' + (data.vram_total / 1024).toFixed(1) + 'G' : '—';
     var vramTemp = data.vram_temp ? data.vram_temp + '°C' : '—';
-    var llmStatus = data.llm_status === 'active';
-    var llmModel = data.llm_model || '—';
+    // Détection dynamique du LLM — basée sur les process réels, pas systemctl
+    var hasLlamaProc = (data.top_procs || []).some(function(p) {
+      return p.name && p.name.indexOf('llama-server') >= 0;
+    });
+    var llmRunning = (parseFloat(data.llm_rss) || 0) > 0 || hasLlamaProc;
+    var llmModel = '—';
+    if (data.llm_cmd && data.llm_cmd !== '—') {
+      var m = data.llm_cmd.match(/-m\s+(\S+)/);
+      if (m) { llmModel = m[1].split('/').pop() || m[1]; }
+    }
+    // Fallback au champ fourni si le parsing a échoué
+    if (llmModel === '—' && data.llm_model) { llmModel = data.llm_model; }
+    var llmStatus = llmRunning;
     var llmRss = data.llm_rss_gb ? data.llm_rss_gb + ' GB' : '—';
     var llmUptime = data.llm_uptime || '—';
 
@@ -1102,11 +1186,7 @@ app.get('/', async (req, res) => {
       (llmStatus ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +
       '<div class="pc-action-result" id="pc-' + name + '-result"></div>';
 
-    // Show action buttons for PC Marie (has LLM start/kill support)
-    var actionsEl = document.getElementById('pc-' + name + '-actions');
-    if (actionsEl) {
-      actionsEl.style.display = (name === 'marie' || name === 'louis' || name === 'gabriel') ? 'flex' : 'none';
-      // Update auto-kill checkbox
+    // Update auto-kill checkbox
       var autoCheck = document.getElementById('auto-kill-' + name);
       if (autoCheck) {
         var wasChecked = autoCheck.checked;
@@ -1121,7 +1201,6 @@ app.get('/', async (req, res) => {
           pcAction(name, 'set_auto_kill', this.checked);
         };
       }
-    }
 
     // Show last action result
     var resultEl = document.getElementById('pc-' + name + '-result');
@@ -1141,6 +1220,8 @@ app.get('/', async (req, res) => {
     fetch('/api/pc-gabriel').then(function(r){return r.json();}).then(function(d){renderPc(d,'gabriel');}).catch(function(e){console.error('pc-gabriel:',e);});
     fetch('/api/pc-louis').then(function(r){return r.json();}).then(function(d){renderPc(d,'louis');}).catch(function(e){console.error('pc-louis:',e);});
     fetch('/api/pc-marie').then(function(r){return r.json();}).then(function(d){renderPc(d,'marie');}).catch(function(e){console.error('pc-marie:',e);});
+    fetchPlugState('louis');
+    fetchPlugState('marie');
   }
 
   // Auto-kill config helpers
@@ -1173,6 +1254,49 @@ app.get('/', async (req, res) => {
       console.error('pcAction error:', err);
       var resultEl = document.getElementById('pc-' + pc + '-result');
       if (resultEl) resultEl.textContent = '❌ Erreur réseau';
+    });
+  }
+
+  // Plug state management
+  window.togglePlug = function(name) {
+    fetch('/api/pc-toggle-plug', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(res) {
+      if (res.ok) {
+        updatePlugToggle(name, res.state);
+      } else {
+        var resultEl = document.getElementById('pc-' + name + '-result');
+        if (resultEl) resultEl.textContent = '❌ ' + (res.error || 'Erreur prise');
+      }
+    })
+    .catch(function(err) {
+      console.error('togglePlug error:', err);
+      var resultEl = document.getElementById('pc-' + name + '-result');
+      if (resultEl) resultEl.textContent = '❌ Erreur réseau';
+    });
+  };
+
+  function updatePlugToggle(name, state) {
+    var toggle = document.getElementById('pc-' + name + '-plug-toggle');
+    if (!toggle) return;
+    var statusEl = document.getElementById('pc-' + name + '-plug-status');
+    var isOn = state === 'on';
+    toggle.className = 'pc-plug-toggle' + (isOn ? ' on' : ' off');
+    if (statusEl) statusEl.textContent = isOn ? 'ON' : 'OFF';
+  }
+
+  function fetchPlugState(name) {
+    fetch('/api/pc-plug-state/' + name)
+    .then(function(r) { return r.json(); })
+    .then(function(res) {
+      if (res.ok) updatePlugToggle(name, res.state);
+    })
+    .catch(function(err) {
+      console.error('fetchPlugState(' + name + '):', err);
     });
   }
 
@@ -1209,6 +1333,8 @@ app.get('/', async (req, res) => {
     // Find all elements with this data-card-id
     var els = document.querySelectorAll('[data-card-id="' + cardId + '"]');
     els.forEach(function(el) {
+      // Ne pas cacher les lignes du panneau settings — sinon impossible de réafficher
+      if (el.closest('#settings-panel')) return;
       if (visible) {
         el.classList.remove('card-hidden');
       } else {
@@ -1328,7 +1454,20 @@ app.post('/api/pc-action', async (req, res) => {
       const result = execSync(cmd, { timeout: 10000 }).toString().trim();
       return res.json({ ok: true, result: result });
     }
-    
+
+    if (action === 'shutdown') {
+      let cmd;
+      if (pc === 'louis') {
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'sudo shutdown -h now && echo OK'";
+      } else if (pc === 'marie') {
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.58 'sudo shutdown -h now && echo OK'";
+      } else if (pc === 'gabriel') {
+        cmd = "ssh -o StrictHostKeyChecking=no gabpop@192.168.3.220 'sudo shutdown -h now && echo OK'";
+      } else return res.status(400).json({ ok: false, error: 'PC inconnu' });
+      const result = execSync(cmd, { timeout: 30000 }).toString().trim();
+      return res.json({ ok: true, result: result });
+    }
+
     return res.status(400).json({ ok: false, error: 'Action inconnue: ' + action });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });

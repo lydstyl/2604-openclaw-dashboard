@@ -1444,10 +1444,9 @@ app.post('/api/pc-action', async (req, res) => {
     if (action === 'start_llm') {
       let cmd;
       if (pc === 'marie') {
-        // Write action file for metrics script to pick up
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.58 'mkdir -p /tmp/marie-dashboard && echo start_llm > /tmp/marie-dashboard/queued_action'";
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.58 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       } else if (pc === 'louis') {
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 '~/run_qwen35-moe.sh >/dev/null 2>&1 & echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       } else {
         cmd = "ssh -o StrictHostKeyChecking=no gabpop@192.168.3.220 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       }

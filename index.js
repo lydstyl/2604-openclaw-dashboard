@@ -1414,7 +1414,7 @@ app.post('/api/pc-action', async (req, res) => {
       let sshHost, sshUser, sshKey;
       if (pc === 'marie') { sshHost = '192.168.3.58'; sshUser = 'gab'; sshKey = '/root/.ssh/id_ed25519_marie'; }
       else if (pc === 'louis') { sshHost = '192.168.3.224'; sshUser = 'gab'; sshKey = ''; }
-      else if (pc === 'gabriel') { sshHost = '192.168.3.220'; sshUser = 'gabpop'; sshKey = ''; }
+      else if (pc === 'gabriel') { sshHost = '192.168.3.224'; sshUser = 'gab'; sshKey = ''; }
       else return res.status(400).json({ ok: false, error: 'PC inconnu' });
 
       let cmd;
@@ -1434,7 +1434,7 @@ app.post('/api/pc-action', async (req, res) => {
       } else if (pc === 'louis') {
         cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'pkill llama-server 2>/dev/null; echo OK'";
       } else {
-        cmd = "ssh -o StrictHostKeyChecking=no gabpop@192.168.3.220 'pkill llama-server 2>/dev/null; echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'pkill llama-server 2>/dev/null; echo OK'";
       }
       const result = execSync(cmd, { timeout: 10000 }).toString().trim();
       return res.json({ ok: true, result: result });
@@ -1447,7 +1447,7 @@ app.post('/api/pc-action', async (req, res) => {
       } else if (pc === 'louis') {
         cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       } else {
-        cmd = "ssh -o StrictHostKeyChecking=no gabpop@192.168.3.220 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       }
       const result = execSync(cmd, { timeout: 10000 }).toString().trim();
       return res.json({ ok: true, result: result });
@@ -1460,7 +1460,7 @@ app.post('/api/pc-action', async (req, res) => {
       } else if (pc === 'marie') {
         cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.58 'sudo shutdown -h now && echo OK'";
       } else if (pc === 'gabriel') {
-        cmd = "ssh -o StrictHostKeyChecking=no gabpop@192.168.3.220 'sudo shutdown -h now && echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'sudo shutdown -h now && echo OK'";
       } else return res.status(400).json({ ok: false, error: 'PC inconnu' });
       const result = execSync(cmd, { timeout: 30000 }).toString().trim();
       return res.json({ ok: true, result: result });

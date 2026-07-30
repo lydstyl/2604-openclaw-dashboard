@@ -7,6 +7,7 @@ const { execSync } = require('child_process');
 const path    = require('path');
 
 const app  = express();
+app.use(express.json());
 const PORT = 3015;
 const OPENROUTER_KEY = process.env.OPENROUTER_KEY || '';
 const OLLAMA_KEY = process.env.OLLAMA_KEY || '';
@@ -366,6 +367,30 @@ function tag(cond1, cond2, l1, l2, l3) {
                : `<span class="tag tag-red">${l3}</span>`;
 }
 
+// ─── Card Visibility ────────────────────────────────────────
+const VISIBILITY_FILE = path.join(DATA_DIR, 'card_visibility.json');
+
+const DEFAULT_VISIBILITY = {
+  'credits': true, 'spending-30d': true, 'spending-24h': true,
+  'cpu': true, 'ram': true, 'disk': true, 'ollama': true,
+  'pc-gabriel': true, 'pc-louis': true, 'pc-marie': true, 'chart': true
+};
+
+function loadCardVisibility() {
+  try {
+    if (fs.existsSync(VISIBILITY_FILE)) {
+      const data = JSON.parse(fs.readFileSync(VISIBILITY_FILE, 'utf8'));
+      return { ...DEFAULT_VISIBILITY, ...data };
+    }
+  } catch (e) { console.error('[card-visibility] erreur lecture:', e.message); }
+  return { ...DEFAULT_VISIBILITY };
+}
+
+function saveCardVisibility(config) {
+  ensureDataDir();
+  fs.writeFileSync(VISIBILITY_FILE, JSON.stringify(config, null, 2));
+}
+
 // ─── Routes ────────────────────────────────────────────────────────────────
 
 // API: credits history
@@ -389,6 +414,90 @@ app.get('/api/delegation-stats', (req, res) => {
   }
 });
 
+// ─── PC Health Cache ─────────────────────────────────────────────────
+const pcCache = { gabriel: null, louis: null, marie: null, gabrielOk: false, louisOk: false, marieOk: false };
+
+async function fetchPcHealth(name, host, port) {
+  const http = require('http');
+  try {
+    return await new Promise((resolve, reject) => {
+      let req;
+      const timeout = setTimeout(() => { if (req) req.destroy(); reject(new Error('SSE read timeout')); }, 7000);
+      req = http.get(`http://${host}:${port}/events`, (res) => {
+        let buf = '';
+        res.on('data', (chunk) => {
+          buf += chunk.toString();
+          const m = buf.match(/^data:\s*(\{.*?\})\n\n/m);
+          if (m) {
+            clearTimeout(timeout);
+            req.destroy();
+            try {
+              const data = JSON.parse(m[1]);
+              pcCache[name] = data;
+              pcCache[name + 'Ok'] = true;
+              resolve(data);
+            } catch (e) { reject(new Error('JSON parse error')); }
+          }
+        });
+        res.on('error', (e) => { clearTimeout(timeout); reject(e); });
+      });
+      req.on('error', (e) => { clearTimeout(timeout); reject(e); });
+    });
+  } catch (e) {
+    if (!pcCache[name]) pcCache[name] = { error: e.message };
+    pcCache[name + 'Ok'] = false;
+    return pcCache[name];
+  }
+}
+
+function startPcCache() {
+  const update = async () => {
+    await Promise.all([
+      fetchPcHealth('gabriel', '192.168.3.102', 3019),
+      fetchPcHealth('louis', '192.168.3.102', 3018),
+      fetchPcHealth('marie', '192.168.3.102', 3024),
+    ]);
+  };
+  update(); // first fetch immediately
+  setInterval(update, 8000); // then every 8s
+}
+
+// API: PC Gabriel
+app.get('/api/pc-gabriel', (req, res) => {
+  res.json(pcCache.gabriel || { error: 'Waiting for data…' });
+});
+
+// API: PC Louis
+app.get('/api/pc-louis', (req, res) => {
+  res.json(pcCache.louis || { error: 'Waiting for data…' });
+});
+
+// API: PC Marie
+app.get('/api/pc-marie', (req, res) => {
+  res.json(pcCache.marie || { error: 'Waiting for data…' });
+});
+
+// API: card visibility
+app.get('/api/card-visibility', (req, res) => {
+  res.json(loadCardVisibility());
+});
+
+app.post('/api/card-visibility', (req, res) => {
+  try {
+    const { cardId, visible } = req.body;
+    const cfg = loadCardVisibility();
+    if (cardId in cfg) {
+      cfg[cardId] = visible;
+      saveCardVisibility(cfg);
+      res.json({ ok: true, cardId, visible });
+    } else {
+      res.status(400).json({ ok: false, error: 'Carte inconnue: ' + cardId });
+    }
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Main dashboard
 app.get('/', async (req, res) => {
   const spending = calcSpending();
@@ -405,6 +514,11 @@ app.get('/', async (req, res) => {
 
   // ─── Delegation Tracker (server-rendered) ────────────────────────────
   let delegationHtml = '';
+
+  // ─── Card visibility ─────────────────────────────────────────
+  const visibility = loadCardVisibility();
+  function vis(id) { return visibility[id] !== false; }
+  function visHidden(id) { return !vis(id) ? 'card-hidden' : ''; }
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.end(`<!DOCTYPE html>
@@ -450,6 +564,65 @@ app.get('/', async (req, res) => {
   .chart-placeholder{color:#555;font-size:0.85rem;text-align:center;padding:3rem 0}
   footer{margin-top:2rem;color:#333;font-size:0.75rem;text-align:center}
   a{color:#333;text-decoration:none}a:hover{color:#666}
+  /* PC Health cards */
+  .pc-mini-bar{height:6px;background:#1a1a1a;border-radius:3px;margin-top:0.4rem;overflow:hidden}
+  .pc-mini-fill{height:100%;border-radius:3px;transition:width 0.5s}
+  .pc-row{display:flex;justify-content:space-between;align-items:center;font-size:0.78rem;margin-top:0.35rem}
+  .pc-row .lbl{color:#555}
+  .pc-row .val{color:#aaa;font-weight:500}
+  .pc-status{display:inline-block;padding:0.1rem 0.5rem;border-radius:10px;font-size:0.65rem;font-weight:600}
+  .pc-status.on{background:#14532d;color:#4ade80}
+  .pc-status.off{background:#450a0a;color:#f87171}
+  .pc-llm{font-size:0.72rem;color:#9ca3af;margin-top:0.3rem}
+  .pc-llm strong{color:#e0e0e0;font-weight:500}
+  /* Alertes */
+  .alert-banner{display:none;background:#1a0a0a;border:1px solid #7f1d1d;border-radius:8px;padding:0.6rem 1rem;margin-bottom:1.25rem;font-size:0.8rem;gap:1rem;flex-wrap:wrap}
+  .alert-banner.show{display:flex}
+  .alert-banner-item{display:flex;align-items:center;gap:0.5rem;color:#fca5a5}
+  .alert-banner-dot{width:8px;height:8px;border-radius:50%;background:#f87171;animation:alert-pulse 1.5s infinite}
+  @keyframes alert-pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+  .alert-badge{display:inline-flex;align-items:center;gap:0.2rem;padding:0.08rem 0.4rem;border-radius:8px;font-size:0.6rem;font-weight:600;background:#450a0a;color:#f87171;margin-left:0.3rem}
+  .alert-badge.warn{background:#3b2f00;color:#facc15}
+  .alert-toggle{display:inline-flex;align-items:center;gap:0.35rem;cursor:pointer;font-size:0.62rem;color:#555;user-select:none;margin-left:auto}
+  .alert-toggle input{display:none}
+  .alert-toggle .slider{width:26px;height:13px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;position:relative;transition:background 0.2s;flex-shrink:0}
+  .alert-toggle .slider::after{content:'';position:absolute;top:1.5px;left:2px;width:8px;height:8px;background:#555;border-radius:50%;transition:all 0.2s}
+  .alert-toggle input:checked+.slider{background:#312e81;border-color:#5b21b6}
+  .alert-toggle input:checked+.slider::after{background:#818cf8;left:15px}
+
+  /* PC Action buttons */
+  .pc-actions{display:flex;gap:0.4rem;align-items:center;margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid #1a1a1a;flex-wrap:wrap}
+  .pc-btn{background:#1a1a2e;color:#818cf8;border:1px solid #312e81;border-radius:6px;padding:0.25rem 0.6rem;font-size:0.68rem;cursor:pointer;transition:all 0.2s;font-family:inherit}
+  .pc-btn:hover{background:#272160;border-color:#4f46e5}
+  .pc-btn:active{transform:scale(0.97)}
+  .pc-btn:disabled{opacity:0.4;cursor:not-allowed}
+  .pc-btn-danger{background:#2a0a0a;color:#f87171;border-color:#7f1d1d}
+  .pc-btn-danger:hover{background:#3b0a0a;border-color:#dc2626}
+  .pc-auto-label{display:inline-flex;align-items:center;gap:0.3rem;cursor:pointer;font-size:0.65rem;color:#666;margin-left:auto;user-select:none}
+  .pc-auto-label input{display:none}
+  .pc-auto-label .slider{width:24px;height:12px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;position:relative;transition:background 0.2s;flex-shrink:0}
+  .pc-auto-label .slider::after{content:'';position:absolute;top:1.5px;left:2px;width:7px;height:7px;background:#555;border-radius:50%;transition:all 0.2s}
+  .pc-auto-label input:checked+.slider{background:#14532d;border-color:#22c55e}
+  .pc-auto-label input:checked+.slider::after{background:#4ade80;left:14px}
+  .pc-action-result{font-size:0.62rem;color:#888;margin-top:0.3rem;min-height:1rem}
+  /* Card visibility */
+  .card-hidden{display:none!important}
+  .settings-btn{background:none;border:none;color:#555;cursor:pointer;font-size:1.1rem;padding:0.15rem 0.35rem;border-radius:6px;transition:all 0.2s;line-height:1}
+  .settings-btn:hover{color:#aaa;background:#1a1a1a}
+  .settings-btn.active{color:#818cf8;background:#1a1a2e}
+  .settings-panel{display:none;background:#0d0d0d;border:1px solid #222;border-radius:10px;padding:0.75rem 1rem;margin-bottom:1.25rem}
+  .settings-panel.show{display:block}
+  .settings-title{font-size:0.7rem;color:#555;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:0.5rem}
+  .settings-row{display:flex;align-items:center;gap:0.5rem;padding:0.3rem 0;cursor:pointer;border-radius:6px;transition:background 0.15s}
+  .settings-row:hover{background:#151515}
+  .settings-row input[type=checkbox]{display:none}
+  .settings-row .s-toggle{width:28px;height:14px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;position:relative;transition:all 0.2s;flex-shrink:0}
+  .settings-row .s-toggle::after{content:'';position:absolute;top:1.5px;left:2px;width:8px;height:8px;background:#555;border-radius:50%;transition:all 0.2s}
+  .settings-row input:checked+.s-toggle{background:#1e3a5f;border-color:#3b82f6}
+  .settings-row input:checked+.s-toggle::after{background:#60a5fa;left:16px}
+  .settings-row .s-label{font-size:0.75rem;color:#aaa;flex:1}
+  .settings-row .s-icon{font-size:0.9rem}
+  .settings-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:0.2rem}
 </style>
 </head>
 <body>
@@ -458,13 +631,37 @@ app.get('/', async (req, res) => {
     <h1>Dashboard</h1>
     <div class="subtitle">192.168.3.102 &nbsp;·&nbsp; uptime ${sys.uptime}</div>
   </div>
-  <div class="refresh-info">Auto-refresh 30s &nbsp;·&nbsp; ${ts}</div>
+  <div style="display:flex;align-items:center;gap:0.6rem">
+    <button id="settingsBtn" class="settings-btn" onclick="toggleSettings()" title="Afficher/masquer des cartes">⚙️</button>
+    <div class="refresh-info">Auto-refresh 30s &nbsp;·&nbsp; ${ts}</div>
+  </div>
 </header>
+
+<!-- Bannière d'alertes -->
+<div id="alert-banner" class="alert-banner"></div>
+
+<!-- Panneau de configuration des cartes -->
+<div id="settings-panel" class="settings-panel">
+  <div class="settings-title">🔄 Cartes à afficher</div>
+  <div class="settings-grid">
+    <label class="settings-row" data-card-id="credits"><span class="s-icon">💳</span><input type="checkbox"${vis('credits')?' checked':''}><span class="s-toggle"></span><span class="s-label">Crédits</span></label>
+    <label class="settings-row" data-card-id="spending-30d"><span class="s-icon">📊</span><input type="checkbox"${vis('spending-30d')?' checked':''}><span class="s-toggle"></span><span class="s-label">Dépenses 30j</span></label>
+    <label class="settings-row" data-card-id="spending-24h"><span class="s-icon">⏰</span><input type="checkbox"${vis('spending-24h')?' checked':''}><span class="s-toggle"></span><span class="s-label">Dépenses 24h</span></label>
+    <label class="settings-row" data-card-id="cpu"><span class="s-icon">🖥️</span><input type="checkbox"${vis('cpu')?' checked':''}><span class="s-toggle"></span><span class="s-label">CPU</span></label>
+    <label class="settings-row" data-card-id="ram"><span class="s-icon">🧠</span><input type="checkbox"${vis('ram')?' checked':''}><span class="s-toggle"></span><span class="s-label">RAM</span></label>
+    <label class="settings-row" data-card-id="disk"><span class="s-icon">💾</span><input type="checkbox"${vis('disk')?' checked':''}><span class="s-toggle"></span><span class="s-label">Disque dur</span></label>
+    <label class="settings-row" data-card-id="ollama"><span class="s-icon">🦙</span><input type="checkbox"${vis('ollama')?' checked':''}><span class="s-toggle"></span><span class="s-label">Ollama Cloud</span></label>
+    <label class="settings-row" data-card-id="pc-gabriel"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-gabriel')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Gabriel</span></label>
+    <label class="settings-row" data-card-id="pc-louis"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-louis')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Louis</span></label>
+    <label class="settings-row" data-card-id="pc-marie"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-marie')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Marie</span></label>
+    <label class="settings-row" data-card-id="chart"><span class="s-icon">📈</span><input type="checkbox"${vis('chart')?' checked':''}><span class="s-toggle"></span><span class="s-label">Graphique</span></label>
+  </div>
+</div>
 
 <div class="grid">
 
   <!-- CREDITS -->
-  <div class="card">
+  <div class="card ${visHidden('credits')}" data-card-id="credits">
     <div class="card-header"><span class="icon">💳</span><span class="card-title">Crédits — Tous providers</span></div>
     <div class="big-value" style="color:${kc}">${credits.total}<span>$</span></div>
     <hr class="divider">
@@ -475,7 +672,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- DÉPENSES 30 JOURS -->
-  <div class="card">
+  <div class="card ${visHidden('spending-30d')}" data-card-id="spending-30d">
     <div class="card-header"><span class="icon">📊</span><span class="card-title">Dépenses — 30 derniers jours</span></div>
     <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending.total.toFixed(2)}<span>$</span></div>
     <hr class="divider">
@@ -487,7 +684,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- DÉPENSES 24H -->
-  <div class="card">
+  <div class="card ${visHidden('spending-24h')}" data-card-id="spending-24h">
     <div class="card-header"><span class="icon">⏰</span><span class="card-title">Dépenses — 24 dernières heures</span></div>
     <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending24h.total.toFixed(2)}<span>$</span></div>
     <hr class="divider">
@@ -498,7 +695,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- CPU -->
-  <div class="card">
+  <div class="card ${visHidden('cpu')}" data-card-id="cpu">
     <div class="card-header"><span class="icon">🖥️</span><span class="card-title">CPU</span></div>
     <div class="big-value" style="color:${cc}">${sys.cpuPct}<span>%</span></div>
     ${bar(sys.cpuPct, cc)}
@@ -509,7 +706,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- RAM -->
-  <div class="card">
+  <div class="card ${visHidden('ram')}" data-card-id="ram">
     <div class="card-header"><span class="icon">🧠</span><span class="card-title">Mémoire RAM</span></div>
     <div class="big-value" style="color:${rc}">${mem.usedByApps}<span>GB apps</span></div>
     <div class="bar-bg">
@@ -529,7 +726,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- DISK -->
-  <div class="card">
+  <div class="card ${visHidden('disk')}" data-card-id="disk">
     <div class="card-header"><span class="icon">💾</span><span class="card-title">Disque dur</span></div>
     <div class="big-value" style="color:${dc}">${disk.used}<span>GB utilisés</span></div>
     ${bar(disk.usedPct, dc)}
@@ -541,7 +738,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- OLLAMA CLOUD -->
-  <div class="card">
+  <div class="card ${visHidden('ollama')}" data-card-id="ollama">
     <div class="card-header"><span class="icon">🦙</span><span class="card-title">Ollama Cloud</span></div>
     <div class="big-value" style="color:#a78bfa">${ollama.plan}<span> plan</span></div>
     <hr class="divider">
@@ -549,10 +746,58 @@ app.get('/', async (req, res) => {
     ${!ollama.ok ? `<p class="error-note">Erreur API : ${ollama.error}</p>` : ''}
   </div>
 
+  <!-- PC GABRIEL -->
+  <div class="card ${visHidden('pc-gabriel')}" data-card-id="pc-gabriel" id="pc-gabriel-card">
+    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Gabriel <span id="pc-gabriel-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-gabriel" checked><span class="slider"></span>🔔</label></div>
+    <div id="pc-gabriel-body">
+      <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
+    </div>
+    <div class="pc-actions" id="pc-gabriel-actions" style="display:none">
+      <button class="pc-btn" onclick="pcAction('gabriel','start_llm')">▶ Lancer LLM</button>
+      <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','kill_llm')">⏹ Kill LLM</button>
+      <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
+        <input type="checkbox" id="auto-kill-gabriel">
+        <span>Auto-kill RAM &gt;90%</span>
+      </label>
+    </div>
+  </div>
+
+  <!-- PC LOUIS -->
+  <div class="card ${visHidden('pc-louis')}" data-card-id="pc-louis" id="pc-louis-card">
+    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Louis <span id="pc-louis-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-louis" checked><span class="slider"></span>🔔</label></div>
+    <div id="pc-louis-body">
+      <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
+    </div>
+    <div class="pc-actions" id="pc-louis-actions" style="display:none">
+      <button class="pc-btn" onclick="pcAction('louis','start_llm')">▶ Lancer LLM</button>
+      <button class="pc-btn pc-btn-danger" onclick="pcAction('louis','kill_llm')">⏹ Kill LLM</button>
+      <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
+        <input type="checkbox" id="auto-kill-louis">
+        <span>Auto-kill RAM &gt;90%</span>
+      </label>
+    </div>
+  </div>
+
+  <!-- PC MARIE -->
+  <div class="card ${visHidden('pc-marie')}" data-card-id="pc-marie" id="pc-marie-card">
+    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Marie <span id="pc-marie-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-marie" checked><span class="slider"></span>🔔</label></div>
+    <div id="pc-marie-body">
+      <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
+    </div>
+    <div class="pc-actions" id="pc-marie-actions" style="display:none">
+      <button class="pc-btn" onclick="pcAction('marie','start_llm')">▶ Lancer LLM</button>
+      <button class="pc-btn pc-btn-danger" onclick="pcAction('marie','kill_llm')">⏹ Kill LLM</button>
+      <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
+        <input type="checkbox" id="auto-kill-marie">
+        <span>Auto-kill RAM &gt;90%</span>
+      </label>
+    </div>
+  </div>
+
 </div>
 
 <!-- Chart Section -->
-<div class="chart-section">
+<div class="chart-section ${visHidden('chart')}" data-card-id="chart">
   <div class="card-header"><span class="icon">📈</span><span class="card-title">Évolution des crédits (30 jours)</span></div>
   <div id="chart-container" class="chart-container">
     <div id="chart-placeholder" class="chart-placeholder">Collecte de données en cours...</div>
@@ -658,7 +903,7 @@ app.get('/', async (req, res) => {
 
  </div>
 
-<footer><a href="http://192.168.3.102:8081">→ Tableau de bord des sites</a></footer>
+<footer><a href="http://192.168.3.102:8042">→ Tableau de bord des sites</a></footer>
 
 
 <script>
@@ -735,10 +980,362 @@ app.get('/', async (req, res) => {
     .catch(function(err){ console.error('Delegation stats error:', err); });
 })();
 </script>
+<script>
+// PC Health cards + alertes
+(function() {
+  var ALERT_CPU = 80, ALERT_RAM = 80;
+
+  function getAlertConfig() {
+    try { return JSON.parse(localStorage.getItem('dash_alerts') || '{}'); } catch(e) { return {}; }
+  }
+  function setAlertConfig(name, val) {
+    var cfg = getAlertConfig();
+    cfg[name] = val;
+    localStorage.setItem('dash_alerts', JSON.stringify(cfg));
+  }
+
+  // Restore toggle states from localStorage
+  function initToggles() {
+    var cfg = getAlertConfig();
+    ['gabriel','louis','marie'].forEach(function(name) {
+      var el = document.getElementById('alert-' + name);
+      if (!el) return;
+      // default to true if not set yet
+      if (cfg[name] === undefined) cfg[name] = true;
+      el.checked = cfg[name];
+      el.addEventListener('change', function() {
+        setAlertConfig(name, el.checked);
+        updateAlertBanner();
+      });
+    });
+    localStorage.setItem('dash_alerts', JSON.stringify(cfg));
+  }
+
+  function updateAlertBanner() {
+    var banner = document.getElementById('alert-banner');
+    var cfg = getAlertConfig();
+    var active = [];
+
+    ['gabriel','louis','marie'].forEach(function(name) {
+      if (!cfg[name]) return;
+      var data = window['_pc_' + name];
+      if (!data || data.error) return;
+      var cpu = parseFloat(data.cpu) || 0;
+      var mem = parseFloat(data.mem_pct) || 0;
+      var alerts = [];
+      if (cpu > ALERT_CPU) alerts.push('CPU ' + cpu.toFixed(0) + '%');
+      if (mem > ALERT_RAM) alerts.push('RAM ' + mem.toFixed(0) + '%');
+      if (alerts.length > 0) active.push({ name: name, alerts: alerts, cpu: cpu, mem: mem });
+    });
+
+    if (active.length === 0) {
+      banner.classList.remove('show');
+      banner.innerHTML = '';
+      return;
+    }
+
+    banner.classList.add('show');
+    banner.innerHTML = active.map(function(pc) {
+      var icon = pc.name === 'gabriel' ? '🖥️' : pc.name === 'louis' ? '💻' : '🖥️';
+      var label = pc.name === 'gabriel' ? 'Gabriel' : pc.name === 'louis' ? 'Louis' : 'Marie';
+      return '<div class="alert-banner-item"><span class="alert-banner-dot"></span>' + icon + ' <strong>' + label + '</strong> — ' + pc.alerts.join(' · ') + '</div>';
+    }).join('');
+  }
+
+  function renderPc(data, name) {
+    var body = document.getElementById('pc-' + name + '-body');
+    var timeEl = document.getElementById('pc-' + name + '-time');
+    if (!body) return;
+
+    // Keep data for alert banner
+    window['_pc_' + name] = data;
+
+    if (!data || data.error) {
+      body.innerHTML = '<div class="error-note" style="padding:0.5rem 0;text-align:center">⚠️ ' + (data ? data.error : 'Données indisponibles') + '</div>';
+      return;
+    }
+
+    var ts = data.timestamp || '—';
+    if (timeEl) timeEl.textContent = ts;
+
+    var cpu = parseFloat(data.cpu) || 0;
+    var memPct = parseFloat(data.mem_pct) || 0;
+    var memUsed = data.mem_used ? (data.mem_used / 1024).toFixed(1) : '—';
+    var memTotal = data.mem_total ? (data.mem_total / 1024).toFixed(1) : '—';
+    var memAvail = data.mem_avail ? (data.mem_avail / 1024).toFixed(1) : '—';
+    var vramPct = parseFloat(data.vram_pct) || 0;
+    var vramDetail = data.vram_used ? (data.vram_used / 1024).toFixed(1) + 'G / ' + (data.vram_total / 1024).toFixed(1) + 'G' : '—';
+    var vramTemp = data.vram_temp ? data.vram_temp + '°C' : '—';
+    var llmStatus = data.llm_status === 'active';
+    var llmModel = data.llm_model || '—';
+    var llmRss = data.llm_rss_gb ? data.llm_rss_gb + ' GB' : '—';
+    var llmUptime = data.llm_uptime || '—';
+
+    function c(val, t60, t80) {
+      return val < t60 ? '#4ade80' : val < t80 ? '#facc15' : '#f87171';
+    }
+
+    function alertBadge(val, threshold) {
+      if (val <= threshold) return '';
+      var cls = val < 90 ? 'warn' : '';
+      return '<span class="alert-badge ' + cls + '">⚠ ' + val.toFixed(0) + '%</span>';
+    }
+
+    // Check if alerts are enabled for this PC
+    var cfg = getAlertConfig();
+    var alertsOn = cfg[name] !== false;
+
+    var cpuBadge = (alertsOn && cpu > ALERT_CPU) ? alertBadge(cpu, ALERT_CPU) : '';
+    var ramBadge = (alertsOn && memPct > ALERT_RAM) ? alertBadge(memPct, ALERT_RAM) : '';
+
+    body.innerHTML =
+      '<div class="pc-row"><span class="lbl">CPU' + (cpuBadge ? '' : '') + '</span><span class="val" style="color:' + c(cpu,50,80) + '">' + cpu.toFixed(1) + '%' + cpuBadge + '</span></div>' +
+      '<div class="pc-mini-bar"><div class="pc-mini-fill" style="width:' + Math.min(100,cpu) + '%;background:' + c(cpu,50,80) + '"></div></div>' +
+      '<div class="pc-row"><span class="lbl">RAM' + (ramBadge ? '' : '') + '</span><span class="val" style="color:' + c(memPct,60,80) + '">' + memPct.toFixed(1) + '%' + ramBadge + '</span></div>' +
+      '<div class="pc-mini-bar"><div class="pc-mini-fill" style="width:' + Math.min(100,memPct) + '%;background:' + c(memPct,60,80) + '"></div></div>' +
+      '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + memUsed + ' / ' + memTotal + '</span><span>libre ' + memAvail + '</span></div>' +
+      '<div class="pc-row" style="margin-top:0.6rem"><span class="lbl">VRAM</span><span class="val" style="color:' + c(vramPct,70,90) + '">' + vramPct.toFixed(1) + '%</span></div>' +
+      '<div class="pc-mini-bar"><div class="pc-mini-fill" style="width:' + Math.min(100,vramPct) + '%;background:' + c(vramPct,70,90) + '"></div></div>' +
+      '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + vramDetail + '</span><span>' + vramTemp + '</span></div>' +
+      '<hr class="divider">' +
+      '<div class="pc-llm">🧠 <strong>' + llmModel + '</strong> <span class="pc-status ' + (llmStatus ? 'on' : 'off') + '">' + (llmStatus ? '● Running' : '● Stopped') + '</span></div>' +
+      (llmStatus ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +
+      '<div class="pc-action-result" id="pc-' + name + '-result"></div>';
+
+    // Show action buttons for PC Marie (has LLM start/kill support)
+    var actionsEl = document.getElementById('pc-' + name + '-actions');
+    if (actionsEl) {
+      actionsEl.style.display = (name === 'marie' || name === 'louis' || name === 'gabriel') ? 'flex' : 'none';
+      // Update auto-kill checkbox
+      var autoCheck = document.getElementById('auto-kill-' + name);
+      if (autoCheck) {
+        var wasChecked = autoCheck.checked;
+        autoCheck.checked = data.auto_kill_enabled || false;
+        if (wasChecked !== autoCheck.checked) {
+          // Save state without triggering
+          var cfg2 = getAutoKillConfig();
+          cfg2[name] = autoCheck.checked;
+          localStorage.setItem('dash_auto_kill', JSON.stringify(cfg2));
+        }
+        autoCheck.onchange = function() {
+          pcAction(name, 'set_auto_kill', this.checked);
+        };
+      }
+    }
+
+    // Show last action result
+    var resultEl = document.getElementById('pc-' + name + '-result');
+    if (resultEl) {
+      resultEl.textContent = data.last_action || '';
+      if (data.last_action) {
+        setTimeout(function() {
+          if (resultEl) resultEl.textContent = '';
+        }, 5000);
+      }
+    }
+
+    updateAlertBanner();
+  }
+
+  function refreshAll() {
+    fetch('/api/pc-gabriel').then(function(r){return r.json();}).then(function(d){renderPc(d,'gabriel');}).catch(function(e){console.error('pc-gabriel:',e);});
+    fetch('/api/pc-louis').then(function(r){return r.json();}).then(function(d){renderPc(d,'louis');}).catch(function(e){console.error('pc-louis:',e);});
+    fetch('/api/pc-marie').then(function(r){return r.json();}).then(function(d){renderPc(d,'marie');}).catch(function(e){console.error('pc-marie:',e);});
+  }
+
+  // Auto-kill config helpers
+  function getAutoKillConfig() {
+    try { return JSON.parse(localStorage.getItem('dash_auto_kill') || '{}'); } catch(e) { return {}; }
+  }
+  function setAutoKillConfig(name, val) {
+    var cfg = getAutoKillConfig();
+    cfg[name] = val;
+    localStorage.setItem('dash_auto_kill', JSON.stringify(cfg));
+  }
+
+  // PC Action handler (exposed globally for onclick)
+  window.pcAction = function(pc, action, value) {
+    fetch('/api/pc-action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pc: pc, action: action, enabled: value })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(res) {
+      console.log('pcAction(' + pc + ', ' + action + '):', res);
+      if (!res.ok) {
+        // Show error
+        var resultEl = document.getElementById('pc-' + pc + '-result');
+        if (resultEl) resultEl.textContent = '❌ ' + (res.error || 'Erreur');
+      }
+    })
+    .catch(function(err) {
+      console.error('pcAction error:', err);
+      var resultEl = document.getElementById('pc-' + pc + '-result');
+      if (resultEl) resultEl.textContent = '❌ Erreur réseau';
+    });
+  }
+
+  initToggles();
+  refreshAll();
+  setInterval(refreshAll, 10000);
+})();
+</script>
+
+<!-- Card visibility toggle JS -->
+<script>
+(function() {
+  var panel = document.getElementById('settings-panel');
+  var btn = document.getElementById('settingsBtn');
+  var visibleCache = null;
+
+  // Toggle panel
+  window.toggleSettings = function() {
+    var show = panel.classList.toggle('show');
+    btn.classList.toggle('active', show);
+  };
+
+  // Close panel on click outside
+  document.addEventListener('click', function(e) {
+    if (panel && panel.classList.contains('show') &&
+        !panel.contains(e.target) && e.target !== btn && !btn.contains(e.target)) {
+      panel.classList.remove('show');
+      btn.classList.remove('active');
+    }
+  });
+
+  // Toggle a card on/off instantly
+  function toggleCard(cardId, visible) {
+    // Find all elements with this data-card-id
+    var els = document.querySelectorAll('[data-card-id="' + cardId + '"]');
+    els.forEach(function(el) {
+      if (visible) {
+        el.classList.remove('card-hidden');
+      } else {
+        el.classList.add('card-hidden');
+      }
+    });
+  }
+
+  // Save preference to server
+  function saveVisibility(cardId, visible) {
+    fetch('/api/card-visibility', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cardId: cardId, visible: visible })
+    }).catch(function(err) {
+      console.error('Erreur sauvegarde visibilité:', err);
+    });
+  }
+
+  // Init settings panel toggles
+  function initSettings() {
+    // Fetch current state from server to stay in sync
+    fetch('/api/card-visibility')
+      .then(function(r) { return r.json(); })
+      .then(function(cfg) {
+        visibleCache = cfg;
+        var rows = panel.querySelectorAll('.settings-row');
+        rows.forEach(function(row) {
+          var cardId = row.getAttribute('data-card-id');
+          var cb = row.querySelector('input[type="checkbox"]');
+          if (!cb || !cardId) return;
+          // Update checkbox state from server
+          var isVisible = cfg[cardId] !== false;
+          cb.checked = isVisible;
+          // Apply to card
+          toggleCard(cardId, isVisible);
+          // Listen for changes
+          cb.addEventListener('change', function() {
+            var visible = cb.checked;
+            var cardId2 = row.getAttribute('data-card-id');
+            toggleCard(cardId2, visible);
+            saveVisibility(cardId2, visible);
+          });
+        });
+      })
+      .catch(function(err) {
+        console.error('Erreur chargement visibilité:', err);
+        // Fallback: use server-rendered state (checkboxes already have correct state)
+        var rows = panel.querySelectorAll('.settings-row');
+        rows.forEach(function(row) {
+          var cardId = row.getAttribute('data-card-id');
+          var cb = row.querySelector('input[type="checkbox"]');
+          if (!cb || !cardId) return;
+          cb.addEventListener('change', function() {
+            toggleCard(cardId, cb.checked);
+            saveVisibility(cardId, cb.checked);
+          });
+        });
+      });
+  }
+
+  if (panel) initSettings();
+})();
+</script>
 </body>
 </html>`);
 });
 
-// ─── Start ─────────────────────────────────────────────────────────────────
+
+// ─── PC Action (POST) — direct SSH to target machine
+app.post('/api/pc-action', async (req, res) => {
+  try {
+    const { pc, action, enabled } = req.body;
+    
+    if (action === 'set_auto_kill') {
+      // Just toggle a local flag file on the target
+      let sshHost, sshUser;
+      if (pc === 'marie') { sshHost = '192.168.3.58'; sshUser = 'gab'; }
+      else if (pc === 'louis') { sshHost = '192.168.3.224'; sshUser = 'gab'; }
+      else if (pc === 'gabriel') { sshHost = '192.168.3.220'; sshUser = 'gabpop'; }
+      else return res.status(400).json({ ok: false, error: 'PC inconnu' });
+
+      let cmd;
+      if (enabled) {
+        cmd = `ssh -o StrictHostKeyChecking=no ${sshUser}@${sshHost} 'mkdir -p /tmp/${pc}-dashboard && touch /tmp/${pc}-dashboard/auto_kill_enabled'`;
+      } else {
+        cmd = `ssh -o StrictHostKeyChecking=no ${sshUser}@${sshHost} 'rm -f /tmp/${pc}-dashboard/auto_kill_enabled'`;
+      }
+      execSync(cmd, { timeout: 10000 });
+      return res.json({ ok: true, enabled: enabled });
+    }
+    
+    if (action === 'kill_llm') {
+      let cmd;
+      if (pc === 'marie') {
+        // Write action file for metrics script to pick up
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.58 'mkdir -p /tmp/marie-dashboard && echo kill_llm > /tmp/marie-dashboard/queued_action'";
+      } else if (pc === 'louis') {
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'pkill -f llama-server && echo OK'";
+      } else {
+        cmd = "ssh -o StrictHostKeyChecking=no gabpop@192.168.3.220 'pkill -f llama-server && echo OK'";
+      }
+      const result = execSync(cmd, { timeout: 10000 }).toString().trim();
+      return res.json({ ok: true, result: result });
+    }
+    
+    if (action === 'start_llm') {
+      let cmd;
+      if (pc === 'marie') {
+        // Write action file for metrics script to pick up
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.58 'mkdir -p /tmp/marie-dashboard && echo start_llm > /tmp/marie-dashboard/queued_action'";
+      } else if (pc === 'louis') {
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 '~/run_qwen35-moe.sh >/dev/null 2>&1 & echo OK'";
+      } else {
+        cmd = "ssh -o StrictHostKeyChecking=no gabpop@192.168.3.220 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
+      }
+      const result = execSync(cmd, { timeout: 10000 }).toString().trim();
+      return res.json({ ok: true, result: result });
+    }
+    
+    return res.status(400).json({ ok: false, error: 'Action inconnue: ' + action });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─── Start────────
 startCreditsCollector();
+startPcCache();
 app.listen(PORT, () => console.log(`openclaw-dash sur le port ${PORT}`));

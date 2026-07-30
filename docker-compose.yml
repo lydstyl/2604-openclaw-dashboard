@@ -12,3 +12,4 @@ services:
       - ./data:/app/data
       - ./.env:/app/.env:ro
       - /:/host:ro
+      - ~/.ssh:/root/.ssh:ro

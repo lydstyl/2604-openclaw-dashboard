@@ -348,6 +348,28 @@ function formatUptime(s) {
   return d > 0 ? `${d}j ${h}h ${m}m` : h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
+// ─── Top Processes ───────────────────────────────────────────────
+function getTopProcesses() {
+  try {
+    // Use host's ps via /host chroot (Alpine busybox ps doesn't support --sort)
+    const output = execSync('chroot /host ps aux --sort=-%cpu | head -4', { encoding: 'utf8', timeout: 5000 });
+    const lines = output.trim().split('\n');
+    const result = [];
+    for (let i = 1; i < lines.length; i++) {
+      const parts = lines[i].trim().split(/\s+/);
+      if (parts.length >= 11) {
+        const cpu = parseFloat(parts[2]);
+        const mem = parseFloat(parts[3]);
+        const cmd = parts.slice(10).join(' ');
+        result.push({ cpu, mem, cmd: cmd.substring(0, 80) });
+      }
+    }
+    return result;
+  } catch (e) {
+    return [{ cpu: 0, mem: 0, cmd: 'Erreur: ' + e.message }];
+  }
+}
+
 // ─── UI Helpers ────────────────────────────────────────────────────────────
 function bar(pct, color, bg) {
   const w = Math.min(100, Math.max(0, parseFloat(pct)));
@@ -460,7 +482,7 @@ function startPcCache() {
     ]);
   };
   update(); // first fetch immediately
-  setInterval(update, 8000); // then every 8s
+  setInterval(update, 15000); // then every 15s
 }
 
 // API: PC Gabriel
@@ -499,6 +521,11 @@ app.post('/api/card-visibility', (req, res) => {
   }
 });
 
+// API: top processes
+app.get('/api/top-processes', (req, res) => {
+  res.json(getTopProcesses());
+});
+
 // ─── Home Assistant Smart Plug Control ───────────────────────────
 const HA_BASE = 'http://192.168.3.167:8123';
 const HA_HEADERS = { Authorization: `Bearer ${HA_TOKEN}`, 'Content-Type': 'application/json' };
@@ -509,13 +536,30 @@ function getPlugEntity(name) {
   return null;
 }
 
-// API: get plug state
+function getPlugPowerEntity(name) {
+  if (name === 'louis') return 'sensor.bouilloire_puissance';
+  if (name === 'marie') return 'sensor.prise3_puissance';
+  return null;
+}
+
+// API: get plug state + power
 app.get('/api/pc-plug-state/:name', async (req, res) => {
   const entityId = getPlugEntity(req.params.name);
+  const powerEntityId = getPlugPowerEntity(req.params.name);
   if (!entityId) return res.json({ ok: false, error: 'PC inconnu' });
   try {
-    const r = await axios.get(`${HA_BASE}/api/states/${entityId}`, { headers: HA_HEADERS, timeout: 5000 });
-    res.json({ ok: true, state: r.data.state, entity_id: entityId });
+    const [r, p] = await Promise.all([
+      axios.get(`${HA_BASE}/api/states/${entityId}`, { headers: HA_HEADERS, timeout: 5000 }),
+      powerEntityId
+        ? axios.get(`${HA_BASE}/api/states/${powerEntityId}`, { headers: HA_HEADERS, timeout: 5000 }).catch(() => null)
+        : Promise.resolve(null),
+    ]);
+    let power = null;
+    if (p && p.data && p.data.state !== 'unknown' && p.data.state !== 'unavailable') {
+      const parsed = parseFloat(p.data.state);
+      power = isNaN(parsed) ? null : parsed;
+    }
+    res.json({ ok: true, state: r.data.state, entity_id: entityId, power });
   } catch (e) {
     res.json({ ok: false, error: e.message });
   }
@@ -598,6 +642,10 @@ app.get('/', async (req, res) => {
   .tag-yellow{background:#3b2f00;color:#facc15}
   .tag-red{background:#450a0a;color:#f87171}
   .error-note{color:#f87171;font-size:0.75rem;margin-top:0.5rem}
+  .proc-row{display:flex;justify-content:space-between;align-items:center;font-size:0.7rem;margin-top:0.25rem;font-family:'SF Mono','Fira Code','Consolas',monospace}
+  .proc-row .proc-cpu{color:#4ade80;font-weight:600;min-width:2.2rem;text-align:right}
+  .proc-row .proc-cmd{color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;margin-left:0.5rem}
+  .proc-row .proc-mem{color:#666;font-size:0.65rem;min-width:1.8rem;text-align:right}
   .divider{border:none;border-top:1px solid #1a1a1a;margin:1rem 0}
   .note{background:#141414;border:1px solid #222;border-radius:8px;padding:0.75rem 1rem;margin-top:1rem;font-size:0.75rem;color:#555;line-height:1.5}
   .note strong{color:#3a3a3a}
@@ -651,6 +699,8 @@ app.get('/', async (req, res) => {
   .pc-plug-status{font-weight:600;font-size:0.68rem;min-width:2.5rem}
   .pc-plug-toggle.on .pc-plug-status{color:#4ade80}
   .pc-plug-toggle.off .pc-plug-status{color:#f87171}
+  .pc-plug-power{font-size:0.62rem;color:#888;margin-left:0.25rem;font-weight:500}
+  .pc-plug-toggle.on .pc-plug-power{color:#86efac}
   .pc-auto-label{display:inline-flex;align-items:center;gap:0.3rem;cursor:pointer;font-size:0.65rem;color:#666;margin-left:auto;user-select:none}
   .pc-auto-label input{display:none}
   .pc-auto-label .slider{width:24px;height:12px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;position:relative;transition:background 0.2s;flex-shrink:0}
@@ -756,6 +806,10 @@ app.get('/', async (req, res) => {
     <div class="row"><span class="label">Load avg (1m)</span><span class="val">${sys.load1}</span></div>
     <div class="row"><span class="label">Cœurs logiques</span><span class="val">${sys.cpuCount}</span></div>
     ${tag(parseFloat(sys.cpuPct) < 50, parseFloat(sys.cpuPct) < 80, '✓ Normal', '⚠ Élevé', '✕ Critique')}
+    <hr class="divider">
+    <div id="top-processes">
+      <div class="proc-row" style="text-align:center;padding:0;color:#444;font-size:0.7rem">⏳ Top process…</div>
+    </div>
   </div>
 
   <!-- RAM -->
@@ -808,6 +862,7 @@ app.get('/', async (req, res) => {
     <div class="pc-actions" id="pc-gabriel-actions" style="display:none">
       <button class="pc-btn" onclick="pcAction('gabriel','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','kill_llm')">⏹ Kill LLM</button>
+      <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','shutdown')">⏻ Éteindre</button>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
         <input type="checkbox" id="auto-kill-gabriel">
         <span>Auto-kill RAM &gt;90%</span>
@@ -825,7 +880,7 @@ app.get('/', async (req, res) => {
       <button class="pc-btn" onclick="pcAction('louis','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('louis','kill_llm')">⏹ Kill LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('louis','shutdown')">⏻ Éteindre</button>
-      <label class="pc-plug-toggle" id="pc-louis-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-louis-plug-slider"></span><span class="pc-plug-status" id="pc-louis-plug-status">❓</span></label>
+      <label class="pc-plug-toggle" id="pc-louis-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-louis-plug-slider"></span><span class="pc-plug-status" id="pc-louis-plug-status">❓</span><span class="pc-plug-power" id="pc-louis-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
         <input type="checkbox" id="auto-kill-louis">
         <span>Auto-kill RAM &gt;90%</span>
@@ -843,7 +898,7 @@ app.get('/', async (req, res) => {
       <button class="pc-btn" onclick="pcAction('marie','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('marie','kill_llm')">⏹ Kill LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('marie','shutdown')">⏻ Éteindre</button>
-      <label class="pc-plug-toggle" id="pc-marie-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-marie-plug-slider"></span><span class="pc-plug-status" id="pc-marie-plug-status">❓</span></label>
+      <label class="pc-plug-toggle" id="pc-marie-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-marie-plug-slider"></span><span class="pc-plug-status" id="pc-marie-plug-status">❓</span><span class="pc-plug-power" id="pc-marie-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
         <input type="checkbox" id="auto-kill-marie">
         <span>Auto-kill RAM &gt;90%</span>
@@ -955,6 +1010,39 @@ app.get('/', async (req, res) => {
       const placeholder = document.getElementById('chart-placeholder');
       placeholder.textContent = 'Erreur de chargement du graphique.';
     });
+})();
+</script>
+
+<script>
+// Top processes — refresh every 15s
+(function() {
+  function renderProcs(data) {
+    var el = document.getElementById('top-processes');
+    if (!el) return;
+    var html = '';
+    for (var i = 0; i < data.length; i++) {
+      var p = data[i];
+      var cpuStr = p.cpu.toFixed(1) + '%';
+      var memStr = p.mem.toFixed(1) + '%';
+      var cmd = p.cmd.length > 55 ? p.cmd.substring(0, 52) + '…' : p.cmd;
+      html += '<div class="proc-row">'
+        + '<span class="proc-cpu" style="color:' + (p.cpu < 30 ? '#4ade80' : p.cpu < 60 ? '#facc15' : '#f87171') + '">' + cpuStr + '</span>'
+        + '<span class="proc-cmd">' + cmd + '</span>'
+        + '<span class="proc-mem">' + memStr + '</span>'
+        + '</div>';
+    }
+    el.innerHTML = html;
+  }
+
+  function fetchProcs() {
+    fetch('/api/top-processes')
+      .then(function(r) { return r.json(); })
+      .then(renderProcs)
+      .catch(function() { /* silently retry next cycle */ });
+  }
+
+  fetchProcs();
+  setInterval(fetchProcs, 15000);
 })();
 </script>
 
@@ -1280,20 +1368,28 @@ app.get('/', async (req, res) => {
     });
   };
 
-  function updatePlugToggle(name, state) {
+  function updatePlugToggle(name, state, power) {
     var toggle = document.getElementById('pc-' + name + '-plug-toggle');
     if (!toggle) return;
     var statusEl = document.getElementById('pc-' + name + '-plug-status');
+    var powerEl = document.getElementById('pc-' + name + '-plug-power');
     var isOn = state === 'on';
     toggle.className = 'pc-plug-toggle' + (isOn ? ' on' : ' off');
     if (statusEl) statusEl.textContent = isOn ? 'ON' : 'OFF';
+    if (powerEl && power !== undefined) {
+      if (isOn && power !== null && !isNaN(power)) {
+        powerEl.textContent = ' · ⚡ ' + (power >= 100 ? Math.round(power) : power.toFixed(1)) + ' W';
+      } else {
+        powerEl.textContent = '';
+      }
+    }
   }
 
   function fetchPlugState(name) {
     fetch('/api/pc-plug-state/' + name)
     .then(function(r) { return r.json(); })
     .then(function(res) {
-      if (res.ok) updatePlugToggle(name, res.state);
+      if (res.ok) updatePlugToggle(name, res.state, res.power);
     })
     .catch(function(err) {
       console.error('fetchPlugState(' + name + '):', err);
@@ -1302,7 +1398,19 @@ app.get('/', async (req, res) => {
 
   initToggles();
   refreshAll();
-  setInterval(refreshAll, 10000);
+  // Refresh adaptatif : 10s onglet visible, 60s onglet caché (économie de requêtes)
+  var REFRESH_VISIBLE = 10000;
+  var REFRESH_HIDDEN = 60000;
+  function scheduleRefresh() {
+    setTimeout(function() {
+      refreshAll();
+      scheduleRefresh();
+    }, document.hidden ? REFRESH_HIDDEN : REFRESH_VISIBLE);
+  }
+  scheduleRefresh();
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden) refreshAll();
+  });
 })();
 </script>
 
@@ -1413,7 +1521,7 @@ app.post('/api/pc-action', async (req, res) => {
       // Just toggle a local flag file on the target
       let sshHost, sshUser, sshKey;
       if (pc === 'marie') { sshHost = '192.168.3.58'; sshUser = 'gab'; sshKey = '/root/.ssh/id_ed25519_marie'; }
-      else if (pc === 'louis') { sshHost = '192.168.3.224'; sshUser = 'gab'; sshKey = ''; }
+      else if (pc === 'louis') { sshHost = '192.168.3.206'; sshUser = 'gab'; sshKey = ''; }
       else if (pc === 'gabriel') { sshHost = '192.168.3.224'; sshUser = 'gab'; sshKey = ''; }
       else return res.status(400).json({ ok: false, error: 'PC inconnu' });
 
@@ -1432,7 +1540,7 @@ app.post('/api/pc-action', async (req, res) => {
       if (pc === 'marie') {
         cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.58 'pkill llama-server 2>/dev/null; echo OK'";
       } else if (pc === 'louis') {
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'pkill llama-server 2>/dev/null; echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206 'pkill llama-server 2>/dev/null; echo OK'";
       } else {
         cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'pkill llama-server 2>/dev/null; echo OK'";
       }
@@ -1445,7 +1553,7 @@ app.post('/api/pc-action', async (req, res) => {
       if (pc === 'marie') {
         cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.58 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       } else if (pc === 'louis') {
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       } else {
         cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       }
@@ -1456,11 +1564,11 @@ app.post('/api/pc-action', async (req, res) => {
     if (action === 'shutdown') {
       let cmd;
       if (pc === 'louis') {
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'sudo shutdown -h now && echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206 'sudo poweroff; echo OK'";
       } else if (pc === 'marie') {
-        cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.58 'sudo shutdown -h now && echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.58 'sudo shutdown -h now; echo OK'";
       } else if (pc === 'gabriel') {
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'sudo shutdown -h now && echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'sudo shutdown -h now; echo OK'";
       } else return res.status(400).json({ ok: false, error: 'PC inconnu' });
       const result = execSync(cmd, { timeout: 30000 }).toString().trim();
       return res.json({ ok: true, result: result });

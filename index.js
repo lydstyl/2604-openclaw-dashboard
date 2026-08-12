@@ -1260,15 +1260,31 @@ app.get('/', async (req, res) => {
     var cpuBadge = (alertsOn && cpu > ALERT_CPU) ? alertBadge(cpu, ALERT_CPU) : '';
     var ramBadge = (alertsOn && memPct > ALERT_RAM) ? alertBadge(memPct, ALERT_RAM) : '';
 
+    // VRAM : une ligne par GPU si data.gpus est présent, sinon fallback agrégé (compat 1 GPU)
+    var vramHtml;
+    if (data.gpus && data.gpus.length > 0) {
+      vramHtml = data.gpus.map(function(g) {
+        var gp = parseFloat(g.pct) || 0;
+        var gName = g.name || ('GPU ' + g.index);
+        var gDetail = (g.total > 0) ? (g.used / 1024).toFixed(1) + 'G / ' + (g.total / 1024).toFixed(1) + 'G' : '—';
+        var gTemp = g.temp ? g.temp + '°C' : '—';
+        return '<div class="pc-row" style="margin-top:0.6rem"><span class="lbl">' + gName + '</span><span class="val" style="color:' + c(gp,70,90) + '">' + gp.toFixed(1) + '%</span></div>' +
+          '<div class="pc-mini-bar"><div class="pc-mini-fill" style="width:' + Math.min(100,gp) + '%;background:' + c(gp,70,90) + '"></div></div>' +
+          '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + gDetail + '</span><span>' + gTemp + '</span></div>';
+      }).join('');
+    } else {
+      vramHtml = '<div class="pc-row" style="margin-top:0.6rem"><span class="lbl">VRAM</span><span class="val" style="color:' + c(vramPct,70,90) + '">' + vramPct.toFixed(1) + '%</span></div>' +
+        '<div class="pc-mini-bar"><div class="pc-mini-fill" style="width:' + Math.min(100,vramPct) + '%;background:' + c(vramPct,70,90) + '"></div></div>' +
+        '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + vramDetail + '</span><span>' + vramTemp + '</span></div>';
+    }
+
     body.innerHTML =
       '<div class="pc-row"><span class="lbl">CPU' + (cpuBadge ? '' : '') + '</span><span class="val" style="color:' + c(cpu,50,80) + '">' + cpu.toFixed(1) + '%' + cpuBadge + '</span></div>' +
       '<div class="pc-mini-bar"><div class="pc-mini-fill" style="width:' + Math.min(100,cpu) + '%;background:' + c(cpu,50,80) + '"></div></div>' +
       '<div class="pc-row"><span class="lbl">RAM' + (ramBadge ? '' : '') + '</span><span class="val" style="color:' + c(memPct,60,80) + '">' + memPct.toFixed(1) + '%' + ramBadge + '</span></div>' +
       '<div class="pc-mini-bar"><div class="pc-mini-fill" style="width:' + Math.min(100,memPct) + '%;background:' + c(memPct,60,80) + '"></div></div>' +
       '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + memUsed + ' / ' + memTotal + '</span><span>libre ' + memAvail + '</span></div>' +
-      '<div class="pc-row" style="margin-top:0.6rem"><span class="lbl">VRAM</span><span class="val" style="color:' + c(vramPct,70,90) + '">' + vramPct.toFixed(1) + '%</span></div>' +
-      '<div class="pc-mini-bar"><div class="pc-mini-fill" style="width:' + Math.min(100,vramPct) + '%;background:' + c(vramPct,70,90) + '"></div></div>' +
-      '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + vramDetail + '</span><span>' + vramTemp + '</span></div>' +
+      vramHtml +
       '<hr class="divider">' +
       '<div class="pc-llm">🧠 <strong>' + llmModel + '</strong> <span class="pc-status ' + (llmStatus ? 'on' : 'off') + '">' + (llmStatus ? '● Running' : '● Stopped') + '</span></div>' +
       (llmStatus ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +

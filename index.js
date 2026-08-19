@@ -1536,7 +1536,7 @@ app.post('/api/pc-action', async (req, res) => {
     if (action === 'set_auto_kill') {
       // Just toggle a local flag file on the target
       let sshHost, sshUser, sshKey;
-      if (pc === 'marie') { sshHost = '192.168.3.58'; sshUser = 'gab'; sshKey = '/root/.ssh/id_ed25519_marie'; }
+      if (pc === 'marie') { sshHost = '192.168.3.57'; sshUser = 'gab'; sshKey = '/root/.ssh/id_ed25519_marie'; }
       else if (pc === 'louis') { sshHost = '192.168.3.206'; sshUser = 'gab'; sshKey = ''; }
       else if (pc === 'gabriel') { sshHost = '192.168.3.224'; sshUser = 'gab'; sshKey = ''; }
       else return res.status(400).json({ ok: false, error: 'PC inconnu' });
@@ -1554,7 +1554,7 @@ app.post('/api/pc-action', async (req, res) => {
     if (action === 'kill_llm') {
       let cmd;
       if (pc === 'marie') {
-        cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.58 'pkill llama-server 2>/dev/null; echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.57 'pkill llama-server 2>/dev/null; echo OK'";
       } else if (pc === 'louis') {
         cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206 'pkill llama-server 2>/dev/null; echo OK'";
       } else {
@@ -1567,7 +1567,7 @@ app.post('/api/pc-action', async (req, res) => {
     if (action === 'start_llm') {
       let cmd;
       if (pc === 'marie') {
-        cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.58 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.57 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       } else if (pc === 'louis') {
         cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       } else {
@@ -1582,7 +1582,7 @@ app.post('/api/pc-action', async (req, res) => {
       if (pc === 'louis') {
         cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206 'sudo poweroff; echo OK'";
       } else if (pc === 'marie') {
-        cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.58 'sudo shutdown -h now; echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.57 'sudo shutdown -h now; echo OK'";
       } else if (pc === 'gabriel') {
         cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'sudo shutdown -h now; echo OK'";
       } else return res.status(400).json({ ok: false, error: 'PC inconnu' });

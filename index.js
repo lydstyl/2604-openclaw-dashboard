@@ -1566,12 +1566,13 @@ app.post('/api/pc-action', async (req, res) => {
     
     if (action === 'start_llm') {
       let cmd;
+      // Script dans ~/script/ — nohup pour détacher du shell SSH (sinon tué à la fermeture)
       if (pc === 'marie') {
-        cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.57 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.57 'nohup ~/script/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       } else if (pc === 'louis') {
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206 'nohup ~/script/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       } else {
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 '~/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'nohup ~/script/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
       }
       const result = execSync(cmd, { timeout: 10000 }).toString().trim();
       return res.json({ ok: true, result: result });

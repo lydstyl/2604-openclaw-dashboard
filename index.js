@@ -1340,6 +1340,10 @@ app.get('/', async (req, res) => {
 
   // PC Action handler (exposed globally for onclick)
   window.pcAction = function(pc, action, value) {
+    var resultEl = document.getElementById('pc-' + pc + '-result');
+    // Feedback visuel immédiat pendant la requête (start_llm peut prendre plusieurs secondes)
+    if (resultEl && action === 'start_llm') resultEl.textContent = '⏳ Lancement…';
+
     fetch('/api/pc-action', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1348,15 +1352,23 @@ app.get('/', async (req, res) => {
     .then(function(r) { return r.json(); })
     .then(function(res) {
       console.log('pcAction(' + pc + ', ' + action + '):', res);
-      if (!res.ok) {
-        // Show error
-        var resultEl = document.getElementById('pc-' + pc + '-result');
-        if (resultEl) resultEl.textContent = '❌ ' + (res.error || 'Erreur');
+      // Toujours afficher le résultat final (ok ou échec) — le bouton ne doit plus rester muet
+      if (resultEl) {
+        if (res.ok) {
+          resultEl.textContent = '✅ ' + (res.result || 'OK');
+        } else {
+          resultEl.textContent = '❌ ' + (res.error || 'Erreur');
+        }
+      }
+      // Rafraîchir les métriques du PC concerné ~3-4s après (temps de démarrage + collecte)
+      if (action === 'start_llm') {
+        setTimeout(function() {
+          fetch('/api/pc-' + pc).then(function(r) { return r.json(); }).then(function(d) { renderPc(d, pc); }).catch(function(e) { console.error('pc-' + pc + ':', e); });
+        }, 3500);
       }
     })
     .catch(function(err) {
       console.error('pcAction error:', err);
-      var resultEl = document.getElementById('pc-' + pc + '-result');
       if (resultEl) resultEl.textContent = '❌ Erreur réseau';
     });
   }
@@ -1565,17 +1577,29 @@ app.post('/api/pc-action', async (req, res) => {
     }
     
     if (action === 'start_llm') {
-      let cmd;
+      let sshPrefix;
       // Script dans ~/script/ — nohup pour détacher du shell SSH (sinon tué à la fermeture)
       if (pc === 'marie') {
-        cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.57 'nohup ~/script/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
+        sshPrefix = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.57";
       } else if (pc === 'louis') {
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206 'nohup ~/script/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
+        sshPrefix = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206";
+      } else if (pc === 'gabriel') {
+        sshPrefix = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224";
       } else {
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'nohup ~/script/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
+        return res.status(400).json({ ok: false, error: 'PC inconnu' });
       }
-      const result = execSync(cmd, { timeout: 10000 }).toString().trim();
-      return res.json({ ok: true, result: result });
+      // Lancement réel (nohup + sortie masquée, code retour non fiable) — on vérifie ensuite
+      const launchCmd = sshPrefix + " 'nohup ~/script/start-default-llm.sh >/dev/null 2>&1 & echo OK'";
+      execSync(launchCmd, { timeout: 20000 });
+      // Laisser ~3s au LLM pour démarrer, puis vérifier que le serveur tourne réellement sur la cible
+      execSync('sleep 3', { timeout: 10000 });
+      const checkCmd = sshPrefix + " 'pgrep llama-server >/dev/null 2>&1 && echo RUNNING || echo STOPPED'";
+      const checkOut = execSync(checkCmd, { timeout: 20000 }).toString().trim();
+      if (checkOut.indexOf('RUNNING') !== -1) {
+        return res.json({ ok: true, result: 'Demarre' });
+      }
+      // La commande a répondu OK mais rien ne tourne : erreur honnête au lieu d'un faux succès
+      return res.json({ ok: false, error: "Le LLM n'a pas demarre sur " + pc + ". Verifier le GPU ou le script distant (~/script/start-default-llm.sh)." });
     }
 
     if (action === 'shutdown') {

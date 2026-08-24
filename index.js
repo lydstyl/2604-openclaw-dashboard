@@ -1216,6 +1216,15 @@ app.get('/', async (req, res) => {
     if (n >= 1024) return Math.round(n / 1024) + 'K';
     return String(n);
   }
+  // Extrait le nombre de slots paralleles (--parallel N / -np N) d'une commande llama-server.
+  // Absent -> 1. Ne matche pas --parallel-draft ni d'autres flags (espace requis apres le flag).
+  function extractParallel(cmd) {
+    if (!cmd || cmd === '—') return 1;
+    var m = cmd.match(/(?:^|\\s)--parallel\\s+(\\d+)/);
+    if (!m) m = cmd.match(/(?:^|\\s)-np\\s+(\\d+)/);
+    var n = m ? parseInt(m[1], 10) : 1;
+    return n > 0 ? n : 1;
+  }
 
   function renderPc(data, name) {
     var body = document.getElementById('pc-' + name + '-body');
@@ -1257,9 +1266,19 @@ app.get('/', async (req, res) => {
       var m = data.llm_cmd.match(/-m\s+(\S+)/);
       if (m) { llmModel = m[1].split('/').pop() || m[1]; }
     }
-    // Contexte max (ctx-size) depuis la commande, badge ex: ctx 96K
+    // Contexte max (ctx-size) depuis la commande + parallel (slots) : badge ex: ctx 256K/req x 5
+    // ctx par slot = ctx_total / parallel (entier, arrondi) ; si parallel absent ou <= 1 -> ctx total seul
     var llmCtx = extractCtxSize(data.llm_cmd);
-    var llmCtxBadge = llmCtx ? '<span class="pc-ctx-badge">ctx ' + formatCtxSize(llmCtx) + '</span>' : '';
+    var llmParallel = extractParallel(data.llm_cmd);
+    var llmCtxBadge = '';
+    if (llmCtx) {
+      if (llmParallel > 1) {
+        var perSlot = Math.round(llmCtx / llmParallel);
+        llmCtxBadge = '<span class="pc-ctx-badge">ctx ' + formatCtxSize(perSlot) + '/req x ' + llmParallel + '</span>';
+      } else {
+        llmCtxBadge = '<span class="pc-ctx-badge">ctx ' + formatCtxSize(llmCtx) + '</span>';
+      }
+    }
     // Fallback au champ fourni si le parsing a échoué
     if (llmModel === '—' && data.llm_model) { llmModel = data.llm_model; }
     var llmStatus = llmRunning;

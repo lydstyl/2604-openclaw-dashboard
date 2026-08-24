@@ -856,7 +856,7 @@ app.get('/', async (req, res) => {
 
   <!-- PC GABRIEL -->
   <div class="card ${visHidden('pc-gabriel')}" data-card-id="pc-gabriel" id="pc-gabriel-card">
-    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Gabriel <span id="pc-gabriel-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-gabriel" checked><span class="slider"></span>🔔</label></div>
+    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Gabriel <span id="pc-gabriel-ip" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">192.168.3.224</span><span id="pc-gabriel-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-gabriel" checked><span class="slider"></span>🔔</label></div>
     <div id="pc-gabriel-body">
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>
@@ -873,7 +873,7 @@ app.get('/', async (req, res) => {
 
   <!-- PC LOUIS -->
   <div class="card ${visHidden('pc-louis')}" data-card-id="pc-louis" id="pc-louis-card">
-    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Louis <span id="pc-louis-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-louis" checked><span class="slider"></span>🔔</label></div>
+    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Louis <span id="pc-louis-ip" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">192.168.3.206</span><span id="pc-louis-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-louis" checked><span class="slider"></span>🔔</label></div>
     <div id="pc-louis-body">
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>
@@ -891,7 +891,7 @@ app.get('/', async (req, res) => {
 
   <!-- PC MARIE -->
   <div class="card ${visHidden('pc-marie')}" data-card-id="pc-marie" id="pc-marie-card">
-    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Marie <span id="pc-marie-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-marie" checked><span class="slider"></span>🔔</label></div>
+    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Marie <span id="pc-marie-ip" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">192.168.3.57</span><span id="pc-marie-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-marie" checked><span class="slider"></span>🔔</label></div>
     <div id="pc-marie-body">
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>

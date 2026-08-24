@@ -666,6 +666,7 @@ app.get('/', async (req, res) => {
   .pc-status.off{background:#450a0a;color:#f87171}
   .pc-llm{font-size:0.72rem;color:#9ca3af;margin-top:0.3rem}
   .pc-llm strong{color:#e0e0e0;font-weight:500}
+  .pc-ctx-badge{display:inline-block;padding:0.08rem 0.4rem;border-radius:8px;font-size:0.62rem;font-weight:600;background:#1e293b;color:#93c5fd;margin-left:0.3rem;vertical-align:middle}
   /* Alertes */
   .alert-banner{display:none;background:#1a0a0a;border:1px solid #7f1d1d;border-radius:8px;padding:0.6rem 1rem;margin-bottom:1.25rem;font-size:0.8rem;gap:1rem;flex-wrap:wrap}
   .alert-banner.show{display:flex}
@@ -1197,6 +1198,25 @@ app.get('/', async (req, res) => {
     }).join('');
   }
 
+  // Extrait le contexte max (ctx-size) d'une commande llama-server.
+  // Matche -c N ou --ctx-size N, JAMAIS --ctx-size-draft N (espace requis après le flag).
+  // NOTE: backslashes doubles (\\s) — le HTML est servi via une template literal
+  // qui droppe les backslashes simples (\s devient s à l'exécution).
+  function extractCtxSize(cmd) {
+    if (!cmd || cmd === '—') return null;
+    var m = cmd.match(/(?:^|\\s)--ctx-size\\s+(\\d+)/);
+    if (!m) m = cmd.match(/(?:^|\\s)-c\\s+(\\d+)/);
+    return m ? parseInt(m[1], 10) : null;
+  }
+  // Format lisible : 98304 -> 96K, 1310720 -> 1.25M, 262144 -> 256K
+  function formatCtxSize(n) {
+    if (n >= 1048576) {
+      return (n / 1048576).toFixed(2).replace(/\\.?0+$/, '') + 'M';
+    }
+    if (n >= 1024) return Math.round(n / 1024) + 'K';
+    return String(n);
+  }
+
   function renderPc(data, name) {
     var body = document.getElementById('pc-' + name + '-body');
     var timeEl = document.getElementById('pc-' + name + '-time');
@@ -1237,6 +1257,9 @@ app.get('/', async (req, res) => {
       var m = data.llm_cmd.match(/-m\s+(\S+)/);
       if (m) { llmModel = m[1].split('/').pop() || m[1]; }
     }
+    // Contexte max (ctx-size) depuis la commande, badge ex: ctx 96K
+    var llmCtx = extractCtxSize(data.llm_cmd);
+    var llmCtxBadge = llmCtx ? '<span class="pc-ctx-badge">ctx ' + formatCtxSize(llmCtx) + '</span>' : '';
     // Fallback au champ fourni si le parsing a échoué
     if (llmModel === '—' && data.llm_model) { llmModel = data.llm_model; }
     var llmStatus = llmRunning;
@@ -1286,7 +1309,7 @@ app.get('/', async (req, res) => {
       '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + memUsed + ' / ' + memTotal + '</span><span>libre ' + memAvail + '</span></div>' +
       vramHtml +
       '<hr class="divider">' +
-      '<div class="pc-llm">🧠 <strong>' + llmModel + '</strong> <span class="pc-status ' + (llmStatus ? 'on' : 'off') + '">' + (llmStatus ? '● Running' : '● Stopped') + '</span></div>' +
+      '<div class="pc-llm">🧠 <strong>' + llmModel + '</strong>' + llmCtxBadge + ' <span class="pc-status ' + (llmStatus ? 'on' : 'off') + '">' + (llmStatus ? '● Running' : '● Stopped') + '</span></div>' +
       (llmStatus ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +
       '<div class="pc-action-result" id="pc-' + name + '-result"></div>';
 

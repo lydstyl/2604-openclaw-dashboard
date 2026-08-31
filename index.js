@@ -531,12 +531,14 @@ const HA_BASE = 'http://192.168.3.167:8123';
 const HA_HEADERS = { Authorization: `Bearer ${HA_TOKEN}`, 'Content-Type': 'application/json' };
 
 function getPlugEntity(name) {
+  if (name === 'gabriel') return 'switch.prise_1_sous_tableau_commutateur';
   if (name === 'louis') return 'switch.bouilloire_commutateur';
   if (name === 'marie') return 'switch.prise3';
   return null;
 }
 
 function getPlugPowerEntity(name) {
+  if (name === 'gabriel') return 'sensor.prise_1_sous_tableau_puissance';
   if (name === 'louis') return 'sensor.bouilloire_puissance';
   if (name === 'marie') return 'sensor.prise3_puissance';
   return null;
@@ -864,6 +866,7 @@ app.get('/', async (req, res) => {
       <button class="pc-btn" onclick="pcAction('gabriel','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','kill_llm')">⏹ Kill LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','shutdown')">⏻ Éteindre</button>
+      <label class="pc-plug-toggle" id="pc-gabriel-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-gabriel-plug-slider"></span><span class="pc-plug-status" id="pc-gabriel-plug-status">❓</span><span class="pc-plug-power" id="pc-gabriel-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
         <input type="checkbox" id="auto-kill-gabriel">
         <span>Auto-kill RAM &gt;90%</span>
@@ -1157,7 +1160,7 @@ app.get('/', async (req, res) => {
     localStorage.setItem('dash_alerts', JSON.stringify(cfg));
 
     // Plug toggle click handlers
-    ['louis','marie'].forEach(function(name) {
+    ['gabriel','louis','marie'].forEach(function(name) {
       var plugEl = document.getElementById('pc-' + name + '-plug-toggle');
       if (!plugEl) return;
       plugEl.addEventListener('click', function(e) {
@@ -1366,6 +1369,7 @@ app.get('/', async (req, res) => {
     fetch('/api/pc-gabriel').then(function(r){return r.json();}).then(function(d){renderPc(d,'gabriel');}).catch(function(e){console.error('pc-gabriel:',e);});
     fetch('/api/pc-louis').then(function(r){return r.json();}).then(function(d){renderPc(d,'louis');}).catch(function(e){console.error('pc-louis:',e);});
     fetch('/api/pc-marie').then(function(r){return r.json();}).then(function(d){renderPc(d,'marie');}).catch(function(e){console.error('pc-marie:',e);});
+    fetchPlugState('gabriel');
     fetchPlugState('louis');
     fetchPlugState('marie');
   }

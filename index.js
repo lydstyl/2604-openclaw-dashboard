@@ -666,6 +666,8 @@ app.get('/', async (req, res) => {
   .pc-status{display:inline-block;padding:0.1rem 0.5rem;border-radius:10px;font-size:0.65rem;font-weight:600}
   .pc-status.on{background:#14532d;color:#4ade80}
   .pc-status.off{background:#450a0a;color:#f87171}
+  .pc-status.busy{background:#451a03;color:#fcd34d;border:1px solid #d97706}
+  .pc-status.idle{background:#1a2a21;color:#86c5a8}
   .pc-llm{font-size:0.72rem;color:#9ca3af;margin-top:0.3rem}
   .pc-llm strong{color:#e0e0e0;font-weight:500}
   .pc-ctx-badge{display:inline-block;padding:0.08rem 0.4rem;border-radius:8px;font-size:0.62rem;font-weight:600;background:#1e293b;color:#93c5fd;margin-left:0.3rem;vertical-align:middle}
@@ -1285,6 +1287,12 @@ app.get('/', async (req, res) => {
     // Fallback au champ fourni si le parsing a échoué
     if (llmModel === '—' && data.llm_model) { llmModel = data.llm_model; }
     var llmStatus = llmRunning;
+    // Occupation LLM — cle llm_busy (1/0) issue du sondage /slots cote machine (is_processing)
+    var llmBusy = llmRunning && (data.llm_busy === 1 || data.llm_busy === '1' || data.llm_busy === true);
+    var llmActivityBadge = '';
+    if (llmStatus) {
+      llmActivityBadge = llmBusy ? '<span class="pc-status busy">⚡ TACHE EN COURS</span>' : '<span class="pc-status idle">LIBRE</span>';
+    }
     var llmRss = data.llm_rss_gb ? data.llm_rss_gb + ' GB' : '—';
     var llmUptime = data.llm_uptime || '—';
 
@@ -1331,7 +1339,7 @@ app.get('/', async (req, res) => {
       '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + memUsed + ' / ' + memTotal + '</span><span>libre ' + memAvail + '</span></div>' +
       vramHtml +
       '<hr class="divider">' +
-      '<div class="pc-llm">🧠 <strong>' + llmModel + '</strong>' + llmCtxBadge + ' <span class="pc-status ' + (llmStatus ? 'on' : 'off') + '">' + (llmStatus ? '● Running' : '● Stopped') + '</span></div>' +
+      '<div class="pc-llm">🧠 <strong>' + llmModel + '</strong>' + llmCtxBadge + ' <span class="pc-status ' + (llmStatus ? 'on' : 'off') + '">' + (llmStatus ? '● Running' : '● Stopped') + '</span>' + llmActivityBadge + '</div>' +
       (llmStatus ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +
       '<div class="pc-action-result" id="pc-' + name + '-result"></div>';
 

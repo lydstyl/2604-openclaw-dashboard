@@ -695,6 +695,10 @@ app.get('/', async (req, res) => {
   .pc-status.off{background:#450a0a;color:#f87171}
   .pc-status.busy{background:#451a03;color:#fcd34d;border:1px solid #d97706}
   .pc-status.idle{background:#1a2a21;color:#86c5a8}
+  .pc-status.img{background:#2a1a0a;color:#fb923c;border:1px solid #7c2d12}
+  .pc-img-port,.pc-img-uptime{font-size:0.65rem;color:#888;margin-left:0.35rem}
+  .pc-llm-link-img{background:#231404;color:#fb923c;border-color:#7c2d12}
+  .pc-llm-link-img:hover{background:#331e06;color:#fdba74;border-color:#ea580c}
   .pc-llm{font-size:0.72rem;color:#9ca3af;margin-top:0.3rem}
   .pc-llm strong{color:#e0e0e0;font-weight:500}
   .pc-ctx-badge{display:inline-block;padding:0.08rem 0.4rem;border-radius:8px;font-size:0.62rem;font-weight:600;background:#1e293b;color:#93c5fd;margin-left:0.3rem;vertical-align:middle}
@@ -1363,8 +1367,28 @@ app.get('/', async (req, res) => {
     var llmPort = extractLlmPort(data.llm_cmd) || '8080';
     var pcIp = PC_IPS[name] || '';
     var llmLinkHtml = pcIp
-      ? '<a class="pc-llm-link" href="http://' + pcIp + ':' + llmPort + '/" target="_blank" rel="noopener">🔗 Interface :' + llmPort + '</a>'
+      ? '<a class="pc-llm-link" href="http://' + pcIp + ':' + llmPort + '/" target="_blank" rel="noopener">🔗 LLM :' + llmPort + '</a>'
       : '';
+    // Serveur d'images Qwen-Image (sd-server) : ligne dediee + lien vers SON interface.
+    // Sans ca, la carte du .224 ne voyait que les llama-server : pendant une generation
+    // d'images elle affichait "● Stopped" et un lien vers un 8080 eteint.
+    var imgRunning = (data.img_status === 'active') || (data.img_running === true);
+    var imgPort = parseInt(data.img_port, 10) || 0;
+    var imgHtml = '';
+    var imgLinkHtml = '';
+    if (!stale && imgRunning) {
+      var imgModel = data.img_model || 'Qwen-Image';
+      var imgCount = parseInt(data.img_count, 10) || 0;
+      imgHtml = '<div class="pc-llm">🎨 <strong>' + imgModel + '</strong>' +
+        '<span class="pc-status img">● Running</span>' +
+        (imgPort ? '<span class="pc-img-port">:' + imgPort + '</span>' : '') +
+        (data.img_uptime && data.img_uptime !== '-' ? '<span class="pc-img-uptime">↑ ' + data.img_uptime + '</span>' : '') +
+        (imgCount > 1 ? '<span class="pc-img-uptime">×' + imgCount + ' serveurs</span>' : '') +
+        '</div>';
+      if (pcIp && imgPort) {
+        imgLinkHtml = '<a class="pc-llm-link pc-llm-link-img" href="http://' + pcIp + ':' + imgPort + '/" target="_blank" rel="noopener">🔗 Image :' + imgPort + '</a>';
+      }
+    }
 
     function c(val, t60, t80) {
       return val < t60 ? '#4ade80' : val < t80 ? '#facc15' : '#f87171';
@@ -1416,7 +1440,8 @@ app.get('/', async (req, res) => {
       '<hr class="divider">' +
       '<div class="pc-llm">🧠 <strong>' + llmModelTxt + '</strong>' + llmCtxBadgeTxt + ' ' + llmStateHtml + llmActivityBadge + '</div>' +
       ((!stale && llmStatus) ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +
-      '<div class="pc-llm-link-row">' + llmLinkHtml + '</div>' +
+      imgHtml +
+      '<div class="pc-llm-link-row">' + llmLinkHtml + imgLinkHtml + '</div>' +
       '<div class="pc-action-result" id="pc-' + name + '-result"></div>';
 
     // Update auto-kill checkbox

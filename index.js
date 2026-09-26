@@ -439,6 +439,12 @@ app.get('/api/delegation-stats', (req, res) => {
 
 // ─── PC Health Cache ─────────────────────────────────────────────────
 const pcCache = { gabriel: null, louis: null, marie: null, gabrielOk: false, louisOk: false, marieOk: false };
+// Horodatage du dernier relevé RÉUSSI par PC. Le cache garde le dernier relevé quand le
+// backend (FastAPI 3019/3024) est mort → sans ce flag le front affiche des données
+// vieilles de plusieurs heures comme si elles étaient live (bug « LLM déjà lancé » 26/09).
+const pcCacheTs = { gabriel: 0, louis: 0, marie: 0 };
+// Au-delà de 3 cycles de collecte (15 s) sans succès, les données sont franchement figées.
+const PC_STALE_AFTER_S = 45;
 
 async function fetchPcHealth(name, host, port) {
   const http = require('http');
@@ -458,6 +464,7 @@ async function fetchPcHealth(name, host, port) {
               const data = JSON.parse(m[1]);
               pcCache[name] = data;
               pcCache[name + 'Ok'] = true;
+              pcCacheTs[name] = Date.now();
               resolve(data);
             } catch (e) { reject(new Error('JSON parse error')); }
           }
@@ -485,19 +492,35 @@ function startPcCache() {
   setInterval(update, 15000); // then every 15s
 }
 
+// ─── Réponse /api/pc-* : marque les données figées ───────────────────
+// Le cache survit à la mort du backend. On expose _stale / _age_s pour que le front
+// n'affiche jamais un vieux relevé comme s'il était live.
+function pcPayload(name) {
+  const d = pcCache[name];
+  if (!d) return { error: 'Waiting for data…' };
+  const ts = pcCacheTs[name] || 0;
+  const ageS = ts ? Math.round((Date.now() - ts) / 1000) : null;
+  const fresh = pcCache[name + 'Ok'] === true;
+  return Object.assign({}, d, {
+    _stale: !fresh || (ageS !== null && ageS > PC_STALE_AFTER_S),
+    _age_s: ageS,
+    _fetched_at: ts ? new Date(ts).toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris' }) : null,
+  });
+}
+
 // API: PC Gabriel
 app.get('/api/pc-gabriel', (req, res) => {
-  res.json(pcCache.gabriel || { error: 'Waiting for data…' });
+  res.json(pcPayload('gabriel'));
 });
 
 // API: PC Louis
 app.get('/api/pc-louis', (req, res) => {
-  res.json(pcCache.louis || { error: 'Waiting for data…' });
+  res.json(pcPayload('louis'));
 });
 
 // API: PC Marie
 app.get('/api/pc-marie', (req, res) => {
-  res.json(pcCache.marie || { error: 'Waiting for data…' });
+  res.json(pcPayload('marie'));
 });
 
 // API: card visibility
@@ -644,6 +667,10 @@ app.get('/', async (req, res) => {
   .tag-yellow{background:#3b2f00;color:#facc15}
   .tag-red{background:#450a0a;color:#f87171}
   .error-note{color:#f87171;font-size:0.75rem;margin-top:0.5rem}
+  .pc-llm-link{display:inline-block;margin-top:0.35rem;padding:0.2rem 0.55rem;background:#0a1a2a;color:#60a5fa;border:1px solid #1e3a5f;border-radius:5px;font-size:0.68rem;text-decoration:none}
+  .pc-llm-link:hover{background:#0f2540;color:#93c5fd;border-color:#2563eb}
+  .pc-llm-link-row{line-height:1.1}
+  .pc-stale-banner{background:#2a0a0a;color:#fca5a5;border:1px solid #7f1d1d;border-radius:6px;padding:0.35rem 0.5rem;font-size:0.68rem;margin-bottom:0.45rem;line-height:1.3}
   .proc-row{display:flex;justify-content:space-between;align-items:center;font-size:0.7rem;margin-top:0.25rem;font-family:'SF Mono','Fira Code','Consolas',monospace}
   .proc-row .proc-cpu{color:#4ade80;font-weight:600;min-width:2.2rem;text-align:right}
   .proc-row .proc-cmd{color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;margin-left:0.5rem}
@@ -1181,6 +1208,7 @@ app.get('/', async (req, res) => {
       if (!cfg[name]) return;
       var data = window['_pc_' + name];
       if (!data || data.error) return;
+      if (data._stale === true || data._stale === 'true') return; // données figées → pas d'alerte fantôme
       var cpu = parseFloat(data.cpu) || 0;
       var mem = parseFloat(data.mem_pct) || 0;
       var alerts = [];
@@ -1221,6 +1249,29 @@ app.get('/', async (req, res) => {
     if (n >= 1024) return Math.round(n / 1024) + 'K';
     return String(n);
   }
+  // IP LAN de chaque carte (pour le lien direct vers l'interface web du serveur LLM)
+  var PC_IPS = { gabriel: '192.168.3.224', louis: '192.168.3.206', marie: '192.168.3.57' };
+  // Port d'ecoute du serveur LLM : --port (llama.cpp) ou --listen-port (sd-server), sinon 8080.
+  // Parsing par split volontairement (pas de regex : une regex ici devrait doubler ses backslashes).
+  function extractLlmPort(cmd) {
+    if (!cmd || cmd === '—') return null;
+    var parts = String(cmd).split(' ');
+    for (var i = 0; i < parts.length; i++) {
+      if ((parts[i] === '--port' || parts[i] === '--listen-port') && parts[i + 1]) {
+        var digits = parts[i + 1].replace(/[^0-9]/g, '');
+        return digits || null;
+      }
+    }
+    return null;
+  }
+  // Age lisible : 42 -> 42s, 180 -> 3min, 5400 -> 1h30
+  function formatAge(sec) {
+    var s = Math.max(0, Math.round(parseFloat(sec) || 0));
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.round(s / 60) + 'min';
+    var h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+    return h + 'h' + (m > 0 ? String(m).padStart(2, '0') : '00');
+  }
   // Extrait le nombre de slots paralleles (--parallel N / -np N) d'une commande llama-server.
   // Absent -> 1. Ne matche pas --parallel-draft ni d'autres flags (espace requis apres le flag).
   function extractParallel(cmd) {
@@ -1250,8 +1301,12 @@ app.get('/', async (req, res) => {
       return;
     }
 
+    // Données figées : le backend n'a pas pu rafraîchir (SSH/backend mort) — le cache
+    // conserve le dernier relevé. On l'AFFICHE COMME PÉRIMÉ, jamais comme live.
+    var stale = (data._stale === true || data._stale === 'true');
+    var staleAge = (data._age_s === 0 || data._age_s) ? formatAge(data._age_s) : '—';
     var ts = data.timestamp || '—';
-    if (timeEl) timeEl.textContent = ts;
+    if (timeEl) timeEl.textContent = stale ? ('⛔ ' + ts + ' · figé') : ts;
 
     var cpu = parseFloat(data.cpu) || 0;
     var memPct = parseFloat(data.mem_pct) || 0;
@@ -1267,8 +1322,10 @@ app.get('/', async (req, res) => {
     });
     var llmRunning = (parseFloat(data.llm_rss) || 0) > 0 || hasLlamaProc;
     var llmModel = '—';
+    // ⚠️ OBLIGATOIRE : 2 backslashes en source → le JS servi passe par une template
+    // literal (1 backslash y devient 0) → regex cassée, nom du modèle jamais extrait.
     if (data.llm_cmd && data.llm_cmd !== '—') {
-      var m = data.llm_cmd.match(/-m\s+(\S+)/);
+      var m = data.llm_cmd.match(/-m\\s+(\\S+)/);
       if (m) { llmModel = m[1].split('/').pop() || m[1]; }
     }
     // Contexte max (ctx-size) depuis la commande + parallel (slots) : badge ex: ctx 256K/req x 5
@@ -1288,13 +1345,26 @@ app.get('/', async (req, res) => {
     if (llmModel === '—' && data.llm_model) { llmModel = data.llm_model; }
     var llmStatus = llmRunning;
     // Occupation LLM — cle llm_busy (1/0) issue du sondage /slots cote machine (is_processing)
-    var llmBusy = llmRunning && (data.llm_busy === 1 || data.llm_busy === '1' || data.llm_busy === true);
+    // Données figées => on ne prétend RIEN sur l'état du LLM (ni Running ni Stopped).
+    var llmBusy = !stale && llmRunning && (data.llm_busy === 1 || data.llm_busy === '1' || data.llm_busy === true);
     var llmActivityBadge = '';
-    if (llmStatus) {
+    if (!stale && llmStatus) {
       llmActivityBadge = llmBusy ? '<span class="pc-status busy">⚡ TACHE EN COURS</span>' : '<span class="pc-status idle">LIBRE</span>';
     }
+    var llmStateHtml = stale
+      ? '<span class="pc-status off">● État inconnu (figé)</span>'
+      : '<span class="pc-status ' + (llmStatus ? 'on' : 'off') + '">' + (llmStatus ? '● Running' : '● Stopped') + '</span>';
+    var llmModelTxt = stale ? '—' : llmModel;
+    var llmCtxBadgeTxt = stale ? '' : llmCtxBadge;
     var llmRss = data.llm_rss_gb ? data.llm_rss_gb + ' GB' : '—';
     var llmUptime = data.llm_uptime || '—';
+    // Lien direct vers l'interface web du serveur LLM de la machine (llama.cpp :8080, ou le
+    // port reel lu dans la ligne de commande --port / --listen-port)
+    var llmPort = extractLlmPort(data.llm_cmd) || '8080';
+    var pcIp = PC_IPS[name] || '';
+    var llmLinkHtml = pcIp
+      ? '<a class="pc-llm-link" href="http://' + pcIp + ':' + llmPort + '/" target="_blank" rel="noopener">🔗 Interface :' + llmPort + '</a>'
+      : '';
 
     function c(val, t60, t80) {
       return val < t60 ? '#4ade80' : val < t80 ? '#facc15' : '#f87171';
@@ -1310,8 +1380,8 @@ app.get('/', async (req, res) => {
     var cfg = getAlertConfig();
     var alertsOn = cfg[name] !== false;
 
-    var cpuBadge = (alertsOn && cpu > ALERT_CPU) ? alertBadge(cpu, ALERT_CPU) : '';
-    var ramBadge = (alertsOn && memPct > ALERT_RAM) ? alertBadge(memPct, ALERT_RAM) : '';
+    var cpuBadge = (alertsOn && !stale && cpu > ALERT_CPU) ? alertBadge(cpu, ALERT_CPU) : '';
+    var ramBadge = (alertsOn && !stale && memPct > ALERT_RAM) ? alertBadge(memPct, ALERT_RAM) : '';
 
     // VRAM : une ligne par GPU si data.gpus est présent, sinon fallback agrégé (compat 1 GPU)
     var vramHtml;
@@ -1331,7 +1401,12 @@ app.get('/', async (req, res) => {
         '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + vramDetail + '</span><span>' + vramTemp + '</span></div>';
     }
 
+    var staleBanner = stale
+      ? '<div class="pc-stale-banner">⛔ Données figées — backend injoignable. Dernier relevé il y a ' + staleAge + ' (' + (data.timestamp || '?') + ')</div>'
+      : '';
+
     body.innerHTML =
+      staleBanner +
       '<div class="pc-row"><span class="lbl">CPU' + (cpuBadge ? '' : '') + '</span><span class="val" style="color:' + c(cpu,50,80) + '">' + cpu.toFixed(1) + '%' + cpuBadge + '</span></div>' +
       '<div class="pc-mini-bar"><div class="pc-mini-fill" style="width:' + Math.min(100,cpu) + '%;background:' + c(cpu,50,80) + '"></div></div>' +
       '<div class="pc-row"><span class="lbl">RAM' + (ramBadge ? '' : '') + '</span><span class="val" style="color:' + c(memPct,60,80) + '">' + memPct.toFixed(1) + '%' + ramBadge + '</span></div>' +
@@ -1339,8 +1414,9 @@ app.get('/', async (req, res) => {
       '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + memUsed + ' / ' + memTotal + '</span><span>libre ' + memAvail + '</span></div>' +
       vramHtml +
       '<hr class="divider">' +
-      '<div class="pc-llm">🧠 <strong>' + llmModel + '</strong>' + llmCtxBadge + ' <span class="pc-status ' + (llmStatus ? 'on' : 'off') + '">' + (llmStatus ? '● Running' : '● Stopped') + '</span>' + llmActivityBadge + '</div>' +
-      (llmStatus ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +
+      '<div class="pc-llm">🧠 <strong>' + llmModelTxt + '</strong>' + llmCtxBadgeTxt + ' ' + llmStateHtml + llmActivityBadge + '</div>' +
+      ((!stale && llmStatus) ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +
+      '<div class="pc-llm-link-row">' + llmLinkHtml + '</div>' +
       '<div class="pc-action-result" id="pc-' + name + '-result"></div>';
 
     // Update auto-kill checkbox

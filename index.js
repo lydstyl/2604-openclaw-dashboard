@@ -523,6 +523,151 @@ app.get('/api/pc-marie', (req, res) => {
   res.json(pcPayload('marie'));
 });
 
+// ─── LLM du PC Gabriel (192.168.3.224) : état réel par HTTP ────────────────
+// Le .224 n'est pas comme Louis/Marie : le moteur qui y tourne change (Strata =
+// serve/server.py + engine/strata, ou llama.cpp). `pgrep llama-server` ne voit QUE
+// llama.cpp et ment donc sur Strata. Seule sonde fiable pour les deux : HTTP.
+// curl n'existe pas dans l'image → module http de Node.
+const LLM224_HOST = '192.168.3.224';
+const LLM224_PORT = 8080;
+const LLM224 = { cache: null, cacheTs: 0, busy: false, startingUntil: 0, lastModel: null };
+
+function httpGetJson(host, port, urlPath, timeoutMs, cb) {
+  let done = false;
+  let req = null;
+  const finish = (err, data) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    if (req) req.destroy();
+    cb(err, data);
+  };
+  const timer = setTimeout(() => {
+    if (done) return;
+    done = true;
+    if (req) req.destroy();
+    cb(new Error('timeout ' + timeoutMs + 'ms sur ' + urlPath));
+  }, timeoutMs);
+  try {
+    req = require('http').get({ host: host, port: port, path: urlPath, method: 'GET' }, (res) => {
+      let body = '';
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => {
+        try { finish(null, JSON.parse(body)); }
+        catch (e) { finish(new Error('JSON invalide sur ' + urlPath + ' : ' + e.message)); }
+      });
+      res.on('error', (e) => finish(e));
+    });
+    req.on('error', (e) => finish(e));
+  } catch (e) { finish(e); }
+}
+
+function llama224WindowOpen() { return Date.now() < LLM224.startingUntil; }
+function startLlama224Window(ms) { LLM224.startingUntil = Date.now() + (ms || 180000); LLM224.cache = null; LLM224.cacheTs = 0; }
+function clearLlama224Window() { LLM224.startingUntil = 0; LLM224.cache = null; LLM224.cacheTs = 0; }
+
+// Sonde : /health (3 s) puis /v1/models (3 s) pour le nom RÉELLEMENT servi.
+// running = /health répond ok · starting = sourd pendant la fenêtre de démarrage · stopped = le reste.
+// force = true → ignore le cache (utilisé après un arrêt/démarrage, là où le cache mentirait).
+function probeLlama224(cb, force) {
+  const now = Date.now();
+  const shape = (entry) => {
+    const out = Object.assign({}, entry);
+    out.age_s = Math.round((Date.now() - entry.ts) / 100) / 10;
+    delete out.ts;
+    return out;
+  };
+  if (!force && LLM224.cache && (now - LLM224.cacheTs) < 2000) return cb(null, shape(LLM224.cache));
+  if (LLM224.busy) {
+    return cb(null, LLM224.cache ? shape(LLM224.cache)
+      : { state: llama224WindowOpen() ? 'starting' : 'stopped', model: null, ctx: null, images: null, health: false, age_s: 0, error: 'sonde déjà en cours' });
+  }
+  LLM224.busy = true;
+  const done = (info, errMsg) => {
+    LLM224.busy = false;
+    if (!info) {
+      info = {
+        state: llama224WindowOpen() ? 'starting' : 'stopped',
+        model: null, ctx: null, images: null, health: false, error: errMsg || null
+      };
+    }
+    if (info.state === 'running') {
+      LLM224.startingUntil = 0;               // il répond : plus de démarrage en cours
+      if (info.model) LLM224.lastModel = info.model;
+    }
+    info.ts = Date.now();
+    LLM224.cache = info;
+    LLM224.cacheTs = info.ts;
+    cb(null, shape(info));
+  };
+  httpGetJson(LLM224_HOST, LLM224_PORT, '/health', 3000, (hErr, health) => {
+    if (hErr || !health || health.status !== 'ok') {
+      return done(null, hErr ? hErr.message : 'health non ok');
+    }
+    httpGetJson(LLM224_HOST, LLM224_PORT, '/v1/models', 3000, (mErr, models) => {
+      let model = health.model || LLM224.lastModel || null;
+      let ctx = health.max_context || null;
+      if (!mErr && models && models.data && models.data.length > 0) {
+        const m0 = models.data[0];
+        if (m0.id) model = m0.id;
+        if (m0.meta && m0.meta.n_ctx) ctx = m0.meta.n_ctx;
+      }
+      // Occupation : /slots (`is_processing`) existe pour llama.cpp ET pour Strata — c'est la
+      // même sémantique que le badge des cartes Louis/Marie. /status (Strata seul) enrichit
+      // avec le débit ; llama.cpp répond 404 → on l'ignore, jamais bloquant.
+      httpGetJson(LLM224_HOST, LLM224_PORT, '/slots', 2500, (sErr, slots) => {
+        let busy = null;
+        if (!sErr && Array.isArray(slots) && slots.length > 0 && slots[0] && typeof slots[0].is_processing !== 'undefined') {
+          busy = slots[0].is_processing === true;
+        }
+        httpGetJson(LLM224_HOST, LLM224_PORT, '/status', 2500, (stErr, st) => {
+          let activity = null;
+          if (busy === true && !stErr && st && typeof st === 'object') {
+            activity = {
+              phase: st.phase || null,
+              queued: (typeof st.queued === 'number') ? st.queued : null,
+              generated: (typeof st.generated === 'number') ? st.generated : null,
+              elapsed_s: (typeof st.elapsed_s === 'number') ? st.elapsed_s : null,
+              tokens_per_s: (typeof st.tokens_per_s === 'number') ? st.tokens_per_s : null,
+              max_tokens: (typeof st.max_tokens === 'number') ? st.max_tokens : null,
+            };
+          }
+          done({
+            state: 'running', model: model, ctx: ctx,
+            images: health.images === true, health: true,
+            busy: busy, activity: activity,
+            error: mErr ? mErr.message : null
+          });
+        });
+      });
+    });
+  });
+}
+
+function probeLlama224Async(force) {
+  return new Promise((resolve) => probeLlama224((err, info) => resolve(info), force));
+}
+
+// API: état du LLM du .224 (Strata ou llama.cpp) — c'est ce que lit la carte PC Gabriel
+app.get('/api/llm-224', (req, res) => {
+  probeLlama224((err, info) => {
+    if (!info) {
+      return res.json({ state: 'stopped', model: null, ctx: null, images: null, health: false, age_s: null, error: err ? err.message : 'sonde indisponible' });
+    }
+    res.json(Object.assign({ host: LLM224_HOST, port: LLM224_PORT, starting: llama224WindowOpen() }, info));
+  });
+});
+
+function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Lance une commande shell DÉTACHÉE : la requête HTTP rend la main tout de suite
+// (un démarrage Strata dure 66-120 s, impossible à attendre dans une réponse HTTP).
+function spawnDetached(cmd) {
+  const child = require('child_process').spawn('/bin/sh', ['-c', cmd], { detached: true, stdio: 'ignore' });
+  child.unref();
+  return child;
+}
+
 // API: card visibility
 app.get('/api/card-visibility', (req, res) => {
   res.json(loadCardVisibility());
@@ -896,8 +1041,8 @@ app.get('/', async (req, res) => {
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>
     <div class="pc-actions" id="pc-gabriel-actions" style="display:none">
-      <button class="pc-btn" onclick="pcAction('gabriel','start_llm')">▶ Lancer LLM</button>
-      <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','kill_llm')">⏹ Kill LLM</button>
+      <button class="pc-btn" onclick="pcAction('gabriel','start_llm')">▶ Démarrer LLM</button>
+      <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','kill_llm')">⏹ Arrêter LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','shutdown')">⏻ Éteindre</button>
       <label class="pc-plug-toggle" id="pc-gabriel-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-gabriel-plug-slider"></span><span class="pc-plug-status" id="pc-gabriel-plug-status">❓</span><span class="pc-plug-power" id="pc-gabriel-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
@@ -1438,7 +1583,9 @@ app.get('/', async (req, res) => {
       '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + memUsed + ' / ' + memTotal + '</span><span>libre ' + memAvail + '</span></div>' +
       vramHtml +
       '<hr class="divider">' +
-      '<div class="pc-llm">🧠 <strong>' + llmModelTxt + '</strong>' + llmCtxBadgeTxt + ' ' + llmStateHtml + llmActivityBadge + '</div>' +
+      ((name === 'gabriel')
+        ? '<div class="pc-llm" id="pc-gabriel-llm">🧠 <strong>—</strong> <span class="pc-status idle">⏳ état…</span></div>'
+        : '<div class="pc-llm" id="pc-' + name + '-llm">🧠 <strong>' + llmModelTxt + '</strong>' + llmCtxBadgeTxt + ' ' + llmStateHtml + llmActivityBadge + '</div>') +
       ((!stale && llmStatus) ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +
       imgHtml +
       '<div class="pc-llm-link-row">' + llmLinkHtml + imgLinkHtml + '</div>' +
@@ -1471,7 +1618,72 @@ app.get('/', async (req, res) => {
       }
     }
 
+    if (name === 'gabriel') refreshLlm224();
+
     updateAlertBanner();
+  }
+
+  // ── État du LLM du .224 (Strata ou llama.cpp) ────────────────────────────
+  // Lu sur /api/llm-224 (sonde HTTP /health + /v1/models côté serveur), JAMAIS sur les
+  // process : le .224 change de moteur et Strata (Python) n'a aucun llama-server.
+  // ⚠️ Ce bloc vit dans une template literal : pas de backtick, pas d'interpolation, pas d'antislash.
+  var _llm224Busy = false;
+  var _llm224StartTs = 0;
+
+  function renderLlm224(info) {
+    var el = document.getElementById('pc-gabriel-llm');
+    if (!el) return;
+    var html = '';
+    if (info.state === 'stopped') {
+      html = '🧠 <strong>—</strong> <span class="pc-status off">● Arrêté</span>';
+    } else if (info.state === 'starting') {
+      html = '🧠 <strong>démarrage…</strong> <span class="pc-status busy">● En cours de démarrage…</span> <span class="pc-status idle">(66-120 s, première charge)</span>';
+    } else if (info.state === 'running') {
+      var modelTxt = info.model ? info.model : 'modèle inconnu';
+      html = '🧠 <strong>' + modelTxt + '</strong>';
+      if (info.ctx) { html += ' <span class="pc-ctx-badge">ctx ' + formatCtxSize(info.ctx) + '</span>'; }
+      html += ' <span class="pc-status on">● En marche :8080</span>';
+      if (info.images === true) { html += ' <span class="pc-status img">🖼 vision</span>'; }
+      // Occupation — même badge que les cartes Louis/Marie, mais lu sur /slots (Strata n'a
+      // pas de processus llama-server : c'est le badge du backend SSE qui manquait ici).
+      if (info.busy === true) {
+        html += ' <span class="pc-status busy">⚡ TACHE EN COURS</span>';
+        var act = info.activity || null;
+        var det = '';
+        if (act) {
+          if (act.tokens_per_s) { det += act.tokens_per_s + ' t/s'; }
+          if (act.generated) { det += (det ? ' · ' : '') + act.generated + ' tok'; }
+          if (typeof act.elapsed_s === 'number') { det += (det ? ' · ' : '') + act.elapsed_s + ' s'; }
+        }
+        if (det) { html += ' <span class="pc-status idle">' + det + '</span>'; }
+      } else if (info.busy === false) {
+        html += ' <span class="pc-status idle">LIBRE</span>';
+      }
+    } else {
+      html = '🧠 <strong>—</strong> <span class="pc-status off">● État inconnu</span>';
+    }
+    el.innerHTML = html;
+  }
+
+  function refreshLlm224() {
+    if (_llm224Busy) return;
+    _llm224Busy = true;
+    fetch('/api/llm-224').then(function(r) { return r.json(); }).then(function(data) {
+      _llm224Busy = false;
+      renderLlm224(data);
+      // Pendant un démarrage on re-sonde toutes les 5 s, mais jamais plus de 4 min
+      // (au-delà : le démarrage a échoué, on laisse la carte dire « Arrêté »).
+      if (data && data.state === 'starting') {
+        if (!_llm224StartTs) _llm224StartTs = Date.now();
+        if ((Date.now() - _llm224StartTs) < 240000) setTimeout(function() { refreshLlm224(); }, 5000);
+      } else {
+        _llm224StartTs = 0;
+      }
+    }).catch(function(e) {
+      _llm224Busy = false;
+      _llm224StartTs = 0;
+      renderLlm224({ state: 'unknown', error: 'réseau' });
+    });
   }
 
   function refreshAll() {
@@ -1498,6 +1710,7 @@ app.get('/', async (req, res) => {
     var resultEl = document.getElementById('pc-' + pc + '-result');
     // Feedback visuel immédiat pendant la requête (start_llm peut prendre plusieurs secondes)
     if (resultEl && action === 'start_llm') resultEl.textContent = '⏳ Lancement…';
+    if (resultEl && action === 'kill_llm' && pc === 'gabriel') resultEl.textContent = '⏳ Arrêt en cours…';
 
     fetch('/api/pc-action', {
       method: 'POST',
@@ -1510,11 +1723,16 @@ app.get('/', async (req, res) => {
       // Toujours afficher le résultat final (ok ou échec) — le bouton ne doit plus rester muet
       if (resultEl) {
         if (res.ok) {
-          resultEl.textContent = '✅ ' + (res.result || 'OK');
+          // Un démarrage lancé n'est PAS un démarrage réussi : on l'annonce comme en cours
+          // tant que la sonde /health ne confirme pas l'état « running ».
+          resultEl.textContent = (res.state === 'starting' ? '⏳ ' : '✅ ') + (res.result || 'OK');
         } else {
           resultEl.textContent = '❌ ' + (res.error || 'Erreur');
         }
       }
+      // État réel du LLM (le .224 ne se lit pas dans les process) : on re-sonde tout de suite,
+      // puis refreshLlm224 se reprogramme toutes les 5 s tant que c'est « en cours de démarrage ».
+      if (pc === 'gabriel' && (action === 'start_llm' || action === 'kill_llm')) refreshLlm224();
       // Rafraîchir les métriques du PC concerné ~3-4s après (temps de démarrage + collecte)
       if (action === 'start_llm') {
         setTimeout(function() {
@@ -1719,6 +1937,26 @@ app.post('/api/pc-action', async (req, res) => {
     }
     
     if (action === 'kill_llm') {
+      if (pc === 'gabriel') {
+        // .224 : deux moteurs possibles, un seul à la fois. stop-strata.sh gère Strata
+        // (serve/server.py + engine/strata) ; pkill -x llama-server gère llama.cpp.
+        // ⛔ jamais 'pkill -f llama' : les chemins des builds nvcc contiennent 'llama.cpp'.
+        const stopCmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 '~/script/stop-strata.sh >/tmp/stop-strata-dashboard.log 2>&1; pkill -x llama-server 2>/dev/null; echo OK'";
+        spawnDetached(stopCmd);   // détaché : stop-strata.sh attend la VRAM jusqu'à 60 s
+        // Retour HONNÊTE : la commande qui répond OK ne prouve rien. On interroge le port
+        // jusqu'à ce qu'il se taise, et on ne dit « Arrêté » que là.
+        let last = null;
+        for (let i = 0; i < 12; i++) {
+          await sleepMs(2000);
+          last = await probeLlama224Async(true);
+          if (!last || last.health !== true) break;
+        }
+        clearLlama224Window();
+        if (last && last.health === true) {
+          return res.json({ ok: false, state: 'running', error: 'Le port 8080 repond encore sur 192.168.3.224 (modele ' + (last.model || 'inconnu') + ') — arret NON confirme.' });
+        }
+        return res.json({ ok: true, state: 'stopped', result: 'LLM arrete — 192.168.3.224:8080 ne repond plus' });
+      }
       let cmd;
       if (pc === 'marie') {
         cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.57 'pkill llama-server 2>/dev/null; echo OK'";
@@ -1732,6 +1970,21 @@ app.post('/api/pc-action', async (req, res) => {
     }
     
     if (action === 'start_llm') {
+      if (pc === 'gabriel') {
+        // Strata met 66-120 s à charger. L'ancien code attendait 23 s puis testait
+        // `pgrep llama-server` : avec Strata (Python + engine/strata) c'était un faux
+        // négatif systématique (« Le LLM n'a pas demarre » alors qu'il chargeait).
+        // Ici : fenêtre de démarrage ouverte, lancement détaché, réponse immédiate.
+        startLlama224Window(180000);
+        const launchCmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'nohup ~/script/start-default-llm.sh >/tmp/start-default-llm-dashboard.log 2>&1 & echo OK'";
+        try {
+          spawnDetached(launchCmd);
+        } catch (e) {
+          clearLlama224Window();
+          return res.json({ ok: false, error: 'Lancement impossible : ' + e.message });
+        }
+        return res.json({ ok: true, state: 'starting', result: 'Demarrage lance (Strata, 66-120 s) — l etat se rafraichit tout seul' });
+      }
       let sshPrefix;
       // Script dans ~/script/ — nohup pour détacher du shell SSH (sinon tué à la fermeture)
       if (pc === 'marie') {

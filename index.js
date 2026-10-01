@@ -1431,6 +1431,18 @@ app.get('/', async (req, res) => {
     return n > 0 ? n : 1;
   }
 
+  // Vision multimodale : le serveur llama.cpp a un projecteur multimodal charge (--mmproj).
+  // Source de verite = la ligne de commande du process VIVANT (deja presente dans llm_cmd,
+  // remontee par les agents dashboard) -> aucune modif cote machines distantes.
+  // Priorite a llm_vision si un agent l'expose un jour. Pas de regex : dans la template
+  // literal servie, les backslashes devraient etre doubles (cf. extractCtxSize).
+  function llmHasVision(d) {
+    if (!d) return false;
+    if (d.llm_vision === true || d.llm_vision === 1 || d.llm_vision === '1') return true;
+    var cmd = d.llm_cmd;
+    return !!(cmd && cmd !== '—' && cmd.indexOf('--mmproj') !== -1);
+  }
+
   function renderPc(data, name) {
     var body = document.getElementById('pc-' + name + '-body');
     var timeEl = document.getElementById('pc-' + name + '-time');
@@ -1500,6 +1512,8 @@ app.get('/', async (req, res) => {
     if (!stale && llmStatus) {
       llmActivityBadge = llmBusy ? '<span class="pc-status busy">⚡ TACHE EN COURS</span>' : '<span class="pc-status idle">LIBRE</span>';
     }
+    // Vision multimodale (mmproj) : meme badge que la carte .224, mais deduit du process vivant.
+    var llmVisionBadge = (!stale && llmStatus && llmHasVision(data)) ? ' <span class="pc-status img">🖼 vision</span>' : '';
     var llmStateHtml = stale
       ? '<span class="pc-status off">● État inconnu (figé)</span>'
       : '<span class="pc-status ' + (llmStatus ? 'on' : 'off') + '">' + (llmStatus ? '● Running' : '● Stopped') + '</span>';
@@ -1585,7 +1599,7 @@ app.get('/', async (req, res) => {
       '<hr class="divider">' +
       ((name === 'gabriel')
         ? '<div class="pc-llm" id="pc-gabriel-llm">🧠 <strong>—</strong> <span class="pc-status idle">⏳ état…</span></div>'
-        : '<div class="pc-llm" id="pc-' + name + '-llm">🧠 <strong>' + llmModelTxt + '</strong>' + llmCtxBadgeTxt + ' ' + llmStateHtml + llmActivityBadge + '</div>') +
+        : '<div class="pc-llm" id="pc-' + name + '-llm">🧠 <strong>' + llmModelTxt + '</strong>' + llmCtxBadgeTxt + ' ' + llmStateHtml + llmVisionBadge + llmActivityBadge + '</div>') +
       ((!stale && llmStatus) ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +
       imgHtml +
       '<div class="pc-llm-link-row">' + llmLinkHtml + imgLinkHtml + '</div>' +

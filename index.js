@@ -1508,9 +1508,22 @@ app.get('/', async (req, res) => {
     // Occupation LLM — cle llm_busy (1/0) issue du sondage /slots cote machine (is_processing)
     // Données figées => on ne prétend RIEN sur l'état du LLM (ni Running ni Stopped).
     var llmBusy = !stale && llmRunning && (data.llm_busy === 1 || data.llm_busy === '1' || data.llm_busy === true);
+    // Compteur de taches en cours : llm_slots_used / llm_slots_total, remontes par les
+    // collecteurs qui interrogent /slots (Marie : --parallel 2 => 2 requetes simultanees).
+    // Affiche uniquement si le serveur a PLUSIEURS slots, sinon "0/1" ne serait que du bruit.
+    var slotsUsed = parseInt(data.llm_slots_used, 10);
+    var slotsTotal = parseInt(data.llm_slots_total, 10);
+    var hasSlots = !isNaN(slotsUsed) && !isNaN(slotsTotal) && slotsTotal > 1 && slotsUsed >= 0;
     var llmActivityBadge = '';
     if (!stale && llmStatus) {
-      llmActivityBadge = llmBusy ? '<span class="pc-status busy">⚡ TACHE EN COURS</span>' : '<span class="pc-status idle">LIBRE</span>';
+      if (hasSlots) {
+        var slotsLbl = slotsUsed + '/' + slotsTotal + (slotsUsed > 1 ? ' tâches' : ' tâche');
+        llmActivityBadge = slotsUsed > 0
+          ? '<span class="pc-status busy">⚡ ' + slotsLbl + ' en cours</span>'
+          : '<span class="pc-status idle">LIBRE · ' + slotsLbl + '</span>';
+      } else {
+        llmActivityBadge = llmBusy ? '<span class="pc-status busy">⚡ TACHE EN COURS</span>' : '<span class="pc-status idle">LIBRE</span>';
+      }
     }
     // Vision multimodale (mmproj) : meme badge que la carte .224, mais deduit du process vivant.
     var llmVisionBadge = (!stale && llmStatus && llmHasVision(data)) ? ' <span class="pc-status img">🖼 vision</span>' : '';

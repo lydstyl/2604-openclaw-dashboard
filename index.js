@@ -1503,7 +1503,7 @@ app.get('/', async (req, res) => {
       '<span class="pc-speed-val">' + it.score + (it.unit || '%') + '</span></div>' +
       '<div class="pc-speed-bar"><div class="pc-speed-fill" style="width:' + pct.toFixed(1) + '%;background:' + col + '"></div></div>' +
       '<div class="pc-speed-row pc-speed-sub" style="margin-top:0.2rem"><span>' + (it.detail || '') + '</span>' +
-      '<span>' + Math.round(pct) + '% du max</span></div>';
+      '<span>absolu / 100</span></div>';
   }
 
   function speedBlockHtml(name) {

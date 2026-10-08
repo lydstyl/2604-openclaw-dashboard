@@ -59,12 +59,12 @@ def build_prompt(n_words, seed):
     return " ".join(parts)
 
 
-def call(node_key, cfg, prompt, results):
+def call(node_key, cfg, prompt, results, max_tokens=MAX_TOKENS):
     url = "http://%s:%d/v1/chat/completions" % (cfg["ip"], PORT)
     body = {
         "model": "x",
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": max_tokens,
         "temperature": 0,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -153,6 +153,7 @@ def to_dashboard(raw):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ctx", type=int, default=100000, help="cible de contexte en tokens (defaut 100000)")
+    ap.add_argument("--max-tokens", type=int, default=256, help="tokens generes (defaut 256 ; 1024 pour le regime etabli)")
     ap.add_argument("--convert", metavar="JSON", help="convertir un resultat brut existant sans mesurer")
     ap.add_argument("--out", default=RAW_FILE, help="ou ecrire le resultat brut (defaut %s)" % RAW_FILE)
     ap.add_argument("--no-write", action="store_true", help="ne pas ecrire data/llm-speed.json")
@@ -169,7 +170,8 @@ def main():
         nonce = int(time.time())
         prompts = {k: build_prompt(n_words, nonce + i) for i, k in enumerate(NODES)}
         results = {}
-        threads = [threading.Thread(target=call, args=(k, cfg, prompts[k], results)) for k, cfg in NODES.items()]
+        threads = [threading.Thread(target=call, args=(k, cfg, prompts[k], results, args.max_tokens))
+                   for k, cfg in NODES.items()]
         t0 = time.time()
         for t in threads:
             t.start()

@@ -660,6 +660,19 @@ app.get('/api/llm-224', (req, res) => {
 
 function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// API: débit des LLM locaux (t/s à ~100k de contexte) — c'est ce que lit la barre
+// "vitesse" des cartes PC. Source = data/llm-speed.json, écrit par la mesure
+// scripts/bench-llm-speed.py (relancer ce script pour rafraîchir les chiffres).
+const LLM_SPEED_FILE = '/app/data/llm-speed.json';
+app.get('/api/llm-speed', (req, res) => {
+  try {
+    const parsed = JSON.parse(require('fs').readFileSync(LLM_SPEED_FILE, 'utf8'));
+    res.json(parsed);
+  } catch (e) {
+    res.json({ ok: false, by_node: {}, max_gen_tps: null, error: 'aucune mesure: ' + e.message });
+  }
+});
+
 // Lance une commande shell DÉTACHÉE : la requête HTTP rend la main tout de suite
 // (un démarrage Strata dure 66-120 s, impossible à attendre dans une réponse HTTP).
 function spawnDetached(cmd) {
@@ -847,6 +860,13 @@ app.get('/', async (req, res) => {
   .pc-llm{font-size:0.72rem;color:#9ca3af;margin-top:0.3rem}
   .pc-llm strong{color:#e0e0e0;font-weight:500}
   .pc-ctx-badge{display:inline-block;padding:0.08rem 0.4rem;border-radius:8px;font-size:0.62rem;font-weight:600;background:#1e293b;color:#93c5fd;margin-left:0.3rem;vertical-align:middle}
+  .pc-speed-wrap{margin-top:0.5rem;border-top:1px dashed #1f1f1f;padding-top:0.45rem}
+  .pc-speed-wrap:empty{display:none;border-top:none;padding-top:0}
+  .pc-speed-row{display:flex;justify-content:space-between;align-items:baseline;font-size:0.7rem;color:#888}
+  .pc-speed-val{font-weight:700;color:#e5e5e5}
+  .pc-speed-bar{height:8px;background:#1a1a1a;border-radius:4px;margin-top:0.3rem;overflow:hidden}
+  .pc-speed-fill{height:100%;border-radius:4px;transition:width 0.5s}
+  .pc-speed-sub{font-size:0.62rem;color:#555}
   /* Alertes */
   .alert-banner{display:none;background:#1a0a0a;border:1px solid #7f1d1d;border-radius:8px;padding:0.6rem 1rem;margin-bottom:1.25rem;font-size:0.8rem;gap:1rem;flex-wrap:wrap}
   .alert-banner.show{display:flex}
@@ -1443,6 +1463,67 @@ app.get('/', async (req, res) => {
     return !!(cmd && cmd !== '—' && cmd.indexOf('--mmproj') !== -1);
   }
 
+  // ── Barre de VITESSE (t/s à ~100k de contexte) ────────────────────────────
+  // Source : /api/llm-speed → data/llm-speed.json (mesure scripts/bench-llm-speed.py).
+  // Un chiffre par nœud, barre remplie au prorata du PLUS RAPIDE (100 % = le plus rapide).
+  // ⚠️ Bloc dans une template literal : pas de backtick, pas d'antislash.
+  var _llmSpeed = null;
+
+  function speedInnerHtml(name) {
+    var s = _llmSpeed;
+    if (!s || !s.by_node) return '';
+    var n = s.by_node[name];
+    if (!n || !n.ok || !n.gen_tps) return '';
+    var max = parseFloat(s.max_gen_tps) || n.gen_tps;
+    var pct = Math.max(3, Math.min(100, (n.gen_tps / max) * 100));
+    var col = (pct > 99) ? '#22c55e' : (pct >= 60 ? '#38bdf8' : '#f59e0b');
+    var ctxTxt = s.context_tokens ? Math.round(s.context_tokens / 1000) + 'k' : '?';
+    var sub = (n.model ? n.model : '') +
+      (n.prefill_tps ? ' · prefill ' + n.prefill_tps + ' t/s' : '');
+    return '<div class="pc-speed-row"><span>⚡ Vitesse <span class="pc-speed-sub">gen @' + ctxTxt + ' ctx</span></span>' +
+      '<span class="pc-speed-val">' + n.gen_tps + ' t/s</span></div>' +
+      '<div class="pc-speed-bar"><div class="pc-speed-fill" style="width:' + pct.toFixed(1) + '%;background:' + col + '"></div></div>' +
+      '<div class="pc-speed-row pc-speed-sub" style="margin-top:0.2rem"><span>' + sub + '</span>' +
+      '<span>' + Math.round(pct) + '% du max</span></div>' +
+      intelInnerHtml(name);
+  }
+
+  // Seconde barre (prévue) : intelligence mesurée. N'apparaît que si la mesure existe
+  // dans data/llm-speed.json (champ by_node.<pc>.intel.score), donc rien à faire tant
+  // que le banc d'intelligence n'a pas tourné.
+  function intelInnerHtml(name) {
+    var s = _llmSpeed;
+    if (!s || !s.by_node || !s.by_node[name]) return '';
+    var it = s.by_node[name].intel;
+    if (!it || !it.score) return '';
+    var max = parseFloat(s.max_intel_score) || it.score;
+    var pct = Math.max(3, Math.min(100, (it.score / max) * 100));
+    var col = (pct > 99) ? '#a78bfa' : (pct >= 60 ? '#818cf8' : '#f472b6');
+    return '<div class="pc-speed-row" style="margin-top:0.4rem"><span>🧠 Intelligence <span class="pc-speed-sub">' + (it.bench || 'score') + '</span></span>' +
+      '<span class="pc-speed-val">' + it.score + (it.unit || '%') + '</span></div>' +
+      '<div class="pc-speed-bar"><div class="pc-speed-fill" style="width:' + pct.toFixed(1) + '%;background:' + col + '"></div></div>' +
+      '<div class="pc-speed-row pc-speed-sub" style="margin-top:0.2rem"><span>' + (it.detail || '') + '</span>' +
+      '<span>' + Math.round(pct) + '% du max</span></div>';
+  }
+
+  function speedBlockHtml(name) {
+    return '<div class="pc-speed-wrap" id="pc-' + name + '-speed">' + speedInnerHtml(name) + '</div>';
+  }
+
+  function refreshSpeedBars() {
+    ['gabriel', 'louis', 'marie'].forEach(function(n) {
+      var el = document.getElementById('pc-' + n + '-speed');
+      if (el) el.innerHTML = speedInnerHtml(n);
+    });
+  }
+
+  function fetchLlmSpeed() {
+    fetch('/api/llm-speed').then(function(r) { return r.json(); }).then(function(d) {
+      _llmSpeed = d;
+      refreshSpeedBars();
+    }).catch(function() {});
+  }
+
   function renderPc(data, name) {
     var body = document.getElementById('pc-' + name + '-body');
     var timeEl = document.getElementById('pc-' + name + '-time');
@@ -1614,6 +1695,7 @@ app.get('/', async (req, res) => {
         ? '<div class="pc-llm" id="pc-gabriel-llm">🧠 <strong>—</strong> <span class="pc-status idle">⏳ état…</span></div>'
         : '<div class="pc-llm" id="pc-' + name + '-llm">🧠 <strong>' + llmModelTxt + '</strong>' + llmCtxBadgeTxt + ' ' + llmStateHtml + llmVisionBadge + llmActivityBadge + '</div>') +
       ((!stale && llmStatus) ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +
+      speedBlockHtml(name) +
       imgHtml +
       '<div class="pc-llm-link-row">' + llmLinkHtml + imgLinkHtml + '</div>' +
       '<div class="pc-action-result" id="pc-' + name + '-result"></div>';
@@ -1720,6 +1802,7 @@ app.get('/', async (req, res) => {
     fetchPlugState('gabriel');
     fetchPlugState('louis');
     fetchPlugState('marie');
+    fetchLlmSpeed();
   }
 
   // Auto-kill config helpers

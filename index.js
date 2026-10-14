@@ -396,7 +396,7 @@ const VISIBILITY_FILE = path.join(DATA_DIR, 'card_visibility.json');
 const DEFAULT_VISIBILITY = {
   'credits': true, 'spending-30d': true, 'spending-24h': true,
   'cpu': true, 'ram': true, 'disk': true, 'ollama': true,
-  'pc-gabriel': true, 'pc-louis': true, 'pc-marie': true, 'chart': true
+  'pc-gabriel': true, 'pc-louis': true, 'pc-marie': true, 'pc-boncoin': true, 'chart': true
 };
 
 function loadCardVisibility() {
@@ -715,6 +715,7 @@ function getPlugEntity(name) {
   if (name === 'gabriel') return 'switch.prise_1_sous_tableau_commutateur';
   if (name === 'louis') return 'switch.bouilloire_commutateur';
   if (name === 'marie') return 'switch.prise3';
+  if (name === 'boncoin') return 'switch.cuisine_prisepcboncoin';
   return null;
 }
 
@@ -722,6 +723,7 @@ function getPlugPowerEntity(name) {
   if (name === 'gabriel') return 'sensor.prise_1_sous_tableau_puissance';
   if (name === 'louis') return 'sensor.bouilloire_puissance';
   if (name === 'marie') return 'sensor.prise3_puissance';
+  if (name === 'boncoin') return 'sensor.cuisine_prisepcboncoin_puissance';
   return null;
 }
 
@@ -958,6 +960,7 @@ app.get('/', async (req, res) => {
     <label class="settings-row" data-card-id="pc-gabriel"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-gabriel')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Gabriel</span></label>
     <label class="settings-row" data-card-id="pc-louis"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-louis')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Louis</span></label>
     <label class="settings-row" data-card-id="pc-marie"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-marie')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Marie</span></label>
+    <label class="settings-row" data-card-id="pc-boncoin"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-boncoin')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC BonCoin</span></label>
     <label class="settings-row" data-card-id="chart"><span class="s-icon">📈</span><input type="checkbox"${vis('chart')?' checked':''}><span class="s-toggle"></span><span class="s-label">Graphique</span></label>
   </div>
 </div>
@@ -1106,6 +1109,21 @@ app.get('/', async (req, res) => {
         <span>Auto-kill RAM &gt;90%</span>
       </label>
     </div>
+  </div>
+
+  <!-- PC BONCOIN (LeBonCoin) — pas encore d'agent SSH/LLM : carte pilotée par la prise HA -->
+  <div class="card ${visHidden('pc-boncoin')}" data-card-id="pc-boncoin" id="pc-boncoin-card">
+    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC BonCoin <span style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">5060 Ti 16 Go + 3060 Ti 8 Go = 24 Go</span><span id="pc-boncoin-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span></div>
+    <div id="pc-boncoin-body">
+      <div class="row"><span class="label">Démarrage</span><span class="val">🔌 prise connectée</span></div>
+      <hr class="divider">
+      <div class="row"><span class="label">Métriques</span><span class="val" style="color:#888">agent non installé</span></div>
+      <p style="color:#555;font-size:0.72rem;margin:0.5rem 0 0">Nouveau PC (achat LeBonCoin) : ni agent SSH ni serveur LLM pour l'instant. La prise « prisePCBonCoin » permet l'allumage à distance.</p>
+    </div>
+    <div class="pc-actions" id="pc-boncoin-actions" style="display:flex">
+      <label class="pc-plug-toggle" id="pc-boncoin-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-boncoin-plug-slider"></span><span class="pc-plug-status" id="pc-boncoin-plug-status">❓</span><span class="pc-plug-power" id="pc-boncoin-plug-power"></span></label>
+    </div>
+    <div class="pc-action-result" id="pc-boncoin-result"></div>
   </div>
 
 </div>
@@ -1358,7 +1376,7 @@ app.get('/', async (req, res) => {
     localStorage.setItem('dash_alerts', JSON.stringify(cfg));
 
     // Plug toggle click handlers
-    ['gabriel','louis','marie'].forEach(function(name) {
+    ['gabriel','louis','marie','boncoin'].forEach(function(name) {
       var plugEl = document.getElementById('pc-' + name + '-plug-toggle');
       if (!plugEl) return;
       plugEl.addEventListener('click', function(e) {
@@ -1802,6 +1820,7 @@ app.get('/', async (req, res) => {
     fetchPlugState('gabriel');
     fetchPlugState('louis');
     fetchPlugState('marie');
+    fetchPlugState('boncoin');
     fetchLlmSpeed();
   }
 

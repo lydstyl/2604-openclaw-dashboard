@@ -396,7 +396,8 @@ const VISIBILITY_FILE = path.join(DATA_DIR, 'card_visibility.json');
 const DEFAULT_VISIBILITY = {
   'credits': true, 'spending-30d': true, 'spending-24h': true,
   'cpu': true, 'ram': true, 'disk': true, 'ollama': true,
-  'pc-gabriel': true, 'pc-louis': true, 'pc-marie': true, 'pc-boncoin': true, 'chart': true
+  'pc-gabriel': true, 'pc-louis': true, 'pc-marie': true, 'pc-boncoin': true, 'chart': true,
+  'solaire-prod': true, 'solaire-grid': true
 };
 
 function loadCardVisibility() {
@@ -751,6 +752,97 @@ app.get('/api/pc-plug-state/:name', async (req, res) => {
 });
 
 // API: toggle PC smart plug
+
+// ─── Solaire : production + import réseau (HA) ────────────────
+// ─── Solar Production & Grid Import ───────────────────────────
+let _solaireCache = { ts: 0, data: null };
+
+function parseSolarValue(state) {
+  if (state === 'unknown' || state === 'unavailable' || state === '') return { val: 0, ok: false };
+  const n = parseFloat(state);
+  if (isNaN(n)) return { val: 0, ok: false };
+  return { val: n, ok: true };
+}
+
+async function fetchSolarData() {
+  const entities = [
+    'sensor.prise_solaire_puissance',
+    'sensor.prise_solaire_summation_delivered',
+    'sensor.prise4_cabanon_solaire_puissance',
+    'sensor.prise4_cabanon_solaire_consommation',
+    'sensor.lixee_zlinky_tic_puissance_apparente',
+    'sensor.lixee_zlinky_tic_consommation_partie_1',
+    'sensor.lixee_zlinky_tic_consommation_partie_2'
+  ];
+  
+  const responses = await Promise.all(
+    entities.map(id => 
+      axios.get(HA_BASE + '/api/states/' + id, { headers: HA_HEADERS, timeout: 5000 })
+        .catch(() => null)
+    )
+  );
+
+  const getVal = (idx) => {
+    if (!responses[idx] || !responses[idx].data) return { val: 0, ok: false };
+    return parseSolarValue(responses[idx].data.state);
+  };
+
+  const p1 = getVal(0);
+  const c1 = getVal(1);
+  const p2 = getVal(2);
+  const c2 = getVal(3);
+  const g1 = getVal(4);
+  const g2 = getVal(5);
+  const g3 = getVal(6);
+
+  const prodPriseW = p1.val;
+  const cumulPriseKWh = c1.val;
+  const prodCabanonW = p2.val;
+  const cumulCabanonKWh = c2.val;
+  const gridW = g1.val;
+  const cumulGridKWh = g2.val + g3.val;
+  const prodW = prodPriseW + prodCabanonW;
+  
+  const now = new Date();
+  const timeStr = now.toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris', hour12: false });
+
+  return {
+    ok: true,
+    prodW: prodW,
+    prodPriseW: prodPriseW,
+    prodCabanonW: prodCabanonW,
+    priseOk: p1.ok,
+    cabanonOk: p2.ok,
+    cumulPriseKWh: cumulPriseKWh,
+    cumulCabanonKWh: cumulCabanonKWh,
+    gridW: gridW,
+    cumulGridKWh: cumulGridKWh,
+    autonomie: (gridW === 0 && prodW > 0),
+    updated_at: timeStr,
+    stale: false,
+    age_s: 0
+  };
+}
+
+app.get('/api/solaire', async (req, res) => {
+  const force = req.query.force === 'true';
+  const now = Date.now();
+  
+  if (!force && _solaireCache.data && (now - _solaireCache.ts) < 10000) {
+    const age_s = Math.floor((now - _solaireCache.ts) / 1000);
+    const data = { ..._solaireCache.data, age_s: age_s, stale: age_s > 10 };
+    return res.json(data);
+  }
+
+  try {
+    const data = await fetchSolarData();
+    _solaireCache = { ts: now, data: data };
+    res.json(data);
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
 app.post('/api/pc-toggle-plug', async (req, res) => {
   const { name } = req.body;
   const entityId = getPlugEntity(name);
@@ -929,6 +1021,16 @@ app.get('/', async (req, res) => {
   .settings-row .s-label{font-size:0.75rem;color:#aaa;flex:1}
   .settings-row .s-icon{font-size:0.9rem}
   .settings-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:0.2rem}
+
+  /* Solaire */
+  .solaire-kw{font-size:0.8rem;color:#666;margin-top:-0.2rem}
+  .solaire-cols{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+  .solaire-col-label{font-size:0.7rem;color:#555;margin-bottom:0.3rem}
+  .solaire-col-val{font-size:1.15rem;font-weight:700;line-height:1.1}
+  .solaire-col-sub{font-size:0.7rem;color:#555;margin-top:0.2rem}
+  .solaire-time{font-size:0.65rem;color:#3a3a3a;margin-top:0.75rem}
+  .solaire-grid-sub{font-size:0.75rem;color:#555;margin-top:0.4rem}
+  .solaire-grid-badge{margin-top:0.5rem}
 </style>
 </head>
 <body>
@@ -962,10 +1064,42 @@ app.get('/', async (req, res) => {
     <label class="settings-row" data-card-id="pc-marie"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-marie')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Marie</span></label>
     <label class="settings-row" data-card-id="pc-boncoin"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-boncoin')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC BonCoin</span></label>
     <label class="settings-row" data-card-id="chart"><span class="s-icon">📈</span><input type="checkbox"${vis('chart')?' checked':''}><span class="s-toggle"></span><span class="s-label">Graphique</span></label>
+    <label class="settings-row" data-card-id="solaire-prod"><span class="s-icon">☀️</span><input type="checkbox"${vis('solaire-prod')?' checked':''}><span class="s-toggle"></span><span class="s-label">Solaire production</span></label>
+    <label class="settings-row" data-card-id="solaire-grid"><span class="s-icon">⚡</span><input type="checkbox"${vis('solaire-grid')?' checked':''}><span class="s-toggle"></span><span class="s-label">Réseau Linky</span></label>
   </div>
 </div>
 
 <div class="grid">
+
+  <!-- SOLAIRE PRODUCTION -->
+  <div class="card ${visHidden('solaire-prod')}" data-card-id="solaire-prod">
+    <div class="card-header"><span class="icon">☀️</span><span class="card-title">Production en temps réel</span></div>
+    <div class="big-value" style="color:#fbbf24"><span id="solaire-prod-total">—</span><span>W</span></div>
+    <div class="solaire-kw" id="solaire-prod-kw">—</div>
+    <hr class="divider">
+    <div class="solaire-cols">
+      <div class="solaire-col">
+        <div class="solaire-col-label">Petits panneaux (prise)</div>
+        <div class="solaire-col-val" style="color:#fbbf24"><span id="solaire-prise-w">—</span> W</div>
+        <div class="solaire-col-sub" id="solaire-prise-cumul">—</div>
+      </div>
+      <div class="solaire-col">
+        <div class="solaire-col-label">Gros panneaux (cabanon)</div>
+        <div class="solaire-col-val" style="color:#f97316"><span id="solaire-cabanon-w">—</span> W</div>
+        <div class="solaire-col-sub" id="solaire-cabanon-cumul">—</div>
+      </div>
+    </div>
+    <div class="solaire-time" id="solaire-prod-time">—</div>
+  </div>
+
+  <!-- SOLAIRE RESEAU -->
+  <div class="card ${visHidden('solaire-grid')}" data-card-id="solaire-grid">
+    <div class="card-header"><span class="icon">⚡</span><span class="card-title">Réseau (Linky) — import depuis EDF</span></div>
+    <div class="big-value" id="solaire-grid-w" style="color:#22c55e">—<span>W</span></div>
+    <div id="solaire-grid-badge"></div>
+    <div class="solaire-grid-sub" id="solaire-grid-cumul">—</div>
+    <div class="solaire-time" id="solaire-grid-time">—</div>
+  </div>
 
   <!-- CREDITS -->
   <div class="card ${visHidden('credits')}" data-card-id="credits">
@@ -1822,6 +1956,7 @@ app.get('/', async (req, res) => {
     fetchPlugState('marie');
     fetchPlugState('boncoin');
     fetchLlmSpeed();
+    fetchSolaire();
   }
 
   // Auto-kill config helpers
@@ -1924,6 +2059,82 @@ app.get('/', async (req, res) => {
     .catch(function(err) {
       console.error('fetchPlugState(' + name + '):', err);
     });
+  }
+
+function fetchSolaire() {
+    fetch('/api/solaire').then(function(r){return r.json();}).then(function(d){renderSolaire(d);}).catch(function(e){console.error('solaire:',e);});
+  }
+
+  function renderSolaire(d) {
+    var prodTotal = document.getElementById('solaire-prod-total');
+    var prodKw = document.getElementById('solaire-prod-kw');
+    var priseW = document.getElementById('solaire-prise-w');
+    var priseCumul = document.getElementById('solaire-prise-cumul');
+    var cabW = document.getElementById('solaire-cabanon-w');
+    var cabCumul = document.getElementById('solaire-cabanon-cumul');
+    var gridW = document.getElementById('solaire-grid-w');
+    var gridBadge = document.getElementById('solaire-grid-badge');
+    var gridCumul = document.getElementById('solaire-grid-cumul');
+    var prodTime = document.getElementById('solaire-prod-time');
+    var gridTime = document.getElementById('solaire-grid-time');
+    if (!prodTotal) return;
+
+    if (!d || !d.ok) {
+      var msg = '⛔ Solaire indisponible';
+      prodTotal.textContent = '—';
+      prodKw.textContent = msg;
+      priseW.textContent = '—';
+      priseCumul.textContent = msg;
+      cabW.textContent = '—';
+      cabCumul.textContent = msg;
+      gridW.innerHTML = '—<span>W</span>';
+      gridBadge.innerHTML = '';
+      gridCumul.textContent = msg;
+      if (prodTime) prodTime.textContent = '';
+      if (gridTime) gridTime.textContent = '';
+      return;
+    }
+
+    var ts = d.updated_at || '—';
+    var stamp = d.stale ? ('⛔ ' + ts) : ts;
+    if (prodTime) prodTime.textContent = stamp;
+    if (gridTime) gridTime.textContent = stamp;
+
+    var prodW = Math.round(d.prodW || 0);
+    prodTotal.textContent = prodW;
+    prodKw.textContent = ((d.prodW || 0) / 1000).toFixed(3) + ' kW';
+
+    if (d.priseOk) {
+      priseW.style.color = '#fbbf24';
+      priseW.textContent = Math.round(d.prodPriseW || 0);
+      priseCumul.textContent = (d.cumulPriseKWh || 0).toFixed(1) + ' kWh cumulé';
+    } else {
+      priseW.textContent = 'Pas de connexion';
+      priseW.style.color = '#64748b';
+      priseCumul.textContent = '📡 capteur inaccessible';
+    }
+
+    if (d.cabanonOk) {
+      cabW.style.color = '#f97316';
+      cabW.textContent = Math.round(d.prodCabanonW || 0);
+      cabCumul.textContent = (d.cumulCabanonKWh || 0).toFixed(1) + ' kWh cumulé';
+    } else {
+      cabW.textContent = 'Pas de connexion';
+      cabW.style.color = '#64748b';
+      cabCumul.textContent = '📡 capteur inaccessible';
+    }
+
+    var gw = Math.round(d.gridW || 0);
+    gridW.innerHTML = gw + '<span>W</span>';
+    gridW.style.color = gw > 0 ? '#60a5fa' : '#22c55e';
+
+    if (d.autonomie) {
+      gridBadge.innerHTML = '<span class="tag tag-green">✅ Autonome — pas aucun import réseau</span>';
+    } else {
+      gridBadge.innerHTML = '';
+    }
+
+    gridCumul.textContent = 'Puissance prélevée du réseau · cumulé: ' + (d.cumulGridKWh || 0).toFixed(1) + ' kWh';
   }
 
   initToggles();

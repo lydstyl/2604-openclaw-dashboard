@@ -415,6 +415,46 @@ function saveCardVisibility(config) {
   fs.writeFileSync(VISIBILITY_FILE, JSON.stringify(config, null, 2));
 }
 
+// --- Card Order (glisser-deposer) -----------------------------------------
+const ORDER_FILE = path.join(DATA_DIR, 'card_order.json');
+
+// Ordre par defaut = ordre de rendu du template (cartes + graphique)
+const DEFAULT_ORDER = [
+  'solaire-prod', 'solaire-grid', 'credits', 'spending-30d', 'spending-24h',
+  'cpu', 'ram', 'disk', 'ollama', 'pc-gabriel', 'pc-louis', 'pc-marie', 'pc-boncoin', 'chart'
+];
+
+function loadCardOrder() {
+  try {
+    if (fs.existsSync(ORDER_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(ORDER_FILE, 'utf8'));
+      const list = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.order) ? raw.order : []);
+      const clean = [];
+      list.forEach(function(id) {
+        if (typeof id === 'string' && DEFAULT_ORDER.indexOf(id) !== -1 && clean.indexOf(id) === -1) clean.push(id);
+      });
+      // une carte absente du fichier (ajoutee apres coup) retombe en fin, dans l ordre du template
+      DEFAULT_ORDER.forEach(function(id) { if (clean.indexOf(id) === -1) clean.push(id); });
+      return clean;
+    }
+  } catch (e) { console.error('[card-order] erreur lecture:', e.message); }
+  return DEFAULT_ORDER.slice();
+}
+
+function saveCardOrder(order) {
+  ensureDataDir();
+  const clean = [];
+  if (Array.isArray(order)) {
+    order.forEach(function(id) {
+      if (typeof id === 'string' && DEFAULT_ORDER.indexOf(id) !== -1 && clean.indexOf(id) === -1) clean.push(id);
+    });
+  }
+  // tableau vide ou invalide = retour a l ordre par defaut
+  DEFAULT_ORDER.forEach(function(id) { if (clean.indexOf(id) === -1) clean.push(id); });
+  fs.writeFileSync(ORDER_FILE, JSON.stringify(clean, null, 2));
+  return clean;
+}
+
 // ─── Routes ────────────────────────────────────────────────────────────────
 
 // API: credits history
@@ -703,6 +743,21 @@ app.post('/api/card-visibility', (req, res) => {
   }
 });
 
+// API: ordre des cartes (glisser-deposer)
+app.get('/api/card-order', (req, res) => {
+  res.json({ ok: true, order: loadCardOrder() });
+});
+
+app.post('/api/card-order', (req, res) => {
+  try {
+    const body = req.body || {};
+    const order = saveCardOrder(body.order);
+    res.json({ ok: true, order: order });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // API: top processes
 app.get('/api/top-processes', (req, res) => {
   res.json(getTopProcesses());
@@ -881,6 +936,13 @@ app.get('/', async (req, res) => {
   function vis(id) { return visibility[id] !== false; }
   function visHidden(id) { return !vis(id) ? 'card-hidden' : ''; }
 
+  // --- Card order (glisser-deposer) ---
+  const cardOrder = loadCardOrder();
+  function orderOf(id) {
+    var idx = cardOrder.indexOf(id);
+    return 'style="order:' + (idx === -1 ? cardOrder.length : idx) + '"';
+  }
+
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
@@ -1006,6 +1068,19 @@ app.get('/', async (req, res) => {
   .pc-action-result{font-size:0.62rem;color:#888;margin-top:0.3rem;min-height:1rem}
   /* Card visibility */
   .card-hidden{display:none!important}
+  /* --- Glisser-deposer des cartes --- */
+  .grid > [data-card-id]{position:relative}
+  .grid > .chart-section{grid-column:1/-1;margin-top:0}
+  .grid > [data-card-id] .card-header{padding-right:1.7rem}
+  .card-drag-handle{position:absolute;top:0.45rem;right:0.5rem;font-size:1rem;line-height:1;color:#333;cursor:grab;user-select:none;-webkit-user-select:none;padding:2px 4px;border-radius:6px;transition:color .15s,background .15s;z-index:5}
+  .card-drag-handle:hover{color:#3b82f6;background:#181818}
+  .card-drag-handle:active{cursor:grabbing}
+  [data-card-id].dragging{opacity:.35}
+  [data-card-id].drop-before{box-shadow:inset 3px 0 0 0 #3b82f6}
+  [data-card-id].drop-after{box-shadow:inset -3px 0 0 0 #3b82f6}
+  .settings-hint{font-size:0.7rem;color:#666;margin:0.35rem 0 0.7rem;display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap}
+  .settings-reset{background:#151515;color:#aaa;border:1px solid #2a2a2a;border-radius:6px;padding:0.2rem 0.55rem;font-size:0.68rem;cursor:pointer;font-family:inherit}
+  .settings-reset:hover{color:#3b82f6;border-color:#3b82f6}
   .settings-btn{background:none;border:none;color:#555;cursor:pointer;font-size:1.1rem;padding:0.15rem 0.35rem;border-radius:6px;transition:all 0.2s;line-height:1}
   .settings-btn:hover{color:#aaa;background:#1a1a1a}
   .settings-btn.active{color:#818cf8;background:#1a1a2e}
@@ -1052,6 +1127,7 @@ app.get('/', async (req, res) => {
 <!-- Panneau de configuration des cartes -->
 <div id="settings-panel" class="settings-panel">
   <div class="settings-title">🔄 Cartes à afficher</div>
+  <div class="settings-hint">Glisser-déposer une carte par sa poignée ⠿ pour la placer où tu veux.<button class="settings-reset" onclick="resetCardOrder()">↺ Ordre par défaut</button></div>
   <div class="settings-grid">
     <label class="settings-row" data-card-id="credits"><span class="s-icon">💳</span><input type="checkbox"${vis('credits')?' checked':''}><span class="s-toggle"></span><span class="s-label">Crédits</span></label>
     <label class="settings-row" data-card-id="spending-30d"><span class="s-icon">📊</span><input type="checkbox"${vis('spending-30d')?' checked':''}><span class="s-toggle"></span><span class="s-label">Dépenses 30j</span></label>
@@ -1073,7 +1149,7 @@ app.get('/', async (req, res) => {
 <div class="grid">
 
   <!-- SOLAIRE PRODUCTION -->
-  <div class="card ${visHidden('solaire-prod')}" data-card-id="solaire-prod">
+  <div class="card ${visHidden('solaire-prod')}" data-card-id="solaire-prod"${orderOf('solaire-prod')} >
     <div class="card-header"><span class="icon">☀️</span><span class="card-title">Production en temps réel</span></div>
     <div class="big-value" style="color:#fbbf24"><span id="solaire-prod-total">—</span><span>W</span></div>
     <div class="solaire-kw" id="solaire-prod-kw">—</div>
@@ -1094,7 +1170,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- SOLAIRE RESEAU -->
-  <div class="card ${visHidden('solaire-grid')}" data-card-id="solaire-grid">
+  <div class="card ${visHidden('solaire-grid')}" data-card-id="solaire-grid"${orderOf('solaire-grid')} >
     <div class="card-header"><span class="icon">⚡</span><span class="card-title">Réseau (Linky) — import depuis EDF</span></div>
     <div class="big-value" id="solaire-grid-w" style="color:#22c55e">—<span>W</span></div>
     <div id="solaire-grid-badge"></div>
@@ -1103,7 +1179,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- CREDITS -->
-  <div class="card ${visHidden('credits')}" data-card-id="credits">
+  <div class="card ${visHidden('credits')}" data-card-id="credits"${orderOf('credits')} >
     <div class="card-header"><span class="icon">💳</span><span class="card-title">Crédits — Tous providers</span></div>
     <div class="big-value" style="color:${kc}">${credits.total}<span>$</span></div>
     <hr class="divider">
@@ -1114,7 +1190,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- DÉPENSES 30 JOURS -->
-  <div class="card ${visHidden('spending-30d')}" data-card-id="spending-30d">
+  <div class="card ${visHidden('spending-30d')}" data-card-id="spending-30d"${orderOf('spending-30d')} >
     <div class="card-header"><span class="icon">📊</span><span class="card-title">Dépenses — 30 derniers jours</span></div>
     <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending.total.toFixed(2)}<span>$</span></div>
     <hr class="divider">
@@ -1126,7 +1202,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- DÉPENSES 24H -->
-  <div class="card ${visHidden('spending-24h')}" data-card-id="spending-24h">
+  <div class="card ${visHidden('spending-24h')}" data-card-id="spending-24h"${orderOf('spending-24h')} >
     <div class="card-header"><span class="icon">⏰</span><span class="card-title">Dépenses — 24 dernières heures</span></div>
     <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending24h.total.toFixed(2)}<span>$</span></div>
     <hr class="divider">
@@ -1137,7 +1213,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- CPU -->
-  <div class="card ${visHidden('cpu')}" data-card-id="cpu">
+  <div class="card ${visHidden('cpu')}" data-card-id="cpu"${orderOf('cpu')} >
     <div class="card-header"><span class="icon">🖥️</span><span class="card-title">CPU</span></div>
     <div class="big-value" style="color:${cc}">${sys.cpuPct}<span>%</span></div>
     ${bar(sys.cpuPct, cc)}
@@ -1152,7 +1228,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- RAM -->
-  <div class="card ${visHidden('ram')}" data-card-id="ram">
+  <div class="card ${visHidden('ram')}" data-card-id="ram"${orderOf('ram')} >
     <div class="card-header"><span class="icon">🧠</span><span class="card-title">Mémoire RAM</span></div>
     <div class="big-value" style="color:${rc}">${mem.usedByApps}<span>GB apps</span></div>
     <div class="bar-bg">
@@ -1172,7 +1248,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- DISK -->
-  <div class="card ${visHidden('disk')}" data-card-id="disk">
+  <div class="card ${visHidden('disk')}" data-card-id="disk"${orderOf('disk')} >
     <div class="card-header"><span class="icon">💾</span><span class="card-title">Disque dur</span></div>
     <div class="big-value" style="color:${dc}">${disk.used}<span>GB utilisés</span></div>
     ${bar(disk.usedPct, dc)}
@@ -1184,7 +1260,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- OLLAMA CLOUD -->
-  <div class="card ${visHidden('ollama')}" data-card-id="ollama">
+  <div class="card ${visHidden('ollama')}" data-card-id="ollama"${orderOf('ollama')} >
     <div class="card-header"><span class="icon">🦙</span><span class="card-title">Ollama Cloud</span></div>
     <div class="big-value" style="color:#a78bfa">${ollama.plan}<span> plan</span></div>
     <hr class="divider">
@@ -1193,7 +1269,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- PC GABRIEL -->
-  <div class="card ${visHidden('pc-gabriel')}" data-card-id="pc-gabriel" id="pc-gabriel-card">
+  <div class="card ${visHidden('pc-gabriel')}" data-card-id="pc-gabriel"${orderOf('pc-gabriel')} id="pc-gabriel-card">
     <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Gabriel <span id="pc-gabriel-ip" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">192.168.3.224</span><span id="pc-gabriel-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-gabriel" checked><span class="slider"></span>🔔</label></div>
     <div id="pc-gabriel-body">
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
@@ -1211,7 +1287,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- PC LOUIS -->
-  <div class="card ${visHidden('pc-louis')}" data-card-id="pc-louis" id="pc-louis-card">
+  <div class="card ${visHidden('pc-louis')}" data-card-id="pc-louis"${orderOf('pc-louis')} id="pc-louis-card">
     <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Louis <span id="pc-louis-ip" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">192.168.3.206</span><span id="pc-louis-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-louis" checked><span class="slider"></span>🔔</label></div>
     <div id="pc-louis-body">
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
@@ -1229,7 +1305,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- PC MARIE -->
-  <div class="card ${visHidden('pc-marie')}" data-card-id="pc-marie" id="pc-marie-card">
+  <div class="card ${visHidden('pc-marie')}" data-card-id="pc-marie"${orderOf('pc-marie')} id="pc-marie-card">
     <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Marie <span id="pc-marie-ip" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">192.168.3.57</span><span id="pc-marie-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-marie" checked><span class="slider"></span>🔔</label></div>
     <div id="pc-marie-body">
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
@@ -1247,7 +1323,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- PC BONCOIN (LeBonCoin) — pas encore d'agent SSH/LLM : carte pilotée par la prise HA -->
-  <div class="card ${visHidden('pc-boncoin')}" data-card-id="pc-boncoin" id="pc-boncoin-card">
+  <div class="card ${visHidden('pc-boncoin')}" data-card-id="pc-boncoin"${orderOf('pc-boncoin')} id="pc-boncoin-card">
     <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC BonCoin <span style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">5060 Ti 16 Go + 3060 Ti 8 Go = 24 Go</span><span id="pc-boncoin-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span></div>
     <div id="pc-boncoin-body">
       <div class="row"><span class="label">Démarrage</span><span class="val">🔌 prise connectée</span></div>
@@ -1261,15 +1337,16 @@ app.get('/', async (req, res) => {
     <div class="pc-action-result" id="pc-boncoin-result"></div>
   </div>
 
-</div>
 
-<!-- Chart Section -->
-<div class="chart-section ${visHidden('chart')}" data-card-id="chart">
+  <!-- Chart Section -->
+  <div class="chart-section ${visHidden('chart')}" data-card-id="chart" ${orderOf('chart')}>
   <div class="card-header"><span class="icon">📈</span><span class="card-title">Évolution des crédits (30 jours)</span></div>
   <div id="chart-container" class="chart-container">
     <div id="chart-placeholder" class="chart-placeholder">Collecte de données en cours...</div>
     <canvas id="creditsChart"></canvas>
+    </div>
   </div>
+
 </div>
 
 <script>
@@ -1632,12 +1709,21 @@ app.get('/', async (req, res) => {
     var col = (pct > 99) ? '#22c55e' : (pct >= 60 ? '#38bdf8' : '#f59e0b');
     var ctxTxt = s.context_tokens ? Math.round(s.context_tokens / 1000) + 'k' : '?';
     var sub = (n.model ? n.model : '') +
-      (n.prefill_tps ? ' · prefill ' + n.prefill_tps + ' t/s' : '');
-    return '<div class="pc-speed-row"><span>⚡ Vitesse <span class="pc-speed-sub">gen @' + ctxTxt + ' ctx</span></span>' +
+      (n.prefill_tps ? ' · prefill ' + n.prefill_tps + ' t/s' : '') +
+      (n.steps_s ? ' · décode ' + n.steps_s + ' steps/s' : '');
+    // Deux regimes mesures : le t/s du serveur inclut la speculation, donc il depend du
+    // CONTENU genere (meme machine : 28 t/s sur du texte libre, 84 t/s sur une enumeration).
+    // La barre reste sur le regime texte (ce que l'utilisateur voit en pratique) ; les deux
+    // chiffres sont affiches pour que personne ne compare un t/s isole.
+    var reg = n.gen_tps_repeat
+      ? '<div class="pc-speed-row pc-speed-sub" style="margin-top:0.15rem"><span>texte libre ' + n.gen_tps +
+        ' t/s · sortie répétitive ' + n.gen_tps_repeat + ' t/s</span></div>'
+      : '';
+    return '<div class="pc-speed-row"><span>⚡ Vitesse <span class="pc-speed-sub">texte libre @' + ctxTxt + ' ctx</span></span>' +
       '<span class="pc-speed-val">' + n.gen_tps + ' t/s</span></div>' +
       '<div class="pc-speed-bar"><div class="pc-speed-fill" style="width:' + pct.toFixed(1) + '%;background:' + col + '"></div></div>' +
       '<div class="pc-speed-row pc-speed-sub" style="margin-top:0.2rem"><span>' + sub + '</span>' +
-      '<span>' + Math.round(pct) + '% du max</span></div>' +
+      '<span>' + Math.round(pct) + '% du max</span></div>' + reg +
       intelInnerHtml(name);
   }
 
@@ -2248,6 +2334,171 @@ function fetchSolaire() {
   }
 
   if (panel) initSettings();
+})();
+</script>
+
+<!-- Card drag &amp; drop JS -->
+<script>
+(function(){
+  var grid = document.querySelector(".grid");
+  if (!grid) { return; }
+  if (grid.querySelector(".card-drag-handle")) { return; }   // anti double-init
+  var draggingEl = null;
+  var currentTarget = null;
+  var currentPos = null;
+
+  // Seuls les enfants porteurs d un data-card-id sont deplacables (jamais les <script> eventuels)
+  function gridCards(){
+    var out = [];
+    var kids = grid.children;
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i].getAttribute && kids[i].getAttribute("data-card-id")) { out.push(kids[i]); }
+    }
+    return out;
+  }
+
+  // Ordre VISUEL = tri par la propriete CSS order (la grille reordonne l affichage, pas le DOM)
+  function getVisualOrder(){
+    return gridCards().sort(function(a, b){
+      var oa = parseInt(a.style.order, 10);
+      var ob = parseInt(b.style.order, 10);
+      if (isNaN(oa)) { oa = 0; }
+      if (isNaN(ob)) { ob = 0; }
+      return oa - ob;
+    });
+  }
+
+  function clearDropClasses(){
+    var kids = grid.children;
+    for (var i = 0; i < kids.length; i++) {
+      kids[i].classList.remove("drop-before");
+      kids[i].classList.remove("drop-after");
+    }
+  }
+
+  function findCard(node){
+    var t = node;
+    while (t && t !== grid) {
+      if (t.getAttribute && t.getAttribute("data-card-id")) { return t; }
+      t = t.parentNode;
+    }
+    return null;
+  }
+
+  function applyOrder(ids){
+    var map = {};
+    var kids = gridCards();
+    for (var i = 0; i < kids.length; i++) {
+      map[kids[i].getAttribute("data-card-id")] = kids[i];
+    }
+    for (var j = 0; j < ids.length; j++) {
+      if (map[ids[j]]) { map[ids[j]].style.order = j; }
+    }
+  }
+
+  function sendOrder(ids){
+    fetch("/api/card-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order: ids })
+    }).then(function(r){ return r.json(); }).then(function(data){
+      if (data && data.ok && data.order) { applyOrder(data.order); }
+    }).catch(function(){});
+  }
+
+  // Poignee de glissement (la carte entiere n est pas draggable : clics et selection de texte preserves)
+  var kids = gridCards();
+  for (var i = 0; i < kids.length; i++) {
+    (function(card){
+      var handle = document.createElement("span");
+      handle.className = "card-drag-handle";
+      handle.title = "Glisser pour déplacer cette carte";
+      handle.textContent = "⠿";
+      card.insertBefore(handle, card.firstChild);
+
+      handle.addEventListener("mousedown", function(){ card.draggable = true; });
+
+      card.addEventListener("dragstart", function(e){
+        draggingEl = card;
+        card.classList.add("dragging");
+        if (e.dataTransfer) {
+          e.dataTransfer.effectAllowed = "move";
+          e.dataTransfer.setData("text/plain", card.getAttribute("data-card-id") || "");
+        }
+      });
+
+      card.addEventListener("dragend", function(){
+        card.draggable = false;
+        card.classList.remove("dragging");
+        clearDropClasses();
+        draggingEl = null;
+        currentTarget = null;
+        currentPos = null;
+      });
+    })(kids[i]);
+  }
+
+  // Un simple clic sur la poignee (sans drag) ne doit pas laisser la carte draggable
+  document.addEventListener("mouseup", function(){
+    if (draggingEl) { return; }
+    var k = gridCards();
+    for (var n = 0; n < k.length; n++) { k[n].draggable = false; }
+  });
+
+  grid.addEventListener("dragover", function(e){
+    e.preventDefault();
+    if (!draggingEl) { return; }
+    var target = findCard(e.target);
+    if (!target || target === draggingEl) {
+      clearDropClasses();
+      currentTarget = null;
+      currentPos = null;
+      return;
+    }
+    clearDropClasses();
+    var rect = target.getBoundingClientRect();
+    var isBefore = e.clientX < rect.left + rect.width / 2;
+    target.classList.add(isBefore ? "drop-before" : "drop-after");
+    currentTarget = target;
+    currentPos = isBefore ? "before" : "after";
+  });
+
+  grid.addEventListener("dragleave", function(e){
+    if (e.target === grid) { clearDropClasses(); }
+  });
+
+  grid.addEventListener("drop", function(e){
+    e.preventDefault();
+    if (!draggingEl || !currentTarget || !currentPos) {
+      clearDropClasses();
+      return;
+    }
+    var visual = getVisualOrder();
+    var fromIdx = visual.indexOf(draggingEl);
+    if (fromIdx === -1) { clearDropClasses(); return; }
+    visual.splice(fromIdx, 1);
+    var toIdx = visual.indexOf(currentTarget);
+    if (toIdx === -1) { clearDropClasses(); return; }
+    if (currentPos === "after") { toIdx = toIdx + 1; }
+    visual.splice(toIdx, 0, draggingEl);
+    var ids = [];
+    for (var i = 0; i < visual.length; i++) {
+      visual[i].style.order = i;
+      ids.push(visual[i].getAttribute("data-card-id"));
+    }
+    sendOrder(ids);
+    clearDropClasses();
+  });
+
+  window.resetCardOrder = function(){
+    fetch("/api/card-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order: [] })
+    }).then(function(r){ return r.json(); }).then(function(data){
+      if (data && data.ok && data.order) { applyOrder(data.order); }
+    }).catch(function(){});
+  };
 })();
 </script>
 </body>

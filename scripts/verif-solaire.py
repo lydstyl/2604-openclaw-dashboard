@@ -201,6 +201,27 @@ def main():
         results.append(f"{'gridW (HA)':<25} | {'Endpoint /api/solaire':<15} | {'N/A':>10} | {'N/A':>10} | {'N/A':>10} | INDISPONIBLE")
         all_pass = False
 
+    # Cross-check DIRECT app solaire <-> Home Assistant (sources indépendantes, demandé par la revue)
+    ha_prod = None
+    if ha_data.get('prise_puissance') is not None and ha_data.get('cabanon_puissance') is not None:
+        ha_prod = ha_data['prise_puissance'] + ha_data['cabanon_puissance']
+    app_prod = app_data.get('productionTotalW') if app_data else None
+    if ha_prod is not None and app_prod is not None:
+        results.append(compare(ha_prod, app_prod, "prodW (app vs HA)", "App /api/realtime"))
+        if abs(ha_prod - app_prod) > max(abs(ha_prod)*0.01, 1.0):
+            all_pass = False
+    else:
+        results.append(f"{'prodW (app vs HA)':<25} | {'App /api/realtime':<15} | {'N/A':>10} | {'N/A':>10} | {'N/A':>10} | INDISPONIBLE")
+
+    ha_grid = ha_data.get('grid_puissance')
+    app_grid = app_data.get('consommationW') if app_data else None
+    if ha_grid is not None and app_grid is not None:
+        results.append(compare(ha_grid, app_grid, "gridW (app vs HA)", "App /api/realtime"))
+        if abs(ha_grid - app_grid) > max(abs(ha_grid)*0.01, 1.0):
+            all_pass = False
+    else:
+        results.append(f"{'gridW (app vs HA)':<25} | {'App /api/realtime':<15} | {'N/A':>10} | {'N/A':>10} | {'N/A':>10} | INDISPONIBLE")
+
     # Print Table
     print(f"{'Vérification':<25} | {'Source':<15} | {'Attendu':>10} | {'Observé':>10} | {'Écart':>10} | {'Statut'}")
     print("-" * 80)

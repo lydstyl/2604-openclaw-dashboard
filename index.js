@@ -817,6 +817,7 @@ async function fetchSolarData() {
     cumulCabanonKWh: cumulCabanonKWh,
     gridW: gridW,
     cumulGridKWh: cumulGridKWh,
+    cumulGridOk: (g2.ok && g3.ok),
     autonomie: (gridW === 0 && prodW > 0),
     updated_at: timeStr,
     stale: false,
@@ -2129,12 +2130,13 @@ function fetchSolaire() {
     gridW.style.color = gw > 0 ? '#60a5fa' : '#22c55e';
 
     if (d.autonomie) {
-      gridBadge.innerHTML = '<span class="tag tag-green">✅ Autonome — pas aucun import réseau</span>';
+      gridBadge.innerHTML = '<span class="tag tag-green">✅ Autonome — aucun import réseau</span>';
     } else {
       gridBadge.innerHTML = '';
     }
 
-    gridCumul.textContent = 'Puissance prélevée du réseau · cumulé: ' + (d.cumulGridKWh || 0).toFixed(1) + ' kWh';
+    gridCumul.textContent = 'Puissance prélevée du réseau · cumulé: ' + (d.cumulGridKWh || 0).toFixed(1) + ' kWh'
+      + (d.cumulGridOk === false ? ' ⚠ cumul partiel (un des deux compteurs muet)' : '');
   }
 
   initToggles();

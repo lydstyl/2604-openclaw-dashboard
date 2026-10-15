@@ -76,6 +76,34 @@ def build_prompt(n_words, seed, tail):
     return " ".join(parts)
 
 
+def slots_state(cfg):
+    """(occupe, total) des slots du serveur ; None si /slots indisponible."""
+    try:
+        with urllib.request.urlopen("http://%s:%d/slots" % (cfg["ip"], PORT), timeout=5) as r:
+            d = json.load(r)
+        return sum(1 for s in d if s.get("is_processing")), len(d)
+    except Exception:
+        return None
+
+
+def wait_idle(cfg, timeout_s=900):
+    """Attend que TOUS les slots soient libres avant de mesurer.
+
+    JAMAIS mesurer un noeud occupe : les slots partagent le GPU, donc un tir concurrent
+    divise le debit et le t/s obtenu ne dit plus rien du noeud (mesure du 15/10 : Marie
+    annoncee a 6,0 t/s alors que le gateway du profil luna tenait ses 2 slots, contre
+    46 t/s slot libre 1 h plus tot). Retourne (attente_s, (occupe, total)).
+    """
+    t0 = time.time()
+    while True:
+        st = slots_state(cfg)
+        if st is None or st[0] == 0:
+            return round(time.time() - t0, 1), (st or (0, 0))
+        if time.time() - t0 > timeout_s:
+            return round(time.time() - t0, 1), st
+        time.sleep(10)
+
+
 def call(node_key, cfg, prompt, results, max_tokens=MAX_TOKENS):
     url = "http://%s:%d/v1/chat/completions" % (cfg["ip"], PORT)
     body = {
@@ -94,6 +122,20 @@ def call(node_key, cfg, prompt, results, max_tokens=MAX_TOKENS):
     }
     data = json.dumps(body).encode()
     rec = {"node": node_key, "ip": cfg["ip"], "label": cfg["label"], "ok": False}
+    # Echantillonnage des slots PENDANT la mesure : un autre client qui decode sur le meme
+    # serveur partage le GPU et divise le debit mesure. Sur Marie (2 slots, utilisee par le
+    # gateway du profil luna) c'est la premiere cause de chiffre faux.
+    samples, stop_ev = [], threading.Event()
+
+    def _sample():
+        while not stop_ev.is_set():
+            st = slots_state(cfg)
+            if st:
+                samples.append(st[0])
+            stop_ev.wait(3)
+
+    th = threading.Thread(target=_sample, daemon=True)
+    th.start()
     t0 = time.time()
     try:
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -120,6 +162,9 @@ def call(node_key, cfg, prompt, results, max_tokens=MAX_TOKENS):
         rec["model"] = model
         rec["usage"] = usage
         rec["timings"] = timings
+        stop_ev.set()
+        rec["max_slots_busy"] = max(samples) if samples else None
+        rec["contended"] = bool(samples) and max(samples) > 1
         if timings:
             rec["ok"] = True
             rec["prompt_tokens"] = timings.get("prompt_n")
@@ -137,6 +182,7 @@ def call(node_key, cfg, prompt, results, max_tokens=MAX_TOKENS):
         else:
             rec["error"] = "pas de timings dans la reponse (usage=%r)" % (usage,)
     except Exception as e:  # noqa: BLE001 - on veut le motif exact dans le rapport
+        stop_ev.set()
         rec["wall_s"] = round(time.time() - t0, 2)
         rec["error"] = "%s: %s" % (type(e).__name__, e)
     results[node_key] = rec
@@ -199,7 +245,18 @@ def main():
     ap.add_argument("--convert", metavar="JSON", help="convertir un resultat brut existant sans mesurer")
     ap.add_argument("--out", default=RAW_FILE, help="ou ecrire le resultat brut (defaut %s)" % RAW_FILE)
     ap.add_argument("--no-write", action="store_true", help="ne pas ecrire data/llm-speed.json")
+    ap.add_argument("--nodes", default="", help="limiter a certains noeuds (ex: marie ou gabriel,louis)")
+    ap.add_argument("--wait-idle", type=int, default=900, help="attente max d'un noeud libre (s, defaut 900)")
+    ap.add_argument("--retry-clean", type=int, default=3,
+                    help="nb d'essais si un autre slot du meme serveur decode pendant la mesure")
     args = ap.parse_args()
+
+    if args.nodes:
+        wanted = [x.strip() for x in args.nodes.split(",") if x.strip()]
+        for k in list(NODES):
+            if k not in wanted:
+                del NODES[k]
+        sys.stderr.write("noeuds retenus : %s\n" % ", ".join(NODES))
 
     if args.convert:
         with open(args.convert) as f:
@@ -218,9 +275,19 @@ def main():
             rec = {"node": key, "ip": cfg["ip"], "label": cfg["label"], "ok": False, "regimes": []}
             for idx, (name, tail) in enumerate(REGIMES):
                 prompt = build_prompt(n_words, nonce + idx * 7 + hash(key) % 1000, tail)
-                tmp = {}
-                call(key, cfg, prompt, tmp, args.max_tokens)
-                sub = tmp.get(key, {})
+                sub = {}
+                for attempt in range(1, max(1, args.retry_clean) + 1):
+                    waited, st = wait_idle(cfg, args.wait_idle)
+                    tmp = {}
+                    call(key, cfg, prompt, tmp, args.max_tokens)
+                    sub = tmp.get(key, {})
+                    sub["waited_idle_s"] = waited
+                    sub["slots_on_start"] = "%s/%s" % st
+                    sub["attempt"] = attempt
+                    if not sub.get("contended"):
+                        break
+                    sys.stderr.write("%s/%s : mesure contaminee (autre slot actif), "
+                                     "nouvel essai\n" % (key, name))
                 sub["regime"] = name
                 rec["regimes"].append(sub)
                 if idx == 0:                     # champs racine = regime "texte" (compat ancien format)

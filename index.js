@@ -1072,8 +1072,10 @@ app.get('/', async (req, res) => {
   .grid > [data-card-id]{position:relative}
   .grid > .chart-section{grid-column:1/-1;margin-top:0}
   .grid > [data-card-id] .card-header{padding-right:1.7rem}
-  .card-drag-handle{position:absolute;top:0.45rem;right:0.5rem;font-size:1rem;line-height:1;color:#333;cursor:grab;user-select:none;-webkit-user-select:none;padding:2px 4px;border-radius:6px;transition:color .15s,background .15s;z-index:5}
-  .card-drag-handle:hover{color:#3b82f6;background:#181818}
+  .card-drag-handle{position:absolute;top:0.3rem;right:0.35rem;width:26px;height:30px;display:flex;align-items:center;justify-content:center;cursor:grab;user-select:none;-webkit-user-select:none;border:1px solid #262626;border-radius:8px;background:#141414;transition:background .15s,border-color .15s;z-index:5}
+  .card-drag-handle::before{content:"";width:12px;height:16px;background-image:radial-gradient(#b4b4b4 1.7px,transparent 1.8px);background-size:6px 6px;background-position:0 0}
+  .card-drag-handle:hover{background:#1d2430;border-color:#3b82f6}
+  .card-drag-handle:hover::before{background-image:radial-gradient(#60a5fa 1.7px,transparent 1.8px)}
   .card-drag-handle:active{cursor:grabbing}
   [data-card-id].dragging{opacity:.35}
   [data-card-id].drop-before{box-shadow:inset 3px 0 0 0 #3b82f6}
@@ -2413,7 +2415,6 @@ function fetchSolaire() {
       var handle = document.createElement("span");
       handle.className = "card-drag-handle";
       handle.title = "Glisser pour déplacer cette carte";
-      handle.textContent = "⠿";
       card.insertBefore(handle, card.firstChild);
 
       handle.addEventListener("mousedown", function(){ card.draggable = true; });

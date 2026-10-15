@@ -1712,7 +1712,8 @@ app.get('/', async (req, res) => {
     var ctxTxt = s.context_tokens ? Math.round(s.context_tokens / 1000) + 'k' : '?';
     var sub = (n.model ? n.model : '') +
       (n.prefill_tps ? ' · prefill ' + n.prefill_tps + ' t/s' : '') +
-      (n.steps_s ? ' · décode ' + n.steps_s + ' steps/s' : '');
+      (n.steps_s ? ' · décode ' + n.steps_s + ' steps/s' : '') +
+      (n.contended ? ' · ⚠ mesuré sous charge partagée' : '');
     // Deux regimes mesures : le t/s du serveur inclut la speculation, donc il depend du
     // CONTENU genere (meme machine : 28 t/s sur du texte libre, 84 t/s sur une enumeration).
     // La barre reste sur le regime texte (ce que l'utilisateur voit en pratique) ; les deux

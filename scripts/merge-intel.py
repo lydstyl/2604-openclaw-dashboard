@@ -49,6 +49,16 @@ def avg(vals):
     return round(sum(vals) / len(vals), 2) if vals else None
 
 
+# Mesures CONNUES comme contaminees (prises avant l'ajout du detecteur de contention) :
+# un autre client decodait sur le meme serveur pendant la mesure. Ecartees du calcul, avec
+# leur raison, plutot que de reecrire le JSON brut.
+QUARANTINE = {
+    ("llm-speed-2reg.json", "marie"):
+        "15/10 17:55 : les 2 slots de Marie etaient occupes par le gateway luna "
+        "(6,0 t/s mesure contre 23,5 t/s en fenetre propre le meme soir)",
+}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--speed", action="append", default=[])
@@ -66,24 +76,40 @@ def main():
         raw = load(p)
         for r in raw.get("results", []):
             if r.get("ok") and r.get("gen_tps"):
+                if (os.path.basename(p), r["node"]) in QUARANTINE:
+                    continue
                 free = regime(r, "texte") or r
                 rep = regime(r, "repetitif")
+                # prefill / prompt_tokens : on prend le regime NON servi par le cache de prompt
+                # (cache_n == 0) ; sinon le prefill annonce est faux (mesure : 11,9 t/s au lieu
+                # de ~510 parce que le prompt venait du cache).
+                cold = r
+                for x in r.get("regimes") or []:
+                    if (x.get("cached_tokens") or 0) == 0 and (x.get("prompt_tokens") or 0) > (cold.get("prompt_tokens") or 0):
+                        cold = x
                 per_node[r["node"]].append({
                     "file": os.path.basename(p),
-                    "gen_tps": free.get("gen_tps"), "prefill_tps": r.get("prefill_tps"),
+                    "gen_tps": free.get("gen_tps"), "prefill_tps": cold.get("prefill_tps"),
                     "steps_s": free.get("steps_s"), "tok_per_step": free.get("tok_per_step"),
                     "gen_tps_repeat": rep.get("gen_tps"),
                     "steps_s_repeat": rep.get("steps_s"),
-                    "prompt_tokens": r.get("prompt_tokens"), "gen_tokens": free.get("gen_tokens"),
+                    "prompt_tokens": cold.get("prompt_tokens"), "gen_tokens": free.get("gen_tokens"),
                     "draft_accepted": free.get("draft_accepted"), "model": r.get("model"),
+                    "contended": bool(free.get("contended")), "attempts": free.get("attempt"),
                     "wall_s": r.get("wall_s"),
                 })
 
     by_node = {}
+    dropped = {}
     for n in NODES:
-        runs = [r for r in per_node[n] if r.get("gen_tps")]
-        if not runs:
+        all_runs = [r for r in per_node[n] if r.get("gen_tps")]
+        if not all_runs:
             continue
+        # une mesure prise pendant qu'un autre client decodait sur le meme serveur est ecartee
+        # des qu'une mesure propre existe pour ce noeud
+        clean = [r for r in all_runs if not r.get("contended")]
+        runs = clean or all_runs
+        dropped[n] = len(all_runs) - len(runs)
         by_node[n] = {
             "ok": True,
             "gen_tps": round(sum(r["gen_tps"] for r in runs) / len(runs), 1),
@@ -96,6 +122,7 @@ def main():
             "gen_tokens": runs[-1]["gen_tokens"],
             "prompt_tokens": runs[-1]["prompt_tokens"],
             "model": (runs[-1].get("model") or "").split("/")[-1] or None,
+            "contended": any(r.get("contended") for r in runs),
             "draft_accepted": runs[-1].get("draft_accepted"),
             "wall_s": runs[-1].get("wall_s"),
         }
@@ -153,6 +180,7 @@ def main():
         "max_gen_tps": max([v["gen_tps"] for v in ok], default=None),
         "max_steps_s": max([v["steps_s"] for v in ok if v.get("steps_s")], default=None),
         "max_intel_score": 100,
+        "runs_dropped_contended": dropped,
         "speed_measured": [os.path.basename(p) for p in speed_files],
         "by_node": by_node,
     }

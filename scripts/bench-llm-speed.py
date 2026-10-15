@@ -274,9 +274,12 @@ def main():
         def worker(key, cfg):
             rec = {"node": key, "ip": cfg["ip"], "label": cfg["label"], "ok": False, "regimes": []}
             for idx, (name, tail) in enumerate(REGIMES):
-                prompt = build_prompt(n_words, nonce + idx * 7 + hash(key) % 1000, tail)
                 sub = {}
                 for attempt in range(1, max(1, args.retry_clean) + 1):
+                    # prompt RECONSTRUIT a chaque essai : un prompt identique est servi par le
+                    # cache de prompt du serveur (prompt_n tombe a 4) et le prefill mesure ne
+                    # veut plus rien dire (mesure du 15/10 : 11,9 t/s annonces au lieu de ~500).
+                    prompt = build_prompt(n_words, nonce + attempt * 31 + idx * 7 + hash(key) % 1000, tail)
                     waited, st = wait_idle(cfg, args.wait_idle)
                     tmp = {}
                     call(key, cfg, prompt, tmp, args.max_tokens)

@@ -20,6 +20,7 @@ spec.loader.exec_module(hr)
 
 n = int(sys.argv[1])
 out = sys.argv[2]
+ONLY = [x.strip() for x in (sys.argv[3].split(",") if len(sys.argv) > 3 else []) if x.strip()]
 
 COMMON = {
     "timeout": 300,
@@ -32,7 +33,7 @@ COMMON = {
 }
 
 MACHINES = {
-    "gabriel": ("PC Gabriel (Strata) — Qwen3.8-Flash-Next 177B IQ3_XXS", "http://192.168.3.224:8080/v1/chat/completions", "qwen3.8-flash-next-iq3_xxs"),
+    "gabriel": ("PC Gabriel (Strata) — Qwen3.8-Flash-Next-UD-Q4_K_XL (MoE)", "http://192.168.3.224:8080/v1/chat/completions", "qwen3.8-flash-next-unsloth-ud-q4_k_xl"),
     "louis":   ("PC Louis — Swift-1.5-Qwen3.8-27B-Q6_K",                "http://192.168.3.206:8080/v1/chat/completions", "Swift-1.5-Qwen3.8-27B-Q6_K.gguf"),
     "marie":   ("PC Marie — Swift-1.5-Qwen3.8-27B-Q4_K_M",              "http://192.168.3.57:8080/v1/chat/completions",  "Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf"),
 }
@@ -41,7 +42,8 @@ for key, (disp, url, model) in MACHINES.items():
     entry.update(display_name=disp, api_url=url, model=model)
     hr.MACHINES[key] = entry
 
-sys.argv = ["humaneval-runner.py", "--machines", ",".join(MACHINES),
+sys.argv = ["humaneval-runner.py", "--machines", ",".join(m for m in MACHINES if not ONLY or m in ONLY),
             "--problems", "0-%d" % (n - 1), "--output", out]
-print("[run_he_3nodes] 3 noeuds en parallele | problemes 0-%d | nothink | -> %s" % (n - 1, out), flush=True)
+print("[run_he_3nodes] noeuds %s | problemes 0-%d | nothink | -> %s" % (
+    ",".join(m for m in MACHINES if not ONLY or m in ONLY), n - 1, out), flush=True)
 hr.main()

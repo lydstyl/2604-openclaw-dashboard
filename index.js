@@ -397,7 +397,7 @@ const DEFAULT_VISIBILITY = {
   'credits': true, 'spending-30d': true, 'spending-24h': true,
   'cpu': true, 'ram': true, 'disk': true, 'ollama': true,
   'pc-gabriel': true, 'pc-louis': true, 'pc-marie': true, 'pc-boncoin': true, 'chart': true,
-  'solaire-prod': true, 'solaire-grid': true
+  'energie': true
 };
 
 function loadCardVisibility() {
@@ -413,6 +413,46 @@ function loadCardVisibility() {
 function saveCardVisibility(config) {
   ensureDataDir();
   fs.writeFileSync(VISIBILITY_FILE, JSON.stringify(config, null, 2));
+}
+
+// --- Card Order (glisser-deposer) -----------------------------------------
+const ORDER_FILE = path.join(DATA_DIR, 'card_order.json');
+
+// Ordre par defaut = ordre de rendu du template (cartes + graphique)
+const DEFAULT_ORDER = [
+  'energie', 'credits', 'spending-30d', 'spending-24h',
+  'cpu', 'ram', 'disk', 'ollama', 'pc-gabriel', 'pc-louis', 'pc-marie', 'pc-boncoin', 'chart'
+];
+
+function loadCardOrder() {
+  try {
+    if (fs.existsSync(ORDER_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(ORDER_FILE, 'utf8'));
+      const list = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.order) ? raw.order : []);
+      const clean = [];
+      list.forEach(function(id) {
+        if (typeof id === 'string' && DEFAULT_ORDER.indexOf(id) !== -1 && clean.indexOf(id) === -1) clean.push(id);
+      });
+      // une carte absente du fichier (ajoutee apres coup) retombe en fin, dans l ordre du template
+      DEFAULT_ORDER.forEach(function(id) { if (clean.indexOf(id) === -1) clean.push(id); });
+      return clean;
+    }
+  } catch (e) { console.error('[card-order] erreur lecture:', e.message); }
+  return DEFAULT_ORDER.slice();
+}
+
+function saveCardOrder(order) {
+  ensureDataDir();
+  const clean = [];
+  if (Array.isArray(order)) {
+    order.forEach(function(id) {
+      if (typeof id === 'string' && DEFAULT_ORDER.indexOf(id) !== -1 && clean.indexOf(id) === -1) clean.push(id);
+    });
+  }
+  // tableau vide ou invalide = retour a l ordre par defaut
+  DEFAULT_ORDER.forEach(function(id) { if (clean.indexOf(id) === -1) clean.push(id); });
+  fs.writeFileSync(ORDER_FILE, JSON.stringify(clean, null, 2));
+  return clean;
 }
 
 // ─── Routes ────────────────────────────────────────────────────────────────
@@ -703,6 +743,21 @@ app.post('/api/card-visibility', (req, res) => {
   }
 });
 
+// API: ordre des cartes (glisser-deposer)
+app.get('/api/card-order', (req, res) => {
+  res.json({ ok: true, order: loadCardOrder() });
+});
+
+app.post('/api/card-order', (req, res) => {
+  try {
+    const body = req.body || {};
+    const order = saveCardOrder(body.order);
+    res.json({ ok: true, order: order });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // API: top processes
 app.get('/api/top-processes', (req, res) => {
   res.json(getTopProcesses());
@@ -753,6 +808,120 @@ app.get('/api/pc-plug-state/:name', async (req, res) => {
 
 // API: toggle PC smart plug
 
+// ─── Prix de l'énergie (config persistée) ────────────────────
+const ENERGY_FILE = path.join(DATA_DIR, 'energy_prices.json');
+
+// Tarif Bleu EDF, grille applicable au 1er août 2026 (TTC, €/kWh)
+const DEFAULT_ENERGY = {
+  mode: 'hphc',          // 'base' | 'hphc'
+  prix_base: 0.1985,     // option Base, >= 9 kVA
+  prix_hp: 0.2142,       // Heures pleines
+  prix_hc: 0.1589,       // Heures creuses
+  // Fenêtres heures creuses mesurées sur le compteur Linky (registres TIC) :
+  // bascule HP->HC à 01:30, HC->HP à 07:00, HP->HC à 12:00, HC->HP à 14:30 (8 h/jour).
+  hc_windows: [[1.5, 7], [12, 14.5]],
+  prix_injection: 0      // €/kWh revendu (0 = pas de revente)
+};
+
+function loadEnergyPrices() {
+  try {
+    if (fs.existsSync(ENERGY_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(ENERGY_FILE, 'utf8'));
+      return { ...DEFAULT_ENERGY, ...raw };
+    }
+  } catch (e) { console.error('[energy-prices] lecture:', e.message); }
+  return { ...DEFAULT_ENERGY };
+}
+
+function saveEnergyPrices(patch) {
+  const cfg = { ...loadEnergyPrices(), ...patch };
+  ensureDataDir();
+  fs.writeFileSync(ENERGY_FILE, JSON.stringify(cfg, null, 2));
+  return cfg;
+}
+
+// Heure locale de Paris (le conteneur tourne en UTC)
+function parisClock(date) {
+  const hh = date.toLocaleString('fr-FR', { timeZone: 'Europe/Paris', hour: '2-digit', hour12: false });
+  const mm = date.toLocaleString('fr-FR', { timeZone: 'Europe/Paris', minute: '2-digit' });
+  const h = parseInt(hh, 10);
+  const m = parseInt(mm, 10);
+  if (isNaN(h) || isNaN(m)) {
+    const d = new Date(date.getTime() + 2 * 3600 * 1000);  // secours : UTC+2
+    return d.getUTCHours() * 60 + d.getUTCMinutes();
+  }
+  return h * 60 + m;
+}
+
+function parisHour(date) { return Math.floor(parisClock(date) / 60); }
+
+// Fenêtres HC en heures décimales (ex. 1.5 = 01:30). Rétro-compat hc_debut/hc_fin.
+function hcWindows(cfg) {
+  const c = cfg || loadEnergyPrices();
+  if (Array.isArray(c.hc_windows) && c.hc_windows.length) {
+    return c.hc_windows
+      .filter(function (w) { return Array.isArray(w) && w.length === 2 && !isNaN(Number(w[0])) && !isNaN(Number(w[1])); })
+      .map(function (w) { return [Number(w[0]), Number(w[1])]; });
+  }
+  if (c.hc_debut !== undefined && c.hc_fin !== undefined) return [[Number(c.hc_debut), Number(c.hc_fin)]];
+  return [];
+}
+
+function fmtHour(h) {
+  const total = Math.round(Number(h) * 60);
+  const hh = Math.floor(total / 60) % 24;
+  const mm = total % 60;
+  return (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm;
+}
+
+function hcWindowsLabel(cfg) {
+  const list = hcWindows(cfg);
+  if (!list.length) return '';
+  return list.map(function (w) { return fmtHour(w[0]) + '–' + fmtHour(w[1]); }).join(' & ');
+}
+
+function isInHcWindow(min, w) {
+  const a = ((Math.round(w[0] * 60) % 1440) + 1440) % 1440;
+  const b = ((Math.round(w[1] * 60) % 1440) + 1440) % 1440;
+  if (a === b) return false;
+  return a < b ? (min >= a && min < b) : (min >= a || min < b);
+}
+
+// Prochaine bascule (début ou fin de fenêtre HC) après `min` minutes
+function nextBoundary(min, list, inHc) {
+  let best = null;
+  list.forEach(function (w) {
+    const cands = inHc ? [w[1]] : [w[0]];
+    cands.forEach(function (b) {
+      let bm = ((Math.round(Number(b) * 60) % 1440) + 1440) % 1440;
+      let d = bm - min;
+      if (d <= 0) d += 1440;
+      if (best === null || d < best.minutes) best = { minutes: d, at: bm };
+    });
+  });
+  return best;
+}
+
+function currentEnergyPrice(cfg, date) {
+  const c = cfg || loadEnergyPrices();
+  if (c.mode !== 'hphc') {
+    return { price: Number(c.prix_base) || 0, label: 'Base', slot: 'prix_base', hc: false, nextAt: null, nextInMin: null };
+  }
+  const min = parisClock(date || new Date());
+  const list = hcWindows(c);
+  let inHc = false;
+  list.forEach(function (w) { if (isInHcWindow(min, w)) inHc = true; });
+  const nb = nextBoundary(min, list, inHc);
+  return {
+    price: Number(inHc ? c.prix_hc : c.prix_hp) || 0,
+    label: inHc ? 'Heures creuses' : 'Heures pleines',
+    slot: inHc ? 'prix_hc' : 'prix_hp',
+    hc: inHc,
+    nextAt: nb ? fmtHour(nb.at / 60) : null,
+    nextInMin: nb ? nb.minutes : null
+  };
+}
+
 // ─── Solaire : production + import réseau (HA) ────────────────
 // ─── Solar Production & Grid Import ───────────────────────────
 let _solaireCache = { ts: 0, data: null };
@@ -800,10 +969,25 @@ async function fetchSolarData() {
   const prodCabanonW = p2.val;
   const cumulCabanonKWh = c2.val;
   const gridW = g1.val;
-  const cumulGridKWh = g2.val + g3.val;
+  // Registres Linky : tranche 1 = index Heures creuses, tranche 2 = index Heures pleines
+  // (mesuré : bascules 01:30/07:00/12:00/14:30 sur 8 jours de séries HA)
+  const cumulGridHcKWh = g2.val;
+  const cumulGridHpKWh = g3.val;
+  const cumulGridKWh = cumulGridHcKWh + cumulGridHpKWh;
   const prodW = prodPriseW + prodCabanonW;
-  
+
+  // Estimation en euros sur 1 h au rythme actuel (TTC)
+  const energyCfg = loadEnergyPrices();
   const now = new Date();
+  const priceInfo = currentEnergyPrice(energyCfg, now);
+  const prodEurH = (prodW / 1000) * priceInfo.price;
+  const gridEurH = (gridW / 1000) * priceInfo.price;
+  const cumulProdEur = (cumulPriseKWh + cumulCabanonKWh) * priceInfo.price;
+  // Cumul réseau valorisé au vrai prix de chaque registre
+  const cumulGridEur = (energyCfg.mode === 'hphc')
+    ? (cumulGridHcKWh * (Number(energyCfg.prix_hc) || 0) + cumulGridHpKWh * (Number(energyCfg.prix_hp) || 0))
+    : (cumulGridKWh * (Number(energyCfg.prix_base) || 0));
+
   const timeStr = now.toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris', hour12: false });
 
   return {
@@ -819,6 +1003,21 @@ async function fetchSolarData() {
     cumulGridKWh: cumulGridKWh,
     cumulGridOk: (g2.ok && g3.ok),
     autonomie: (gridW === 0 && prodW > 0),
+    priceKwh: priceInfo.price,
+    priceLabel: priceInfo.label,
+    priceSlot: priceInfo.slot,
+    priceMode: energyCfg.mode,
+    priceNextAt: priceInfo.nextAt,
+    priceNextInMin: priceInfo.nextInMin,
+    hcWindowsLabel: energyCfg.mode === 'hphc' ? hcWindowsLabel(energyCfg) : '',
+    prixHp: Number(energyCfg.prix_hp) || 0,
+    prixHc: Number(energyCfg.prix_hc) || 0,
+    cumulGridHcKWh: cumulGridHcKWh,
+    cumulGridHpKWh: cumulGridHpKWh,
+    prodEurH: prodEurH,
+    gridEurH: gridEurH,
+    cumulProdEur: cumulProdEur,
+    cumulGridEur: cumulGridEur,
     updated_at: timeStr,
     stale: false,
     age_s: 0
@@ -839,6 +1038,47 @@ app.get('/api/solaire', async (req, res) => {
     const data = await fetchSolarData();
     _solaireCache = { ts: now, data: data };
     res.json(data);
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Prix du kWh : lecture / écriture (le mode et les prix sont persistés)
+app.get('/api/energy-prices', (req, res) => {
+  const cfg = loadEnergyPrices();
+  const cur = currentEnergyPrice(cfg, new Date());
+  res.json({ ok: true, ...cfg, current: cur });
+});
+
+app.post('/api/energy-prices', (req, res) => {
+  try {
+    const body = req.body || {};
+    const patch = {};
+    if (body.mode === 'base' || body.mode === 'hphc') patch.mode = body.mode;
+    ['prix_base', 'prix_hp', 'prix_hc', 'prix_injection'].forEach(function (k) {
+      if (body[k] !== undefined) {
+        const n = Number(body[k]);
+        if (isNaN(n) || n < 0 || n > 5) return;
+        patch[k] = n;
+      }
+    });
+    if (Array.isArray(body.hc_windows)) {
+      const wins = body.hc_windows
+        .filter(function (w) { return Array.isArray(w) && w.length === 2 && !isNaN(Number(w[0])) && !isNaN(Number(w[1])) &&
+          Number(w[0]) >= 0 && Number(w[0]) <= 24 && Number(w[1]) >= 0 && Number(w[1]) <= 24; })
+        .map(function (w) { return [Number(w[0]), Number(w[1])]; });
+      if (wins.length) patch.hc_windows = wins;
+    }
+    ['hc_debut', 'hc_fin'].forEach(function (k) {
+      if (body[k] !== undefined) {
+        const n = parseInt(body[k], 10);
+        if (!isNaN(n) && n >= 0 && n <= 23) patch[k] = n;
+      }
+    });
+    if (!Object.keys(patch).length) return res.json({ ok: false, error: 'aucun champ valide' });
+    const cfg = saveEnergyPrices(patch);
+    _solaireCache = { ts: 0, data: null };  // force le recalcul au prochain appel
+    res.json({ ok: true, ...cfg, current: currentEnergyPrice(cfg, new Date()) });
   } catch (e) {
     res.json({ ok: false, error: e.message });
   }
@@ -870,7 +1110,7 @@ app.get('/', async (req, res) => {
   const rc  = ramColor(parseFloat(mem.appsPct));
   const dc  = diskColor(parseFloat(disk.usedPct));
   const kc  = creditColor(credits.total);
-  const ts  = new Date().toLocaleTimeString('fr-FR');
+  const ts  = new Date().toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris', hour12: false });
   const cachePct = ((parseFloat(mem.cache) / parseFloat(mem.total)) * 100).toFixed(1);
 
   // ─── Delegation Tracker (server-rendered) ────────────────────────────
@@ -880,6 +1120,13 @@ app.get('/', async (req, res) => {
   const visibility = loadCardVisibility();
   function vis(id) { return visibility[id] !== false; }
   function visHidden(id) { return !vis(id) ? 'card-hidden' : ''; }
+
+  // --- Card order (glisser-deposer) ---
+  const cardOrder = loadCardOrder();
+  function orderOf(id) {
+    var idx = cardOrder.indexOf(id);
+    return 'style="order:' + (idx === -1 ? cardOrder.length : idx) + '"';
+  }
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -1006,6 +1253,21 @@ app.get('/', async (req, res) => {
   .pc-action-result{font-size:0.62rem;color:#888;margin-top:0.3rem;min-height:1rem}
   /* Card visibility */
   .card-hidden{display:none!important}
+  /* --- Glisser-deposer des cartes --- */
+  .grid > [data-card-id]{position:relative}
+  .grid > .chart-section{grid-column:1/-1;margin-top:0}
+  .grid > [data-card-id] .card-header{padding-right:1.7rem}
+  .card-drag-handle{position:absolute;top:0.3rem;right:0.35rem;width:26px;height:30px;display:flex;align-items:center;justify-content:center;cursor:grab;user-select:none;-webkit-user-select:none;border:1px solid #262626;border-radius:8px;background:#141414;transition:background .15s,border-color .15s;z-index:5}
+  .card-drag-handle::before{content:"";width:12px;height:16px;background-image:radial-gradient(#b4b4b4 1.7px,transparent 1.8px);background-size:6px 6px;background-position:0 0}
+  .card-drag-handle:hover{background:#1d2430;border-color:#3b82f6}
+  .card-drag-handle:hover::before{background-image:radial-gradient(#60a5fa 1.7px,transparent 1.8px)}
+  .card-drag-handle:active{cursor:grabbing}
+  [data-card-id].dragging{opacity:.35}
+  [data-card-id].drop-before{box-shadow:inset 3px 0 0 0 #3b82f6}
+  [data-card-id].drop-after{box-shadow:inset -3px 0 0 0 #3b82f6}
+  .settings-hint{font-size:0.7rem;color:#666;margin:0.35rem 0 0.7rem;display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap}
+  .settings-reset{background:#151515;color:#aaa;border:1px solid #2a2a2a;border-radius:6px;padding:0.2rem 0.55rem;font-size:0.68rem;cursor:pointer;font-family:inherit}
+  .settings-reset:hover{color:#3b82f6;border-color:#3b82f6}
   .settings-btn{background:none;border:none;color:#555;cursor:pointer;font-size:1.1rem;padding:0.15rem 0.35rem;border-radius:6px;transition:all 0.2s;line-height:1}
   .settings-btn:hover{color:#aaa;background:#1a1a1a}
   .settings-btn.active{color:#818cf8;background:#1a1a2e}
@@ -1032,6 +1294,10 @@ app.get('/', async (req, res) => {
   .solaire-time{font-size:0.65rem;color:#3a3a3a;margin-top:0.75rem}
   .solaire-grid-sub{font-size:0.75rem;color:#555;margin-top:0.4rem}
   .solaire-grid-badge{margin-top:0.5rem}
+  .solaire-eur{font-size:0.85rem;font-weight:700;margin-top:0.35rem}
+  .solaire-detail{font-size:0.68rem;color:#555;margin-top:0.15rem}
+  .solaire-price{font-size:0.65rem;color:#3a3a3a;margin-top:0.5rem;cursor:pointer}
+  .solaire-price:hover{color:#60a5fa}
 </style>
 </head>
 <body>
@@ -1052,6 +1318,7 @@ app.get('/', async (req, res) => {
 <!-- Panneau de configuration des cartes -->
 <div id="settings-panel" class="settings-panel">
   <div class="settings-title">🔄 Cartes à afficher</div>
+  <div class="settings-hint">Glisser-déposer une carte par sa poignée ⠿ pour la placer où tu veux.<button class="settings-reset" onclick="resetCardOrder()">↺ Ordre par défaut</button></div>
   <div class="settings-grid">
     <label class="settings-row" data-card-id="credits"><span class="s-icon">💳</span><input type="checkbox"${vis('credits')?' checked':''}><span class="s-toggle"></span><span class="s-label">Crédits</span></label>
     <label class="settings-row" data-card-id="spending-30d"><span class="s-icon">📊</span><input type="checkbox"${vis('spending-30d')?' checked':''}><span class="s-toggle"></span><span class="s-label">Dépenses 30j</span></label>
@@ -1065,45 +1332,40 @@ app.get('/', async (req, res) => {
     <label class="settings-row" data-card-id="pc-marie"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-marie')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Marie</span></label>
     <label class="settings-row" data-card-id="pc-boncoin"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-boncoin')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC BonCoin</span></label>
     <label class="settings-row" data-card-id="chart"><span class="s-icon">📈</span><input type="checkbox"${vis('chart')?' checked':''}><span class="s-toggle"></span><span class="s-label">Graphique</span></label>
-    <label class="settings-row" data-card-id="solaire-prod"><span class="s-icon">☀️</span><input type="checkbox"${vis('solaire-prod')?' checked':''}><span class="s-toggle"></span><span class="s-label">Solaire production</span></label>
-    <label class="settings-row" data-card-id="solaire-grid"><span class="s-icon">⚡</span><input type="checkbox"${vis('solaire-grid')?' checked':''}><span class="s-toggle"></span><span class="s-label">Réseau Linky</span></label>
+    <label class="settings-row" data-card-id="energie"><span class="s-icon">⚡</span><input type="checkbox"${vis('energie')?' checked':''}><span class="s-toggle"></span><span class="s-label">Énergie (solaire + Linky)</span></label>
   </div>
 </div>
 
 <div class="grid">
 
-  <!-- SOLAIRE PRODUCTION -->
-  <div class="card ${visHidden('solaire-prod')}" data-card-id="solaire-prod">
-    <div class="card-header"><span class="icon">☀️</span><span class="card-title">Production en temps réel</span></div>
-    <div class="big-value" style="color:#fbbf24"><span id="solaire-prod-total">—</span><span>W</span></div>
-    <div class="solaire-kw" id="solaire-prod-kw">—</div>
-    <hr class="divider">
+  <!-- ÉNERGIE : production solaire + import réseau, avec coût/économie €/h -->
+  <div class="card ${visHidden('energie')}" data-card-id="energie"${orderOf('energie')} >
+    <div class="card-header"><span class="icon">⚡</span><span class="card-title">Énergie en temps réel</span></div>
     <div class="solaire-cols">
       <div class="solaire-col">
-        <div class="solaire-col-label">Petits panneaux (prise)</div>
-        <div class="solaire-col-val" style="color:#fbbf24"><span id="solaire-prise-w">—</span> W</div>
-        <div class="solaire-col-sub" id="solaire-prise-cumul">—</div>
+        <div class="solaire-col-label">☀️ Production solaire</div>
+        <div class="solaire-col-val" style="color:#fbbf24"><span id="energie-prod-w">—<span style="font-size:0.7rem;font-weight:400">W</span></span></div>
+        <div class="solaire-col-sub" id="energie-prod-kw">—</div>
+        <div class="solaire-eur" id="energie-prod-eur" style="color:#fbbf24">—</div>
+        <div class="solaire-detail" id="energie-prod-detail">—</div>
       </div>
       <div class="solaire-col">
-        <div class="solaire-col-label">Gros panneaux (cabanon)</div>
-        <div class="solaire-col-val" style="color:#f97316"><span id="solaire-cabanon-w">—</span> W</div>
-        <div class="solaire-col-sub" id="solaire-cabanon-cumul">—</div>
+        <div class="solaire-col-label">⚡ Import EDF (Linky)</div>
+        <div class="solaire-col-val" id="energie-grid-w" style="color:#22c55e">— <span style="font-size:0.7rem;font-weight:400">W</span></div>
+        <div class="solaire-col-sub" id="energie-grid-kw">—</div>
+        <div class="solaire-eur" id="energie-grid-eur" style="color:#60a5fa">—</div>
+        <div class="solaire-detail" id="energie-grid-detail">—</div>
       </div>
     </div>
-    <div class="solaire-time" id="solaire-prod-time">—</div>
-  </div>
-
-  <!-- SOLAIRE RESEAU -->
-  <div class="card ${visHidden('solaire-grid')}" data-card-id="solaire-grid">
-    <div class="card-header"><span class="icon">⚡</span><span class="card-title">Réseau (Linky) — import depuis EDF</span></div>
-    <div class="big-value" id="solaire-grid-w" style="color:#22c55e">—<span>W</span></div>
-    <div id="solaire-grid-badge"></div>
-    <div class="solaire-grid-sub" id="solaire-grid-cumul">—</div>
-    <div class="solaire-time" id="solaire-grid-time">—</div>
+    <div class="solaire-grid-sub" id="energie-net" style="margin-top:0.6rem">—</div>
+    <div class="solaire-grid-badge" id="energie-badge"></div>
+    <div class="solaire-detail" id="energie-hc" style="margin-top:0.55rem">—</div>
+    <div class="solaire-price" id="energie-price" onclick="editEnergyPrice()" title="Cliquer pour changer le prix du kWh">—</div>
+    <div class="solaire-time" id="energie-time">—</div>
   </div>
 
   <!-- CREDITS -->
-  <div class="card ${visHidden('credits')}" data-card-id="credits">
+  <div class="card ${visHidden('credits')}" data-card-id="credits"${orderOf('credits')} >
     <div class="card-header"><span class="icon">💳</span><span class="card-title">Crédits — Tous providers</span></div>
     <div class="big-value" style="color:${kc}">${credits.total}<span>$</span></div>
     <hr class="divider">
@@ -1114,7 +1376,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- DÉPENSES 30 JOURS -->
-  <div class="card ${visHidden('spending-30d')}" data-card-id="spending-30d">
+  <div class="card ${visHidden('spending-30d')}" data-card-id="spending-30d"${orderOf('spending-30d')} >
     <div class="card-header"><span class="icon">📊</span><span class="card-title">Dépenses — 30 derniers jours</span></div>
     <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending.total.toFixed(2)}<span>$</span></div>
     <hr class="divider">
@@ -1126,7 +1388,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- DÉPENSES 24H -->
-  <div class="card ${visHidden('spending-24h')}" data-card-id="spending-24h">
+  <div class="card ${visHidden('spending-24h')}" data-card-id="spending-24h"${orderOf('spending-24h')} >
     <div class="card-header"><span class="icon">⏰</span><span class="card-title">Dépenses — 24 dernières heures</span></div>
     <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending24h.total.toFixed(2)}<span>$</span></div>
     <hr class="divider">
@@ -1137,7 +1399,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- CPU -->
-  <div class="card ${visHidden('cpu')}" data-card-id="cpu">
+  <div class="card ${visHidden('cpu')}" data-card-id="cpu"${orderOf('cpu')} >
     <div class="card-header"><span class="icon">🖥️</span><span class="card-title">CPU</span></div>
     <div class="big-value" style="color:${cc}">${sys.cpuPct}<span>%</span></div>
     ${bar(sys.cpuPct, cc)}
@@ -1152,7 +1414,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- RAM -->
-  <div class="card ${visHidden('ram')}" data-card-id="ram">
+  <div class="card ${visHidden('ram')}" data-card-id="ram"${orderOf('ram')} >
     <div class="card-header"><span class="icon">🧠</span><span class="card-title">Mémoire RAM</span></div>
     <div class="big-value" style="color:${rc}">${mem.usedByApps}<span>GB apps</span></div>
     <div class="bar-bg">
@@ -1172,7 +1434,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- DISK -->
-  <div class="card ${visHidden('disk')}" data-card-id="disk">
+  <div class="card ${visHidden('disk')}" data-card-id="disk"${orderOf('disk')} >
     <div class="card-header"><span class="icon">💾</span><span class="card-title">Disque dur</span></div>
     <div class="big-value" style="color:${dc}">${disk.used}<span>GB utilisés</span></div>
     ${bar(disk.usedPct, dc)}
@@ -1184,7 +1446,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- OLLAMA CLOUD -->
-  <div class="card ${visHidden('ollama')}" data-card-id="ollama">
+  <div class="card ${visHidden('ollama')}" data-card-id="ollama"${orderOf('ollama')} >
     <div class="card-header"><span class="icon">🦙</span><span class="card-title">Ollama Cloud</span></div>
     <div class="big-value" style="color:#a78bfa">${ollama.plan}<span> plan</span></div>
     <hr class="divider">
@@ -1193,7 +1455,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- PC GABRIEL -->
-  <div class="card ${visHidden('pc-gabriel')}" data-card-id="pc-gabriel" id="pc-gabriel-card">
+  <div class="card ${visHidden('pc-gabriel')}" data-card-id="pc-gabriel"${orderOf('pc-gabriel')} id="pc-gabriel-card">
     <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Gabriel <span id="pc-gabriel-ip" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">192.168.3.224</span><span id="pc-gabriel-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-gabriel" checked><span class="slider"></span>🔔</label></div>
     <div id="pc-gabriel-body">
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
@@ -1211,7 +1473,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- PC LOUIS -->
-  <div class="card ${visHidden('pc-louis')}" data-card-id="pc-louis" id="pc-louis-card">
+  <div class="card ${visHidden('pc-louis')}" data-card-id="pc-louis"${orderOf('pc-louis')} id="pc-louis-card">
     <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Louis <span id="pc-louis-ip" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">192.168.3.206</span><span id="pc-louis-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-louis" checked><span class="slider"></span>🔔</label></div>
     <div id="pc-louis-body">
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
@@ -1229,7 +1491,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- PC MARIE -->
-  <div class="card ${visHidden('pc-marie')}" data-card-id="pc-marie" id="pc-marie-card">
+  <div class="card ${visHidden('pc-marie')}" data-card-id="pc-marie"${orderOf('pc-marie')} id="pc-marie-card">
     <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC Marie <span id="pc-marie-ip" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">192.168.3.57</span><span id="pc-marie-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-marie" checked><span class="slider"></span>🔔</label></div>
     <div id="pc-marie-body">
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
@@ -1247,7 +1509,7 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- PC BONCOIN (LeBonCoin) — pas encore d'agent SSH/LLM : carte pilotée par la prise HA -->
-  <div class="card ${visHidden('pc-boncoin')}" data-card-id="pc-boncoin" id="pc-boncoin-card">
+  <div class="card ${visHidden('pc-boncoin')}" data-card-id="pc-boncoin"${orderOf('pc-boncoin')} id="pc-boncoin-card">
     <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC BonCoin <span style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">5060 Ti 16 Go + 3060 Ti 8 Go = 24 Go</span><span id="pc-boncoin-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span></div>
     <div id="pc-boncoin-body">
       <div class="row"><span class="label">Démarrage</span><span class="val">🔌 prise connectée</span></div>
@@ -1261,15 +1523,16 @@ app.get('/', async (req, res) => {
     <div class="pc-action-result" id="pc-boncoin-result"></div>
   </div>
 
-</div>
 
-<!-- Chart Section -->
-<div class="chart-section ${visHidden('chart')}" data-card-id="chart">
+  <!-- Chart Section -->
+  <div class="chart-section ${visHidden('chart')}" data-card-id="chart" ${orderOf('chart')}>
   <div class="card-header"><span class="icon">📈</span><span class="card-title">Évolution des crédits (30 jours)</span></div>
   <div id="chart-container" class="chart-container">
     <div id="chart-placeholder" class="chart-placeholder">Collecte de données en cours...</div>
     <canvas id="creditsChart"></canvas>
+    </div>
   </div>
+
 </div>
 
 <script>
@@ -1632,12 +1895,22 @@ app.get('/', async (req, res) => {
     var col = (pct > 99) ? '#22c55e' : (pct >= 60 ? '#38bdf8' : '#f59e0b');
     var ctxTxt = s.context_tokens ? Math.round(s.context_tokens / 1000) + 'k' : '?';
     var sub = (n.model ? n.model : '') +
-      (n.prefill_tps ? ' · prefill ' + n.prefill_tps + ' t/s' : '');
-    return '<div class="pc-speed-row"><span>⚡ Vitesse <span class="pc-speed-sub">gen @' + ctxTxt + ' ctx</span></span>' +
+      (n.prefill_tps ? ' · prefill ' + n.prefill_tps + ' t/s' : '') +
+      (n.steps_s ? ' · décode ' + n.steps_s + ' steps/s' : '') +
+      (n.contended ? ' · ⚠ mesuré sous charge partagée' : '');
+    // Deux regimes mesures : le t/s du serveur inclut la speculation, donc il depend du
+    // CONTENU genere (meme machine : 28 t/s sur du texte libre, 84 t/s sur une enumeration).
+    // La barre reste sur le regime texte (ce que l'utilisateur voit en pratique) ; les deux
+    // chiffres sont affiches pour que personne ne compare un t/s isole.
+    var reg = n.gen_tps_repeat
+      ? '<div class="pc-speed-row pc-speed-sub" style="margin-top:0.15rem"><span>texte libre ' + n.gen_tps +
+        ' t/s · sortie répétitive ' + n.gen_tps_repeat + ' t/s</span></div>'
+      : '';
+    return '<div class="pc-speed-row"><span>⚡ Vitesse <span class="pc-speed-sub">texte libre @' + ctxTxt + ' ctx</span></span>' +
       '<span class="pc-speed-val">' + n.gen_tps + ' t/s</span></div>' +
       '<div class="pc-speed-bar"><div class="pc-speed-fill" style="width:' + pct.toFixed(1) + '%;background:' + col + '"></div></div>' +
       '<div class="pc-speed-row pc-speed-sub" style="margin-top:0.2rem"><span>' + sub + '</span>' +
-      '<span>' + Math.round(pct) + '% du max</span></div>' +
+      '<span>' + Math.round(pct) + '% du max</span></div>' + reg +
       intelInnerHtml(name);
   }
 
@@ -2063,81 +2336,131 @@ app.get('/', async (req, res) => {
   }
 
 function fetchSolaire() {
-    fetch('/api/solaire').then(function(r){return r.json();}).then(function(d){renderSolaire(d);}).catch(function(e){console.error('solaire:',e);});
+    fetch('/api/solaire').then(function(r){return r.json();}).then(function(d){renderEnergie(d);}).catch(function(e){console.error('solaire:',e);});
   }
 
-  function renderSolaire(d) {
-    var prodTotal = document.getElementById('solaire-prod-total');
-    var prodKw = document.getElementById('solaire-prod-kw');
-    var priseW = document.getElementById('solaire-prise-w');
-    var priseCumul = document.getElementById('solaire-prise-cumul');
-    var cabW = document.getElementById('solaire-cabanon-w');
-    var cabCumul = document.getElementById('solaire-cabanon-cumul');
-    var gridW = document.getElementById('solaire-grid-w');
-    var gridBadge = document.getElementById('solaire-grid-badge');
-    var gridCumul = document.getElementById('solaire-grid-cumul');
-    var prodTime = document.getElementById('solaire-prod-time');
-    var gridTime = document.getElementById('solaire-grid-time');
-    if (!prodTotal) return;
+  function renderEnergie(d) {
+    var prodW = document.getElementById('energie-prod-w');
+    var prodKw = document.getElementById('energie-prod-kw');
+    var prodEur = document.getElementById('energie-prod-eur');
+    var prodDetail = document.getElementById('energie-prod-detail');
+    var gridW = document.getElementById('energie-grid-w');
+    var gridKw = document.getElementById('energie-grid-kw');
+    var gridEur = document.getElementById('energie-grid-eur');
+    var gridDetail = document.getElementById('energie-grid-detail');
+    var netEl = document.getElementById('energie-net');
+    var badge = document.getElementById('energie-badge');
+    var hcEl = document.getElementById('energie-hc');
+    var priceEl = document.getElementById('energie-price');
+    var timeEl = document.getElementById('energie-time');
+    if (!prodW) return;
+
+    function money(v, dec) {
+      var n = Number(v) || 0;
+      return n.toLocaleString('fr-FR', { minimumFractionDigits: dec, maximumFractionDigits: dec }) + ' €';
+    }
+    function eur(v) {
+      var n = Number(v) || 0;
+      return money(n, Math.abs(n) < 0.1 ? 3 : 2);
+    }
+    function cents(v) { return (Number(v) * 100).toFixed(2).replace('.', ',') + ' c€'; }
+    function W(v) { return '<span style="font-size:0.7rem;font-weight:400">' + v + '</span>'; }
 
     if (!d || !d.ok) {
-      var msg = '⛔ Solaire indisponible';
-      prodTotal.textContent = '—';
-      prodKw.textContent = msg;
-      priseW.textContent = '—';
-      priseCumul.textContent = msg;
-      cabW.textContent = '—';
-      cabCumul.textContent = msg;
-      gridW.innerHTML = '—<span>W</span>';
-      gridBadge.innerHTML = '';
-      gridCumul.textContent = msg;
-      if (prodTime) prodTime.textContent = '';
-      if (gridTime) gridTime.textContent = '';
+      window._energyData = {};
+      prodW.textContent = '—';
+      prodKw.textContent = '⛔ Énergie indisponible';
+      prodEur.textContent = '';
+      prodDetail.textContent = '';
+      gridW.innerHTML = '— ' + W('W');
+      gridKw.textContent = '⛔ capteur indisponible';
+      gridEur.textContent = '';
+      gridDetail.textContent = '';
+      if (netEl) netEl.textContent = '';
+      badge.innerHTML = '';
+      if (hcEl) hcEl.textContent = '';
+      priceEl.textContent = '';
+      if (timeEl) timeEl.textContent = '';
       return;
+    }
+    window._energyData = d;
+
+    var prod = Math.round(d.prodW || 0);
+    var gw = Math.round(d.gridW || 0);
+    var priseOk = d.priseOk === true || d.priseOk === 'true';
+    var cabOk = d.cabanonOk === true || d.cabanonOk === 'true';
+
+    prodW.innerHTML = prod + ' ' + W('W');
+    prodKw.textContent = ((d.prodW || 0) / 1000).toFixed(2).replace('.', ',') + ' kW';
+    prodEur.textContent = '💰 ' + eur(d.prodEurH) + ' / h économisés';
+    prodDetail.innerHTML = 'Prise ' + (priseOk ? Math.round(d.prodPriseW || 0) + ' W' : 'hors ligne')
+      + ' · Cabanon ' + (cabOk ? Math.round(d.prodCabanonW || 0) + ' W' : 'hors ligne')
+      + ' · cumul ' + ((d.cumulPriseKWh || 0) + (d.cumulCabanonKWh || 0)).toFixed(1).replace('.', ',') + ' kWh ≈ ' + money(d.cumulProdEur, 2);
+
+    gridW.innerHTML = gw + ' ' + W('W');
+    gridW.style.color = gw > 0 ? '#60a5fa' : '#22c55e';
+    gridKw.textContent = ((d.gridW || 0) / 1000).toFixed(2).replace('.', ',') + ' kW';
+    gridEur.textContent = '💸 ' + eur(d.gridEurH) + ' / h à payer';
+    var splitHc = (d.priceMode === 'hphc')
+      ? ' <span style="color:#888">(HC ' + (d.cumulGridHcKWh || 0).toFixed(1).replace('.', ',')
+        + ' · HP ' + (d.cumulGridHpKWh || 0).toFixed(1).replace('.', ',') + ' kWh)</span>'
+      : '';
+    gridDetail.innerHTML = 'cumul ' + (d.cumulGridKWh || 0).toFixed(1).replace('.', ',') + ' kWh ≈ ' + money(d.cumulGridEur, 2)
+      + splitHc + (d.cumulGridOk === false ? ' ⚠ partiel' : '');
+
+    var netH = (Number(d.gridEurH) || 0) - (Number(d.prodEurH) || 0);
+    if (netEl) {
+      var netTxt = '⚖️ Net 1 h : ' + (netH > 0 ? '+' : '') + eur(netH);
+      netEl.innerHTML = netH > 0
+        ? netTxt + ' <span style="color:#888">(import ' + eur(d.gridEurH) + ' − production ' + eur(d.prodEurH) + ')</span>'
+        : '<span style="color:#22c55e">' + netTxt + ' (production couvre tout)</span>';
+    }
+
+    if (d.autonomie) {
+      badge.innerHTML = '<span class="tag tag-green">✅ Autonome — aucun import réseau</span>';
+    } else if (gw > 0) {
+      badge.innerHTML = '';
+    } else {
+      badge.innerHTML = '';
+    }
+
+    var nextTxt = '';
+    if (d.priceMode === 'hphc' && d.priceNextInMin !== null && d.priceNextInMin !== undefined && d.priceNextAt) {
+      var mn = Number(d.priceNextInMin);
+      var dans = mn >= 60 ? Math.floor(mn / 60) + ' h ' + (mn % 60 ? (mn % 60) + ' min' : '') : mn + ' min';
+      nextTxt = ' → ' + (d.priceLabel === 'Heures creuses' ? 'HP' : 'HC') + ' dans ' + dans.replace('  ', ' ') + ' (à ' + d.priceNextAt + ')';
+    }
+    priceEl.textContent = 'Prix : ' + cents(d.priceKwh) + ' / kWh · ' + (d.priceLabel || '—') + nextTxt + ' · cliquer pour modifier';
+    if (hcEl) {
+      hcEl.textContent = (d.priceMode === 'hphc' && d.hcWindowsLabel)
+        ? '🕐 Heures creuses : ' + d.hcWindowsLabel + ' — HC ' + cents(d.prixHc) + ' / HP ' + cents(d.prixHp)
+        : '';
     }
 
     var ts = d.updated_at || '—';
-    var stamp = d.stale ? ('⛔ ' + ts) : ts;
-    if (prodTime) prodTime.textContent = stamp;
-    if (gridTime) gridTime.textContent = stamp;
-
-    var prodW = Math.round(d.prodW || 0);
-    prodTotal.textContent = prodW;
-    prodKw.textContent = ((d.prodW || 0) / 1000).toFixed(3) + ' kW';
-
-    if (d.priseOk) {
-      priseW.style.color = '#fbbf24';
-      priseW.textContent = Math.round(d.prodPriseW || 0);
-      priseCumul.textContent = (d.cumulPriseKWh || 0).toFixed(1) + ' kWh cumulé';
-    } else {
-      priseW.textContent = 'Pas de connexion';
-      priseW.style.color = '#64748b';
-      priseCumul.textContent = '📡 capteur inaccessible';
-    }
-
-    if (d.cabanonOk) {
-      cabW.style.color = '#f97316';
-      cabW.textContent = Math.round(d.prodCabanonW || 0);
-      cabCumul.textContent = (d.cumulCabanonKWh || 0).toFixed(1) + ' kWh cumulé';
-    } else {
-      cabW.textContent = 'Pas de connexion';
-      cabW.style.color = '#64748b';
-      cabCumul.textContent = '📡 capteur inaccessible';
-    }
-
-    var gw = Math.round(d.gridW || 0);
-    gridW.innerHTML = gw + '<span>W</span>';
-    gridW.style.color = gw > 0 ? '#60a5fa' : '#22c55e';
-
-    if (d.autonomie) {
-      gridBadge.innerHTML = '<span class="tag tag-green">✅ Autonome — aucun import réseau</span>';
-    } else {
-      gridBadge.innerHTML = '';
-    }
-
-    gridCumul.textContent = 'Puissance prélevée du réseau · cumulé: ' + (d.cumulGridKWh || 0).toFixed(1) + ' kWh'
-      + (d.cumulGridOk === false ? ' ⚠ cumul partiel (un des deux compteurs muet)' : '');
+    if (timeEl) timeEl.textContent = (d.stale === true || d.stale === 'true') ? ('⛔ ' + ts) : ts;
   }
+
+  // Édition du prix du kWh (appliqué au tarif en cours : base / HP / HC)
+  window.editEnergyPrice = function () {
+    var d = window._energyData || {};
+    var slot = d.priceSlot || 'prix_base';
+    var label = d.priceLabel || 'Base';
+    var cur = ((Number(d.priceKwh) || 0) * 100).toFixed(2).replace('.', ',');
+    var rep = window.prompt('Prix du kWh en c€ TTC (' + label + ') :', cur);
+    if (rep === null) return;
+    var n = parseFloat(String(rep).replace(',', '.'));
+    if (isNaN(n) || n <= 0 || n > 300) { window.alert('Valeur invalide'); return; }
+    var body = { mode: d.priceMode || 'base' };
+    body[slot] = n / 100;
+    fetch('/api/energy-prices', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json(); }).then(function (res) {
+      if (res.ok) { fetchSolaire(); } else { window.alert('Erreur : ' + (res.error || 'inconnue')); }
+    }).catch(function (e) { window.alert('Erreur réseau : ' + e.message); });
+  };
 
   initToggles();
   refreshAll();
@@ -2248,6 +2571,170 @@ function fetchSolaire() {
   }
 
   if (panel) initSettings();
+})();
+</script>
+
+<!-- Card drag &amp; drop JS -->
+<script>
+(function(){
+  var grid = document.querySelector(".grid");
+  if (!grid) { return; }
+  if (grid.querySelector(".card-drag-handle")) { return; }   // anti double-init
+  var draggingEl = null;
+  var currentTarget = null;
+  var currentPos = null;
+
+  // Seuls les enfants porteurs d un data-card-id sont deplacables (jamais les <script> eventuels)
+  function gridCards(){
+    var out = [];
+    var kids = grid.children;
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i].getAttribute && kids[i].getAttribute("data-card-id")) { out.push(kids[i]); }
+    }
+    return out;
+  }
+
+  // Ordre VISUEL = tri par la propriete CSS order (la grille reordonne l affichage, pas le DOM)
+  function getVisualOrder(){
+    return gridCards().sort(function(a, b){
+      var oa = parseInt(a.style.order, 10);
+      var ob = parseInt(b.style.order, 10);
+      if (isNaN(oa)) { oa = 0; }
+      if (isNaN(ob)) { ob = 0; }
+      return oa - ob;
+    });
+  }
+
+  function clearDropClasses(){
+    var kids = grid.children;
+    for (var i = 0; i < kids.length; i++) {
+      kids[i].classList.remove("drop-before");
+      kids[i].classList.remove("drop-after");
+    }
+  }
+
+  function findCard(node){
+    var t = node;
+    while (t && t !== grid) {
+      if (t.getAttribute && t.getAttribute("data-card-id")) { return t; }
+      t = t.parentNode;
+    }
+    return null;
+  }
+
+  function applyOrder(ids){
+    var map = {};
+    var kids = gridCards();
+    for (var i = 0; i < kids.length; i++) {
+      map[kids[i].getAttribute("data-card-id")] = kids[i];
+    }
+    for (var j = 0; j < ids.length; j++) {
+      if (map[ids[j]]) { map[ids[j]].style.order = j; }
+    }
+  }
+
+  function sendOrder(ids){
+    fetch("/api/card-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order: ids })
+    }).then(function(r){ return r.json(); }).then(function(data){
+      if (data && data.ok && data.order) { applyOrder(data.order); }
+    }).catch(function(){});
+  }
+
+  // Poignee de glissement (la carte entiere n est pas draggable : clics et selection de texte preserves)
+  var kids = gridCards();
+  for (var i = 0; i < kids.length; i++) {
+    (function(card){
+      var handle = document.createElement("span");
+      handle.className = "card-drag-handle";
+      handle.title = "Glisser pour déplacer cette carte";
+      card.insertBefore(handle, card.firstChild);
+
+      handle.addEventListener("mousedown", function(){ card.draggable = true; });
+
+      card.addEventListener("dragstart", function(e){
+        draggingEl = card;
+        card.classList.add("dragging");
+        if (e.dataTransfer) {
+          e.dataTransfer.effectAllowed = "move";
+          e.dataTransfer.setData("text/plain", card.getAttribute("data-card-id") || "");
+        }
+      });
+
+      card.addEventListener("dragend", function(){
+        card.draggable = false;
+        card.classList.remove("dragging");
+        clearDropClasses();
+        draggingEl = null;
+        currentTarget = null;
+        currentPos = null;
+      });
+    })(kids[i]);
+  }
+
+  // Un simple clic sur la poignee (sans drag) ne doit pas laisser la carte draggable
+  document.addEventListener("mouseup", function(){
+    if (draggingEl) { return; }
+    var k = gridCards();
+    for (var n = 0; n < k.length; n++) { k[n].draggable = false; }
+  });
+
+  grid.addEventListener("dragover", function(e){
+    e.preventDefault();
+    if (!draggingEl) { return; }
+    var target = findCard(e.target);
+    if (!target || target === draggingEl) {
+      clearDropClasses();
+      currentTarget = null;
+      currentPos = null;
+      return;
+    }
+    clearDropClasses();
+    var rect = target.getBoundingClientRect();
+    var isBefore = e.clientX < rect.left + rect.width / 2;
+    target.classList.add(isBefore ? "drop-before" : "drop-after");
+    currentTarget = target;
+    currentPos = isBefore ? "before" : "after";
+  });
+
+  grid.addEventListener("dragleave", function(e){
+    if (e.target === grid) { clearDropClasses(); }
+  });
+
+  grid.addEventListener("drop", function(e){
+    e.preventDefault();
+    if (!draggingEl || !currentTarget || !currentPos) {
+      clearDropClasses();
+      return;
+    }
+    var visual = getVisualOrder();
+    var fromIdx = visual.indexOf(draggingEl);
+    if (fromIdx === -1) { clearDropClasses(); return; }
+    visual.splice(fromIdx, 1);
+    var toIdx = visual.indexOf(currentTarget);
+    if (toIdx === -1) { clearDropClasses(); return; }
+    if (currentPos === "after") { toIdx = toIdx + 1; }
+    visual.splice(toIdx, 0, draggingEl);
+    var ids = [];
+    for (var i = 0; i < visual.length; i++) {
+      visual[i].style.order = i;
+      ids.push(visual[i].getAttribute("data-card-id"));
+    }
+    sendOrder(ids);
+    clearDropClasses();
+  });
+
+  window.resetCardOrder = function(){
+    fetch("/api/card-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order: [] })
+    }).then(function(r){ return r.json(); }).then(function(data){
+      if (data && data.ok && data.order) { applyOrder(data.order); }
+    }).catch(function(){});
+  };
 })();
 </script>
 </body>

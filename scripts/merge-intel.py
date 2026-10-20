@@ -8,9 +8,21 @@ Entrees (toutes optionnelles, defauts = sorties des harnais standards) :
   --humaneval resume humaneval-summary.json (50 ou 164 problemes, pass@1)
   --out     fichier ecrit (defaut ../data/llm-speed.json)
 
-Le JSON produit porte, par carte : gen_tps (moyenne des tirs), prefill_tps, runs[],
-et intel {score, unit, bench, detail}. `max_intel_score` = 100 : la barre intelligence
-affiche donc le score ABSOLU, pas un classement relatif (contrairement a la vitesse).
+Le JSON produit porte, par carte :
+  gen_tps / prefill_tps / runs[]  -> regime "texte" (TEXTE LIBRE) : ce que l'utilisateur
+                                     voit en pratique, c'est lui qui remplit la barre
+  steps_s / tok_per_step          -> vitesse de DECODE pure, insensible au taux
+                                     d'acceptation du drafter : seule metrique comparable
+                                     entre deux noeuds (reproductible a +/-0,02)
+  gen_tps_repeat                  -> borne haute (sortie tres previsible)
+  intel {score, unit, bench, detail}
+`max_intel_score` = 100 : la barre intelligence affiche donc le score ABSOLU, pas un
+classement relatif (contrairement a la vitesse).
+
+Pourquoi deux regimes (mesure du 15/10/2026) : le t/s renvoye par le serveur inclut la
+speculation, il depend donc du CONTENU genere. A 28k ctx, meme prompt de remplissage :
+texte libre 27,9 t/s (2,6 tok/step) contre enumeration d'entiers 84,0 t/s (7,8 tok/step)
+sur Louis — pour des steps/s IDENTIQUES (10,59 vs 10,86). Un t/s seul ne veut rien dire.
 """
 import argparse, glob, json, os, sys
 
@@ -22,6 +34,29 @@ NODES = ["gabriel", "louis", "marie"]
 def load(p):
     with open(p) as f:
         return json.load(f)
+
+
+def regime(r, name):
+    """Bloc d'un regime donne ; compatible avec les JSON bruts d'avant les 2 regimes."""
+    for x in r.get("regimes") or []:
+        if x.get("regime") == name:
+            return x
+    return {}
+
+
+def avg(vals):
+    vals = [v for v in vals if isinstance(v, (int, float))]
+    return round(sum(vals) / len(vals), 2) if vals else None
+
+
+# Mesures CONNUES comme contaminees (prises avant l'ajout du detecteur de contention) :
+# un autre client decodait sur le meme serveur pendant la mesure. Ecartees du calcul, avec
+# leur raison, plutot que de reecrire le JSON brut.
+QUARANTINE = {
+    ("llm-speed-2reg.json", "marie"):
+        "15/10 17:55 : les 2 slots de Marie etaient occupes par le gateway luna "
+        "(6,0 t/s mesure contre 23,5 t/s en fenetre propre le meme soir)",
+}
 
 
 def main():
@@ -41,30 +76,53 @@ def main():
         raw = load(p)
         for r in raw.get("results", []):
             if r.get("ok") and r.get("gen_tps"):
+                if (os.path.basename(p), r["node"]) in QUARANTINE:
+                    continue
+                free = regime(r, "texte") or r
+                rep = regime(r, "repetitif")
+                # prefill / prompt_tokens : on prend le regime NON servi par le cache de prompt
+                # (cache_n == 0) ; sinon le prefill annonce est faux (mesure : 11,9 t/s au lieu
+                # de ~510 parce que le prompt venait du cache).
+                cold = r
+                for x in r.get("regimes") or []:
+                    if (x.get("cached_tokens") or 0) == 0 and (x.get("prompt_tokens") or 0) > (cold.get("prompt_tokens") or 0):
+                        cold = x
                 per_node[r["node"]].append({
                     "file": os.path.basename(p),
-                    "gen_tps": r["gen_tps"], "prefill_tps": r.get("prefill_tps"),
-                    "prompt_tokens": r.get("prompt_tokens"), "gen_tokens": r.get("gen_tokens"),
-                    "draft_accepted": r.get("draft_accepted"), "model": r.get("model"),
+                    "gen_tps": free.get("gen_tps"), "prefill_tps": cold.get("prefill_tps"),
+                    "steps_s": free.get("steps_s"), "tok_per_step": free.get("tok_per_step"),
+                    "gen_tps_repeat": rep.get("gen_tps"),
+                    "steps_s_repeat": rep.get("steps_s"),
+                    "prompt_tokens": cold.get("prompt_tokens"), "gen_tokens": free.get("gen_tokens"),
+                    "draft_accepted": free.get("draft_accepted"), "model": r.get("model"),
+                    "contended": bool(free.get("contended")), "attempts": free.get("attempt"),
                     "wall_s": r.get("wall_s"),
                 })
 
     by_node = {}
+    dropped = {}
     for n in NODES:
-        runs = per_node[n]
-        if not runs:
+        all_runs = [r for r in per_node[n] if r.get("gen_tps")]
+        if not all_runs:
             continue
-        gen = round(sum(r["gen_tps"] for r in runs) / len(runs), 1)
-        pre = round(sum(r["prefill_tps"] for r in runs if r["prefill_tps"]) /
-                    max(1, len([r for r in runs if r["prefill_tps"]])), 1)
+        # une mesure prise pendant qu'un autre client decodait sur le meme serveur est ecartee
+        # des qu'une mesure propre existe pour ce noeud
+        clean = [r for r in all_runs if not r.get("contended")]
+        runs = clean or all_runs
+        dropped[n] = len(all_runs) - len(runs)
         by_node[n] = {
             "ok": True,
-            "gen_tps": gen,
-            "prefill_tps": pre,
+            "gen_tps": round(sum(r["gen_tps"] for r in runs) / len(runs), 1),
+            "prefill_tps": avg([r["prefill_tps"] for r in runs]),
             "runs": [r["gen_tps"] for r in runs],
+            "steps_s": avg([r["steps_s"] for r in runs]),
+            "tok_per_step": avg([r["tok_per_step"] for r in runs]),
+            "gen_tps_repeat": avg([r["gen_tps_repeat"] for r in runs]),
+            "steps_s_repeat": avg([r["steps_s_repeat"] for r in runs]),
             "gen_tokens": runs[-1]["gen_tokens"],
             "prompt_tokens": runs[-1]["prompt_tokens"],
             "model": (runs[-1].get("model") or "").split("/")[-1] or None,
+            "contended": any(r.get("contended") for r in runs),
             "draft_accepted": runs[-1].get("draft_accepted"),
             "wall_s": runs[-1].get("wall_s"),
         }
@@ -96,7 +154,7 @@ def main():
         if b:
             parts.append("%s/%s taches FR" % (b["score_sum"], b["tasks"]))
         if h:
-            parts.append("HumanEval-50 %.0f%% (%s/%s)" % (h["score_pct"], h["passed"], h["total"]))
+            parts.append("HumanEval %.0f%% (%s/%s)" % (h["score_pct"], h["passed"], h["total"]))
         score = None
         if b:
             score = round(100.0 * b["score_sum"] / b["tasks"], 1)
@@ -105,21 +163,24 @@ def main():
         by_node[n]["intel"] = {
             "score": score,
             "unit": "%",
-            "bench": "Batterie FR 13 taches" if b else "HumanEval-50",
+            "bench": ("Batterie FR %s taches" % b["tasks"]) if b else "HumanEval",
             "detail": " · ".join(parts),
             "battery_sum": b["score_sum"] if b else None,
             "battery_tasks": b["tasks"] if b else None,
             "humaneval_pct": h["score_pct"] if h else None,
+            "humaneval_total": h["total"] if h else None,
         }
 
     ok = [v for v in by_node.values() if v.get("ok")]
     payload = {
         "ok": bool(ok),
-        "source": "scripts/bench-llm-speed.py + merge-intel.py (small_tasks.py, humaneval-runner.py)",
+        "source": "scripts/bench-llm-speed.py (2 regimes) + merge-intel.py (small_tasks.py, humaneval-runner.py)",
         "measured_at": load(speed_files[-1]).get("measured_at"),
         "context_tokens": max([v["prompt_tokens"] for v in ok if v.get("prompt_tokens")], default=None),
         "max_gen_tps": max([v["gen_tps"] for v in ok], default=None),
+        "max_steps_s": max([v["steps_s"] for v in ok if v.get("steps_s")], default=None),
         "max_intel_score": 100,
+        "runs_dropped_contended": dropped,
         "speed_measured": [os.path.basename(p) for p in speed_files],
         "by_node": by_node,
     }
@@ -131,9 +192,10 @@ def main():
         if not v:
             continue
         it = v.get("intel") or {}
-        print("%-8s %5s t/s (tirs %s) | prefill %s | intel %s%% [%s]" % (
-            n, v["gen_tps"], v["runs"], v["prefill_tps"], it.get("score"), it.get("detail")))
-    print("-> %s (max %s t/s)" % (out, payload["max_gen_tps"]))
+        print("%-8s texte %5s t/s | repetitif %5s t/s | %5s steps/s | prefill %s | intel %s%% [%s]" % (
+            n, v["gen_tps"], v["gen_tps_repeat"], v["steps_s"], v["prefill_tps"],
+            it.get("score"), it.get("detail")))
+    print("-> %s (max %s t/s texte, %s steps/s)" % (out, payload["max_gen_tps"], payload["max_steps_s"]))
 
 
 if __name__ == "__main__":

@@ -1540,6 +1540,7 @@ app.get('/', async (req, res) => {
     <div class="pc-actions" id="pc-boncoin-actions" style="display:none">
       <button class="pc-btn" onclick="pcAction('boncoin','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('boncoin','kill_llm')">⏹ Kill LLM</button>
+      <button class="pc-btn pc-btn-danger" onclick="pcAction('boncoin','shutdown')">⏻ Éteindre</button>
       <label class="pc-plug-toggle" id="pc-boncoin-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-boncoin-plug-slider"></span><span class="pc-plug-status" id="pc-boncoin-plug-status">❓</span><span class="pc-plug-power" id="pc-boncoin-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM >90%">
         <input type="checkbox" id="auto-kill-boncoin">

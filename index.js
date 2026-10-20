@@ -479,11 +479,11 @@ app.get('/api/delegation-stats', (req, res) => {
 });
 
 // ─── PC Health Cache ─────────────────────────────────────────────────
-const pcCache = { gabriel: null, louis: null, marie: null, gabrielOk: false, louisOk: false, marieOk: false };
+const pcCache = { gabriel: null, louis: null, marie: null, boncoin: null, gabrielOk: false, louisOk: false, marieOk: false, boncoinOk: false };
 // Horodatage du dernier relevé RÉUSSI par PC. Le cache garde le dernier relevé quand le
 // backend (FastAPI 3019/3024) est mort → sans ce flag le front affiche des données
 // vieilles de plusieurs heures comme si elles étaient live (bug « LLM déjà lancé » 26/09).
-const pcCacheTs = { gabriel: 0, louis: 0, marie: 0 };
+const pcCacheTs = { gabriel: 0, louis: 0, marie: 0, boncoin: 0 };
 // Au-delà de 3 cycles de collecte (15 s) sans succès, les données sont franchement figées.
 const PC_STALE_AFTER_S = 45;
 
@@ -527,6 +527,7 @@ function startPcCache() {
       fetchPcHealth('gabriel', '192.168.3.102', 3019),
       fetchPcHealth('louis', '192.168.3.102', 3018),
       fetchPcHealth('marie', '192.168.3.102', 3024),
+      fetchPcHealth('boncoin', '192.168.3.102', 3036),
     ]);
   };
   update(); // first fetch immediately
@@ -562,6 +563,11 @@ app.get('/api/pc-louis', (req, res) => {
 // API: PC Marie
 app.get('/api/pc-marie', (req, res) => {
   res.json(pcPayload('marie'));
+});
+
+// API: PC SkillORP (ex-carte « PC BonCoin » — backend skillorp-dashboard :3036)
+app.get('/api/pc-boncoin', (req, res) => {
+  res.json(pcPayload('boncoin'));
 });
 
 // ─── LLM du PC Gabriel (192.168.3.224) : état réel par HTTP ────────────────
@@ -800,7 +806,15 @@ app.get('/api/pc-plug-state/:name', async (req, res) => {
       const parsed = parseFloat(p.data.state);
       power = isNaN(parsed) ? null : parsed;
     }
-    res.json({ ok: true, state: r.data.state, entity_id: entityId, power });
+    // Coût au rythme actuel, au prix du kWh en vigueur (HP/HC courant)
+    const priceInfo = currentEnergyPrice(loadEnergyPrices(), new Date());
+    const eurH = power === null ? null : (power / 1000) * priceInfo.price;
+    const eurMonth = eurH === null ? null : eurH * MONTH_HOURS;
+    res.json({
+      ok: true, state: r.data.state, entity_id: entityId, power,
+      priceKwh: priceInfo.price, priceLabel: priceInfo.label,
+      eurH: eurH, eurMonth: eurMonth
+    });
   } catch (e) {
     res.json({ ok: false, error: e.message });
   }
@@ -810,6 +824,10 @@ app.get('/api/pc-plug-state/:name', async (req, res) => {
 
 // ─── Prix de l'énergie (config persistée) ────────────────────
 const ENERGY_FILE = path.join(DATA_DIR, 'energy_prices.json');
+
+// Projection mensuelle : 30 jours pleins (les montants « mois » sont des extrapolations
+// au rythme actuel, pas une consommation mensuelle mesurée)
+const MONTH_HOURS = 30 * 24;
 
 // Tarif Bleu EDF, grille applicable au 1er août 2026 (TTC, €/kWh)
 const DEFAULT_ENERGY = {
@@ -982,6 +1000,8 @@ async function fetchSolarData() {
   const priceInfo = currentEnergyPrice(energyCfg, now);
   const prodEurH = (prodW / 1000) * priceInfo.price;
   const gridEurH = (gridW / 1000) * priceInfo.price;
+  const prodEurMonth = prodEurH * MONTH_HOURS;
+  const gridEurMonth = gridEurH * MONTH_HOURS;
   const cumulProdEur = (cumulPriseKWh + cumulCabanonKWh) * priceInfo.price;
   // Cumul réseau valorisé au vrai prix de chaque registre
   const cumulGridEur = (energyCfg.mode === 'hphc')
@@ -1016,6 +1036,9 @@ async function fetchSolarData() {
     cumulGridHpKWh: cumulGridHpKWh,
     prodEurH: prodEurH,
     gridEurH: gridEurH,
+    prodEurMonth: prodEurMonth,
+    gridEurMonth: gridEurMonth,
+    monthHours: MONTH_HOURS,
     cumulProdEur: cumulProdEur,
     cumulGridEur: cumulGridEur,
     updated_at: timeStr,
@@ -1330,7 +1353,7 @@ app.get('/', async (req, res) => {
     <label class="settings-row" data-card-id="pc-gabriel"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-gabriel')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Gabriel</span></label>
     <label class="settings-row" data-card-id="pc-louis"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-louis')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Louis</span></label>
     <label class="settings-row" data-card-id="pc-marie"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-marie')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Marie</span></label>
-    <label class="settings-row" data-card-id="pc-boncoin"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-boncoin')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC BonCoin</span></label>
+    <label class="settings-row" data-card-id="pc-boncoin"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-boncoin')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC SkillORP</span></label>
     <label class="settings-row" data-card-id="chart"><span class="s-icon">📈</span><input type="checkbox"${vis('chart')?' checked':''}><span class="s-toggle"></span><span class="s-label">Graphique</span></label>
     <label class="settings-row" data-card-id="energie"><span class="s-icon">⚡</span><input type="checkbox"${vis('energie')?' checked':''}><span class="s-toggle"></span><span class="s-label">Énergie (solaire + Linky)</span></label>
   </div>
@@ -1508,17 +1531,21 @@ app.get('/', async (req, res) => {
     </div>
   </div>
 
-  <!-- PC BONCOIN (LeBonCoin) — pas encore d'agent SSH/LLM : carte pilotée par la prise HA -->
+  <!-- PC SKILLORP (tour d'occasion) — backend skillorp-dashboard :3036, SSH 192.168.3.249, prise HA -->
   <div class="card ${visHidden('pc-boncoin')}" data-card-id="pc-boncoin"${orderOf('pc-boncoin')} id="pc-boncoin-card">
-    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC BonCoin <span style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">5060 Ti 16 Go + 3060 Ti 8 Go = 24 Go</span><span id="pc-boncoin-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span></div>
+    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">PC SkillORP <span id="pc-boncoin-ip" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.7rem">192.168.3.249</span><span id="pc-boncoin-time" style="color:#444;font-weight:400;margin-left:0.5rem;font-size:0.65rem"></span></span><label class="alert-toggle" title="Activer alertes CPU/RAM >80%"><input type="checkbox" id="alert-boncoin" checked><span class="slider"></span>🔔</label></div>
     <div id="pc-boncoin-body">
-      <div class="row"><span class="label">Démarrage</span><span class="val">🔌 prise connectée</span></div>
-      <hr class="divider">
-      <div class="row"><span class="label">Métriques</span><span class="val" style="color:#888">agent non installé</span></div>
-      <p style="color:#555;font-size:0.72rem;margin:0.5rem 0 0">Nouveau PC (achat LeBonCoin) : ni agent SSH ni serveur LLM pour l'instant. La prise « prisePCBonCoin » permet l'allumage à distance.</p>
+      <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>
-    <div class="pc-actions" id="pc-boncoin-actions" style="display:flex">
+    <div class="pc-actions" id="pc-boncoin-actions" style="display:none">
+      <button class="pc-btn" onclick="pcAction('boncoin','start_llm')">▶ Lancer LLM</button>
+      <button class="pc-btn pc-btn-danger" onclick="pcAction('boncoin','kill_llm')">⏹ Kill LLM</button>
+      <button class="pc-btn pc-btn-danger" onclick="pcAction('boncoin','shutdown')">⏻ Éteindre</button>
       <label class="pc-plug-toggle" id="pc-boncoin-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-boncoin-plug-slider"></span><span class="pc-plug-status" id="pc-boncoin-plug-status">❓</span><span class="pc-plug-power" id="pc-boncoin-plug-power"></span></label>
+      <label class="pc-auto-label" title="Kill automatique du LLM si RAM >90%">
+        <input type="checkbox" id="auto-kill-boncoin">
+        <span>Auto-kill RAM &gt;90%</span>
+      </label>
     </div>
     <div class="pc-action-result" id="pc-boncoin-result"></div>
   </div>
@@ -1835,7 +1862,7 @@ app.get('/', async (req, res) => {
     return String(n);
   }
   // IP LAN de chaque carte (pour le lien direct vers l'interface web du serveur LLM)
-  var PC_IPS = { gabriel: '192.168.3.224', louis: '192.168.3.206', marie: '192.168.3.57' };
+  var PC_IPS = { gabriel: '192.168.3.224', louis: '192.168.3.206', marie: '192.168.3.57', boncoin: '192.168.3.249' };
   // Port d'ecoute du serveur LLM : --port (llama.cpp) ou --listen-port (sd-server), sinon 8080.
   // Parsing par split volontairement (pas de regex : une regex ici devrait doubler ses backslashes).
   function extractLlmPort(cmd) {
@@ -1961,7 +1988,7 @@ app.get('/', async (req, res) => {
     // Toujours montrer les actions (switch prise compris) — même si SSH échoue
     var actionsEl = document.getElementById('pc-' + name + '-actions');
     if (actionsEl) {
-      actionsEl.style.display = (name === 'marie' || name === 'louis' || name === 'gabriel') ? 'flex' : 'none';
+      actionsEl.style.display = (name === 'marie' || name === 'louis' || name === 'gabriel' || name === 'boncoin') ? 'flex' : 'none';
     }
 
     if (!data || data.error) {
@@ -2225,6 +2252,7 @@ app.get('/', async (req, res) => {
     fetch('/api/pc-gabriel').then(function(r){return r.json();}).then(function(d){renderPc(d,'gabriel');}).catch(function(e){console.error('pc-gabriel:',e);});
     fetch('/api/pc-louis').then(function(r){return r.json();}).then(function(d){renderPc(d,'louis');}).catch(function(e){console.error('pc-louis:',e);});
     fetch('/api/pc-marie').then(function(r){return r.json();}).then(function(d){renderPc(d,'marie');}).catch(function(e){console.error('pc-marie:',e);});
+    fetch('/api/pc-boncoin').then(function(r){return r.json();}).then(function(d){renderPc(d,'boncoin');}).catch(function(e){console.error('pc-boncoin:',e);});
     fetchPlugState('gabriel');
     fetchPlugState('louis');
     fetchPlugState('marie');
@@ -2307,7 +2335,14 @@ app.get('/', async (req, res) => {
     });
   };
 
-  function updatePlugToggle(name, state, power) {
+  // Format court d'un montant en euros (3 décimales sous 0,10 €)
+  function fmtEurShort(v) {
+    var n = Number(v) || 0;
+    var dec = (n !== 0 && Math.abs(n) < 0.1) ? 3 : 2;
+    return n.toLocaleString('fr-FR', { minimumFractionDigits: dec, maximumFractionDigits: dec }) + ' €';
+  }
+
+  function updatePlugToggle(name, state, power, eurH, eurMonth) {
     var toggle = document.getElementById('pc-' + name + '-plug-toggle');
     if (!toggle) return;
     var statusEl = document.getElementById('pc-' + name + '-plug-status');
@@ -2317,7 +2352,15 @@ app.get('/', async (req, res) => {
     if (statusEl) statusEl.textContent = isOn ? 'ON' : 'OFF';
     if (powerEl && power !== undefined) {
       if (isOn && power !== null && !isNaN(power)) {
-        powerEl.textContent = ' · ⚡ ' + (power >= 100 ? Math.round(power) : power.toFixed(1)) + ' W';
+        var txt = ' · ⚡ ' + (power >= 100 ? String(Math.round(power)) : power.toFixed(1).replace('.', ',')) + ' W';
+        if (eurH !== null && eurH !== undefined && !isNaN(eurH)) {
+          txt += ' · ' + fmtEurShort(eurH) + '/h';
+          if (eurMonth !== null && eurMonth !== undefined && !isNaN(eurMonth)) {
+            txt += ' · ' + fmtEurShort(eurMonth) + '/mois';
+          }
+        }
+        powerEl.textContent = txt;
+        powerEl.title = 'Coût estimé au rythme actuel (prix du kWh en vigueur) : heure et projection sur 30 jours';
       } else {
         powerEl.textContent = '';
       }
@@ -2328,7 +2371,7 @@ app.get('/', async (req, res) => {
     fetch('/api/pc-plug-state/' + name)
     .then(function(r) { return r.json(); })
     .then(function(res) {
-      if (res.ok) updatePlugToggle(name, res.state, res.power);
+      if (res.ok) updatePlugToggle(name, res.state, res.power, res.eurH, res.eurMonth);
     })
     .catch(function(err) {
       console.error('fetchPlugState(' + name + '):', err);
@@ -2361,7 +2404,7 @@ function fetchSolaire() {
     }
     function eur(v) {
       var n = Number(v) || 0;
-      return money(n, Math.abs(n) < 0.1 ? 3 : 2);
+      return money(n, (n !== 0 && Math.abs(n) < 0.1) ? 3 : 2);
     }
     function cents(v) { return (Number(v) * 100).toFixed(2).replace('.', ',') + ' c€'; }
     function W(v) { return '<span style="font-size:0.7rem;font-weight:400">' + v + '</span>'; }
@@ -2392,7 +2435,8 @@ function fetchSolaire() {
 
     prodW.innerHTML = prod + ' ' + W('W');
     prodKw.textContent = ((d.prodW || 0) / 1000).toFixed(2).replace('.', ',') + ' kW';
-    prodEur.textContent = '💰 ' + eur(d.prodEurH) + ' / h économisés';
+    prodEur.textContent = '💰 ' + eur(d.prodEurH) + ' / h · ≈ ' + eur(d.prodEurMonth) + ' / mois économisés';
+    prodEur.title = 'Économie estimée au rythme actuel : par heure puis projection sur 30 jours (720 h)';
     prodDetail.innerHTML = 'Prise ' + (priseOk ? Math.round(d.prodPriseW || 0) + ' W' : 'hors ligne')
       + ' · Cabanon ' + (cabOk ? Math.round(d.prodCabanonW || 0) + ' W' : 'hors ligne')
       + ' · cumul ' + ((d.cumulPriseKWh || 0) + (d.cumulCabanonKWh || 0)).toFixed(1).replace('.', ',') + ' kWh ≈ ' + money(d.cumulProdEur, 2);
@@ -2400,7 +2444,8 @@ function fetchSolaire() {
     gridW.innerHTML = gw + ' ' + W('W');
     gridW.style.color = gw > 0 ? '#60a5fa' : '#22c55e';
     gridKw.textContent = ((d.gridW || 0) / 1000).toFixed(2).replace('.', ',') + ' kW';
-    gridEur.textContent = '💸 ' + eur(d.gridEurH) + ' / h à payer';
+    gridEur.textContent = '💸 ' + eur(d.gridEurH) + ' / h · ≈ ' + eur(d.gridEurMonth) + ' / mois à payer';
+    gridEur.title = 'Coût estimé au rythme actuel : par heure puis projection sur 30 jours (720 h), au prix ' + (d.priceLabel || '');
     var splitHc = (d.priceMode === 'hphc')
       ? ' <span style="color:#888">(HC ' + (d.cumulGridHcKWh || 0).toFixed(1).replace('.', ',')
         + ' · HP ' + (d.cumulGridHpKWh || 0).toFixed(1).replace('.', ',') + ' kWh)</span>'
@@ -2409,8 +2454,10 @@ function fetchSolaire() {
       + splitHc + (d.cumulGridOk === false ? ' ⚠ partiel' : '');
 
     var netH = (Number(d.gridEurH) || 0) - (Number(d.prodEurH) || 0);
+    var netM = (Number(d.gridEurMonth) || 0) - (Number(d.prodEurMonth) || 0);
     if (netEl) {
-      var netTxt = '⚖️ Net 1 h : ' + (netH > 0 ? '+' : '') + eur(netH);
+      var netTxt = '⚖️ Net 1 h : ' + (netH > 0 ? '+' : '') + eur(netH)
+        + ' · 30 j : ' + (netM > 0 ? '+' : '') + eur(netM);
       netEl.innerHTML = netH > 0
         ? netTxt + ' <span style="color:#888">(import ' + eur(d.gridEurH) + ' − production ' + eur(d.prodEurH) + ')</span>'
         : '<span style="color:#22c55e">' + netTxt + ' (production couvre tout)</span>';
@@ -2753,6 +2800,7 @@ app.post('/api/pc-action', async (req, res) => {
       if (pc === 'marie') { sshHost = '192.168.3.57'; sshUser = 'gab'; sshKey = '/root/.ssh/id_ed25519_marie'; }
       else if (pc === 'louis') { sshHost = '192.168.3.206'; sshUser = 'gab'; sshKey = ''; }
       else if (pc === 'gabriel') { sshHost = '192.168.3.224'; sshUser = 'gab'; sshKey = ''; }
+      else if (pc === 'boncoin') { sshHost = '192.168.3.249'; sshUser = 'gab'; sshKey = ''; }
       else return res.status(400).json({ ok: false, error: 'PC inconnu' });
 
       let cmd;
@@ -2791,6 +2839,8 @@ app.post('/api/pc-action', async (req, res) => {
         cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.57 'pkill llama-server 2>/dev/null; echo OK'";
       } else if (pc === 'louis') {
         cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206 'pkill llama-server 2>/dev/null; echo OK'";
+      } else if (pc === 'boncoin') {
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.249 'pkill llama-server 2>/dev/null; echo OK'";
       } else {
         cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'pkill llama-server 2>/dev/null; echo OK'";
       }
@@ -2822,6 +2872,8 @@ app.post('/api/pc-action', async (req, res) => {
         sshPrefix = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206";
       } else if (pc === 'gabriel') {
         sshPrefix = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224";
+      } else if (pc === 'boncoin') {
+        sshPrefix = "ssh -o StrictHostKeyChecking=no gab@192.168.3.249";
       } else {
         return res.status(400).json({ ok: false, error: 'PC inconnu' });
       }
@@ -2847,6 +2899,8 @@ app.post('/api/pc-action', async (req, res) => {
         cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.57 'sudo shutdown -h now; echo OK'";
       } else if (pc === 'gabriel') {
         cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'sudo shutdown -h now; echo OK'";
+      } else if (pc === 'boncoin') {
+        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.249 'sudo -n shutdown -h now; echo OK'";
       } else return res.status(400).json({ ok: false, error: 'PC inconnu' });
       const result = execSync(cmd, { timeout: 30000 }).toString().trim();
       return res.json({ ok: true, result: result });

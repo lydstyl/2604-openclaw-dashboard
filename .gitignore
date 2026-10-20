@@ -1,4 +1,27 @@
+# Node
 node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Données locales, secrets et sauvegardes — jamais dans le repo public
 data/
 .env
+.env.*
+!.env.example
 *.bak-*
+*.log
+*.tmp
+
+# OS / éditeurs
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

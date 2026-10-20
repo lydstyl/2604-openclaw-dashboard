@@ -397,7 +397,7 @@ const DEFAULT_VISIBILITY = {
   'credits': true, 'spending-30d': true, 'spending-24h': true,
   'cpu': true, 'ram': true, 'disk': true, 'ollama': true,
   'pc-gabriel': true, 'pc-louis': true, 'pc-marie': true, 'pc-boncoin': true, 'chart': true,
-  'solaire-prod': true, 'solaire-grid': true
+  'energie': true
 };
 
 function loadCardVisibility() {
@@ -420,7 +420,7 @@ const ORDER_FILE = path.join(DATA_DIR, 'card_order.json');
 
 // Ordre par defaut = ordre de rendu du template (cartes + graphique)
 const DEFAULT_ORDER = [
-  'solaire-prod', 'solaire-grid', 'credits', 'spending-30d', 'spending-24h',
+  'energie', 'credits', 'spending-30d', 'spending-24h',
   'cpu', 'ram', 'disk', 'ollama', 'pc-gabriel', 'pc-louis', 'pc-marie', 'pc-boncoin', 'chart'
 ];
 
@@ -808,6 +808,120 @@ app.get('/api/pc-plug-state/:name', async (req, res) => {
 
 // API: toggle PC smart plug
 
+// ─── Prix de l'énergie (config persistée) ────────────────────
+const ENERGY_FILE = path.join(DATA_DIR, 'energy_prices.json');
+
+// Tarif Bleu EDF, grille applicable au 1er août 2026 (TTC, €/kWh)
+const DEFAULT_ENERGY = {
+  mode: 'hphc',          // 'base' | 'hphc'
+  prix_base: 0.1985,     // option Base, >= 9 kVA
+  prix_hp: 0.2142,       // Heures pleines
+  prix_hc: 0.1589,       // Heures creuses
+  // Fenêtres heures creuses mesurées sur le compteur Linky (registres TIC) :
+  // bascule HP->HC à 01:30, HC->HP à 07:00, HP->HC à 12:00, HC->HP à 14:30 (8 h/jour).
+  hc_windows: [[1.5, 7], [12, 14.5]],
+  prix_injection: 0      // €/kWh revendu (0 = pas de revente)
+};
+
+function loadEnergyPrices() {
+  try {
+    if (fs.existsSync(ENERGY_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(ENERGY_FILE, 'utf8'));
+      return { ...DEFAULT_ENERGY, ...raw };
+    }
+  } catch (e) { console.error('[energy-prices] lecture:', e.message); }
+  return { ...DEFAULT_ENERGY };
+}
+
+function saveEnergyPrices(patch) {
+  const cfg = { ...loadEnergyPrices(), ...patch };
+  ensureDataDir();
+  fs.writeFileSync(ENERGY_FILE, JSON.stringify(cfg, null, 2));
+  return cfg;
+}
+
+// Heure locale de Paris (le conteneur tourne en UTC)
+function parisClock(date) {
+  const hh = date.toLocaleString('fr-FR', { timeZone: 'Europe/Paris', hour: '2-digit', hour12: false });
+  const mm = date.toLocaleString('fr-FR', { timeZone: 'Europe/Paris', minute: '2-digit' });
+  const h = parseInt(hh, 10);
+  const m = parseInt(mm, 10);
+  if (isNaN(h) || isNaN(m)) {
+    const d = new Date(date.getTime() + 2 * 3600 * 1000);  // secours : UTC+2
+    return d.getUTCHours() * 60 + d.getUTCMinutes();
+  }
+  return h * 60 + m;
+}
+
+function parisHour(date) { return Math.floor(parisClock(date) / 60); }
+
+// Fenêtres HC en heures décimales (ex. 1.5 = 01:30). Rétro-compat hc_debut/hc_fin.
+function hcWindows(cfg) {
+  const c = cfg || loadEnergyPrices();
+  if (Array.isArray(c.hc_windows) && c.hc_windows.length) {
+    return c.hc_windows
+      .filter(function (w) { return Array.isArray(w) && w.length === 2 && !isNaN(Number(w[0])) && !isNaN(Number(w[1])); })
+      .map(function (w) { return [Number(w[0]), Number(w[1])]; });
+  }
+  if (c.hc_debut !== undefined && c.hc_fin !== undefined) return [[Number(c.hc_debut), Number(c.hc_fin)]];
+  return [];
+}
+
+function fmtHour(h) {
+  const total = Math.round(Number(h) * 60);
+  const hh = Math.floor(total / 60) % 24;
+  const mm = total % 60;
+  return (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm;
+}
+
+function hcWindowsLabel(cfg) {
+  const list = hcWindows(cfg);
+  if (!list.length) return '';
+  return list.map(function (w) { return fmtHour(w[0]) + '–' + fmtHour(w[1]); }).join(' & ');
+}
+
+function isInHcWindow(min, w) {
+  const a = ((Math.round(w[0] * 60) % 1440) + 1440) % 1440;
+  const b = ((Math.round(w[1] * 60) % 1440) + 1440) % 1440;
+  if (a === b) return false;
+  return a < b ? (min >= a && min < b) : (min >= a || min < b);
+}
+
+// Prochaine bascule (début ou fin de fenêtre HC) après `min` minutes
+function nextBoundary(min, list, inHc) {
+  let best = null;
+  list.forEach(function (w) {
+    const cands = inHc ? [w[1]] : [w[0]];
+    cands.forEach(function (b) {
+      let bm = ((Math.round(Number(b) * 60) % 1440) + 1440) % 1440;
+      let d = bm - min;
+      if (d <= 0) d += 1440;
+      if (best === null || d < best.minutes) best = { minutes: d, at: bm };
+    });
+  });
+  return best;
+}
+
+function currentEnergyPrice(cfg, date) {
+  const c = cfg || loadEnergyPrices();
+  if (c.mode !== 'hphc') {
+    return { price: Number(c.prix_base) || 0, label: 'Base', slot: 'prix_base', hc: false, nextAt: null, nextInMin: null };
+  }
+  const min = parisClock(date || new Date());
+  const list = hcWindows(c);
+  let inHc = false;
+  list.forEach(function (w) { if (isInHcWindow(min, w)) inHc = true; });
+  const nb = nextBoundary(min, list, inHc);
+  return {
+    price: Number(inHc ? c.prix_hc : c.prix_hp) || 0,
+    label: inHc ? 'Heures creuses' : 'Heures pleines',
+    slot: inHc ? 'prix_hc' : 'prix_hp',
+    hc: inHc,
+    nextAt: nb ? fmtHour(nb.at / 60) : null,
+    nextInMin: nb ? nb.minutes : null
+  };
+}
+
 // ─── Solaire : production + import réseau (HA) ────────────────
 // ─── Solar Production & Grid Import ───────────────────────────
 let _solaireCache = { ts: 0, data: null };
@@ -855,10 +969,25 @@ async function fetchSolarData() {
   const prodCabanonW = p2.val;
   const cumulCabanonKWh = c2.val;
   const gridW = g1.val;
-  const cumulGridKWh = g2.val + g3.val;
+  // Registres Linky : tranche 1 = index Heures creuses, tranche 2 = index Heures pleines
+  // (mesuré : bascules 01:30/07:00/12:00/14:30 sur 8 jours de séries HA)
+  const cumulGridHcKWh = g2.val;
+  const cumulGridHpKWh = g3.val;
+  const cumulGridKWh = cumulGridHcKWh + cumulGridHpKWh;
   const prodW = prodPriseW + prodCabanonW;
-  
+
+  // Estimation en euros sur 1 h au rythme actuel (TTC)
+  const energyCfg = loadEnergyPrices();
   const now = new Date();
+  const priceInfo = currentEnergyPrice(energyCfg, now);
+  const prodEurH = (prodW / 1000) * priceInfo.price;
+  const gridEurH = (gridW / 1000) * priceInfo.price;
+  const cumulProdEur = (cumulPriseKWh + cumulCabanonKWh) * priceInfo.price;
+  // Cumul réseau valorisé au vrai prix de chaque registre
+  const cumulGridEur = (energyCfg.mode === 'hphc')
+    ? (cumulGridHcKWh * (Number(energyCfg.prix_hc) || 0) + cumulGridHpKWh * (Number(energyCfg.prix_hp) || 0))
+    : (cumulGridKWh * (Number(energyCfg.prix_base) || 0));
+
   const timeStr = now.toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris', hour12: false });
 
   return {
@@ -874,6 +1003,21 @@ async function fetchSolarData() {
     cumulGridKWh: cumulGridKWh,
     cumulGridOk: (g2.ok && g3.ok),
     autonomie: (gridW === 0 && prodW > 0),
+    priceKwh: priceInfo.price,
+    priceLabel: priceInfo.label,
+    priceSlot: priceInfo.slot,
+    priceMode: energyCfg.mode,
+    priceNextAt: priceInfo.nextAt,
+    priceNextInMin: priceInfo.nextInMin,
+    hcWindowsLabel: energyCfg.mode === 'hphc' ? hcWindowsLabel(energyCfg) : '',
+    prixHp: Number(energyCfg.prix_hp) || 0,
+    prixHc: Number(energyCfg.prix_hc) || 0,
+    cumulGridHcKWh: cumulGridHcKWh,
+    cumulGridHpKWh: cumulGridHpKWh,
+    prodEurH: prodEurH,
+    gridEurH: gridEurH,
+    cumulProdEur: cumulProdEur,
+    cumulGridEur: cumulGridEur,
     updated_at: timeStr,
     stale: false,
     age_s: 0
@@ -894,6 +1038,47 @@ app.get('/api/solaire', async (req, res) => {
     const data = await fetchSolarData();
     _solaireCache = { ts: now, data: data };
     res.json(data);
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Prix du kWh : lecture / écriture (le mode et les prix sont persistés)
+app.get('/api/energy-prices', (req, res) => {
+  const cfg = loadEnergyPrices();
+  const cur = currentEnergyPrice(cfg, new Date());
+  res.json({ ok: true, ...cfg, current: cur });
+});
+
+app.post('/api/energy-prices', (req, res) => {
+  try {
+    const body = req.body || {};
+    const patch = {};
+    if (body.mode === 'base' || body.mode === 'hphc') patch.mode = body.mode;
+    ['prix_base', 'prix_hp', 'prix_hc', 'prix_injection'].forEach(function (k) {
+      if (body[k] !== undefined) {
+        const n = Number(body[k]);
+        if (isNaN(n) || n < 0 || n > 5) return;
+        patch[k] = n;
+      }
+    });
+    if (Array.isArray(body.hc_windows)) {
+      const wins = body.hc_windows
+        .filter(function (w) { return Array.isArray(w) && w.length === 2 && !isNaN(Number(w[0])) && !isNaN(Number(w[1])) &&
+          Number(w[0]) >= 0 && Number(w[0]) <= 24 && Number(w[1]) >= 0 && Number(w[1]) <= 24; })
+        .map(function (w) { return [Number(w[0]), Number(w[1])]; });
+      if (wins.length) patch.hc_windows = wins;
+    }
+    ['hc_debut', 'hc_fin'].forEach(function (k) {
+      if (body[k] !== undefined) {
+        const n = parseInt(body[k], 10);
+        if (!isNaN(n) && n >= 0 && n <= 23) patch[k] = n;
+      }
+    });
+    if (!Object.keys(patch).length) return res.json({ ok: false, error: 'aucun champ valide' });
+    const cfg = saveEnergyPrices(patch);
+    _solaireCache = { ts: 0, data: null };  // force le recalcul au prochain appel
+    res.json({ ok: true, ...cfg, current: currentEnergyPrice(cfg, new Date()) });
   } catch (e) {
     res.json({ ok: false, error: e.message });
   }
@@ -925,7 +1110,7 @@ app.get('/', async (req, res) => {
   const rc  = ramColor(parseFloat(mem.appsPct));
   const dc  = diskColor(parseFloat(disk.usedPct));
   const kc  = creditColor(credits.total);
-  const ts  = new Date().toLocaleTimeString('fr-FR');
+  const ts  = new Date().toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris', hour12: false });
   const cachePct = ((parseFloat(mem.cache) / parseFloat(mem.total)) * 100).toFixed(1);
 
   // ─── Delegation Tracker (server-rendered) ────────────────────────────
@@ -1109,6 +1294,10 @@ app.get('/', async (req, res) => {
   .solaire-time{font-size:0.65rem;color:#3a3a3a;margin-top:0.75rem}
   .solaire-grid-sub{font-size:0.75rem;color:#555;margin-top:0.4rem}
   .solaire-grid-badge{margin-top:0.5rem}
+  .solaire-eur{font-size:0.85rem;font-weight:700;margin-top:0.35rem}
+  .solaire-detail{font-size:0.68rem;color:#555;margin-top:0.15rem}
+  .solaire-price{font-size:0.65rem;color:#3a3a3a;margin-top:0.5rem;cursor:pointer}
+  .solaire-price:hover{color:#60a5fa}
 </style>
 </head>
 <body>
@@ -1143,41 +1332,36 @@ app.get('/', async (req, res) => {
     <label class="settings-row" data-card-id="pc-marie"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-marie')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Marie</span></label>
     <label class="settings-row" data-card-id="pc-boncoin"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-boncoin')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC BonCoin</span></label>
     <label class="settings-row" data-card-id="chart"><span class="s-icon">📈</span><input type="checkbox"${vis('chart')?' checked':''}><span class="s-toggle"></span><span class="s-label">Graphique</span></label>
-    <label class="settings-row" data-card-id="solaire-prod"><span class="s-icon">☀️</span><input type="checkbox"${vis('solaire-prod')?' checked':''}><span class="s-toggle"></span><span class="s-label">Solaire production</span></label>
-    <label class="settings-row" data-card-id="solaire-grid"><span class="s-icon">⚡</span><input type="checkbox"${vis('solaire-grid')?' checked':''}><span class="s-toggle"></span><span class="s-label">Réseau Linky</span></label>
+    <label class="settings-row" data-card-id="energie"><span class="s-icon">⚡</span><input type="checkbox"${vis('energie')?' checked':''}><span class="s-toggle"></span><span class="s-label">Énergie (solaire + Linky)</span></label>
   </div>
 </div>
 
 <div class="grid">
 
-  <!-- SOLAIRE PRODUCTION -->
-  <div class="card ${visHidden('solaire-prod')}" data-card-id="solaire-prod"${orderOf('solaire-prod')} >
-    <div class="card-header"><span class="icon">☀️</span><span class="card-title">Production en temps réel</span></div>
-    <div class="big-value" style="color:#fbbf24"><span id="solaire-prod-total">—</span><span>W</span></div>
-    <div class="solaire-kw" id="solaire-prod-kw">—</div>
-    <hr class="divider">
+  <!-- ÉNERGIE : production solaire + import réseau, avec coût/économie €/h -->
+  <div class="card ${visHidden('energie')}" data-card-id="energie"${orderOf('energie')} >
+    <div class="card-header"><span class="icon">⚡</span><span class="card-title">Énergie en temps réel</span></div>
     <div class="solaire-cols">
       <div class="solaire-col">
-        <div class="solaire-col-label">Petits panneaux (prise)</div>
-        <div class="solaire-col-val" style="color:#fbbf24"><span id="solaire-prise-w">—</span> W</div>
-        <div class="solaire-col-sub" id="solaire-prise-cumul">—</div>
+        <div class="solaire-col-label">☀️ Production solaire</div>
+        <div class="solaire-col-val" style="color:#fbbf24"><span id="energie-prod-w">—<span style="font-size:0.7rem;font-weight:400">W</span></span></div>
+        <div class="solaire-col-sub" id="energie-prod-kw">—</div>
+        <div class="solaire-eur" id="energie-prod-eur" style="color:#fbbf24">—</div>
+        <div class="solaire-detail" id="energie-prod-detail">—</div>
       </div>
       <div class="solaire-col">
-        <div class="solaire-col-label">Gros panneaux (cabanon)</div>
-        <div class="solaire-col-val" style="color:#f97316"><span id="solaire-cabanon-w">—</span> W</div>
-        <div class="solaire-col-sub" id="solaire-cabanon-cumul">—</div>
+        <div class="solaire-col-label">⚡ Import EDF (Linky)</div>
+        <div class="solaire-col-val" id="energie-grid-w" style="color:#22c55e">— <span style="font-size:0.7rem;font-weight:400">W</span></div>
+        <div class="solaire-col-sub" id="energie-grid-kw">—</div>
+        <div class="solaire-eur" id="energie-grid-eur" style="color:#60a5fa">—</div>
+        <div class="solaire-detail" id="energie-grid-detail">—</div>
       </div>
     </div>
-    <div class="solaire-time" id="solaire-prod-time">—</div>
-  </div>
-
-  <!-- SOLAIRE RESEAU -->
-  <div class="card ${visHidden('solaire-grid')}" data-card-id="solaire-grid"${orderOf('solaire-grid')} >
-    <div class="card-header"><span class="icon">⚡</span><span class="card-title">Réseau (Linky) — import depuis EDF</span></div>
-    <div class="big-value" id="solaire-grid-w" style="color:#22c55e">—<span>W</span></div>
-    <div id="solaire-grid-badge"></div>
-    <div class="solaire-grid-sub" id="solaire-grid-cumul">—</div>
-    <div class="solaire-time" id="solaire-grid-time">—</div>
+    <div class="solaire-grid-sub" id="energie-net" style="margin-top:0.6rem">—</div>
+    <div class="solaire-grid-badge" id="energie-badge"></div>
+    <div class="solaire-detail" id="energie-hc" style="margin-top:0.55rem">—</div>
+    <div class="solaire-price" id="energie-price" onclick="editEnergyPrice()" title="Cliquer pour changer le prix du kWh">—</div>
+    <div class="solaire-time" id="energie-time">—</div>
   </div>
 
   <!-- CREDITS -->
@@ -2152,81 +2336,131 @@ app.get('/', async (req, res) => {
   }
 
 function fetchSolaire() {
-    fetch('/api/solaire').then(function(r){return r.json();}).then(function(d){renderSolaire(d);}).catch(function(e){console.error('solaire:',e);});
+    fetch('/api/solaire').then(function(r){return r.json();}).then(function(d){renderEnergie(d);}).catch(function(e){console.error('solaire:',e);});
   }
 
-  function renderSolaire(d) {
-    var prodTotal = document.getElementById('solaire-prod-total');
-    var prodKw = document.getElementById('solaire-prod-kw');
-    var priseW = document.getElementById('solaire-prise-w');
-    var priseCumul = document.getElementById('solaire-prise-cumul');
-    var cabW = document.getElementById('solaire-cabanon-w');
-    var cabCumul = document.getElementById('solaire-cabanon-cumul');
-    var gridW = document.getElementById('solaire-grid-w');
-    var gridBadge = document.getElementById('solaire-grid-badge');
-    var gridCumul = document.getElementById('solaire-grid-cumul');
-    var prodTime = document.getElementById('solaire-prod-time');
-    var gridTime = document.getElementById('solaire-grid-time');
-    if (!prodTotal) return;
+  function renderEnergie(d) {
+    var prodW = document.getElementById('energie-prod-w');
+    var prodKw = document.getElementById('energie-prod-kw');
+    var prodEur = document.getElementById('energie-prod-eur');
+    var prodDetail = document.getElementById('energie-prod-detail');
+    var gridW = document.getElementById('energie-grid-w');
+    var gridKw = document.getElementById('energie-grid-kw');
+    var gridEur = document.getElementById('energie-grid-eur');
+    var gridDetail = document.getElementById('energie-grid-detail');
+    var netEl = document.getElementById('energie-net');
+    var badge = document.getElementById('energie-badge');
+    var hcEl = document.getElementById('energie-hc');
+    var priceEl = document.getElementById('energie-price');
+    var timeEl = document.getElementById('energie-time');
+    if (!prodW) return;
+
+    function money(v, dec) {
+      var n = Number(v) || 0;
+      return n.toLocaleString('fr-FR', { minimumFractionDigits: dec, maximumFractionDigits: dec }) + ' €';
+    }
+    function eur(v) {
+      var n = Number(v) || 0;
+      return money(n, Math.abs(n) < 0.1 ? 3 : 2);
+    }
+    function cents(v) { return (Number(v) * 100).toFixed(2).replace('.', ',') + ' c€'; }
+    function W(v) { return '<span style="font-size:0.7rem;font-weight:400">' + v + '</span>'; }
 
     if (!d || !d.ok) {
-      var msg = '⛔ Solaire indisponible';
-      prodTotal.textContent = '—';
-      prodKw.textContent = msg;
-      priseW.textContent = '—';
-      priseCumul.textContent = msg;
-      cabW.textContent = '—';
-      cabCumul.textContent = msg;
-      gridW.innerHTML = '—<span>W</span>';
-      gridBadge.innerHTML = '';
-      gridCumul.textContent = msg;
-      if (prodTime) prodTime.textContent = '';
-      if (gridTime) gridTime.textContent = '';
+      window._energyData = {};
+      prodW.textContent = '—';
+      prodKw.textContent = '⛔ Énergie indisponible';
+      prodEur.textContent = '';
+      prodDetail.textContent = '';
+      gridW.innerHTML = '— ' + W('W');
+      gridKw.textContent = '⛔ capteur indisponible';
+      gridEur.textContent = '';
+      gridDetail.textContent = '';
+      if (netEl) netEl.textContent = '';
+      badge.innerHTML = '';
+      if (hcEl) hcEl.textContent = '';
+      priceEl.textContent = '';
+      if (timeEl) timeEl.textContent = '';
       return;
+    }
+    window._energyData = d;
+
+    var prod = Math.round(d.prodW || 0);
+    var gw = Math.round(d.gridW || 0);
+    var priseOk = d.priseOk === true || d.priseOk === 'true';
+    var cabOk = d.cabanonOk === true || d.cabanonOk === 'true';
+
+    prodW.innerHTML = prod + ' ' + W('W');
+    prodKw.textContent = ((d.prodW || 0) / 1000).toFixed(2).replace('.', ',') + ' kW';
+    prodEur.textContent = '💰 ' + eur(d.prodEurH) + ' / h économisés';
+    prodDetail.innerHTML = 'Prise ' + (priseOk ? Math.round(d.prodPriseW || 0) + ' W' : 'hors ligne')
+      + ' · Cabanon ' + (cabOk ? Math.round(d.prodCabanonW || 0) + ' W' : 'hors ligne')
+      + ' · cumul ' + ((d.cumulPriseKWh || 0) + (d.cumulCabanonKWh || 0)).toFixed(1).replace('.', ',') + ' kWh ≈ ' + money(d.cumulProdEur, 2);
+
+    gridW.innerHTML = gw + ' ' + W('W');
+    gridW.style.color = gw > 0 ? '#60a5fa' : '#22c55e';
+    gridKw.textContent = ((d.gridW || 0) / 1000).toFixed(2).replace('.', ',') + ' kW';
+    gridEur.textContent = '💸 ' + eur(d.gridEurH) + ' / h à payer';
+    var splitHc = (d.priceMode === 'hphc')
+      ? ' <span style="color:#888">(HC ' + (d.cumulGridHcKWh || 0).toFixed(1).replace('.', ',')
+        + ' · HP ' + (d.cumulGridHpKWh || 0).toFixed(1).replace('.', ',') + ' kWh)</span>'
+      : '';
+    gridDetail.innerHTML = 'cumul ' + (d.cumulGridKWh || 0).toFixed(1).replace('.', ',') + ' kWh ≈ ' + money(d.cumulGridEur, 2)
+      + splitHc + (d.cumulGridOk === false ? ' ⚠ partiel' : '');
+
+    var netH = (Number(d.gridEurH) || 0) - (Number(d.prodEurH) || 0);
+    if (netEl) {
+      var netTxt = '⚖️ Net 1 h : ' + (netH > 0 ? '+' : '') + eur(netH);
+      netEl.innerHTML = netH > 0
+        ? netTxt + ' <span style="color:#888">(import ' + eur(d.gridEurH) + ' − production ' + eur(d.prodEurH) + ')</span>'
+        : '<span style="color:#22c55e">' + netTxt + ' (production couvre tout)</span>';
+    }
+
+    if (d.autonomie) {
+      badge.innerHTML = '<span class="tag tag-green">✅ Autonome — aucun import réseau</span>';
+    } else if (gw > 0) {
+      badge.innerHTML = '';
+    } else {
+      badge.innerHTML = '';
+    }
+
+    var nextTxt = '';
+    if (d.priceMode === 'hphc' && d.priceNextInMin !== null && d.priceNextInMin !== undefined && d.priceNextAt) {
+      var mn = Number(d.priceNextInMin);
+      var dans = mn >= 60 ? Math.floor(mn / 60) + ' h ' + (mn % 60 ? (mn % 60) + ' min' : '') : mn + ' min';
+      nextTxt = ' → ' + (d.priceLabel === 'Heures creuses' ? 'HP' : 'HC') + ' dans ' + dans.replace('  ', ' ') + ' (à ' + d.priceNextAt + ')';
+    }
+    priceEl.textContent = 'Prix : ' + cents(d.priceKwh) + ' / kWh · ' + (d.priceLabel || '—') + nextTxt + ' · cliquer pour modifier';
+    if (hcEl) {
+      hcEl.textContent = (d.priceMode === 'hphc' && d.hcWindowsLabel)
+        ? '🕐 Heures creuses : ' + d.hcWindowsLabel + ' — HC ' + cents(d.prixHc) + ' / HP ' + cents(d.prixHp)
+        : '';
     }
 
     var ts = d.updated_at || '—';
-    var stamp = d.stale ? ('⛔ ' + ts) : ts;
-    if (prodTime) prodTime.textContent = stamp;
-    if (gridTime) gridTime.textContent = stamp;
-
-    var prodW = Math.round(d.prodW || 0);
-    prodTotal.textContent = prodW;
-    prodKw.textContent = ((d.prodW || 0) / 1000).toFixed(3) + ' kW';
-
-    if (d.priseOk) {
-      priseW.style.color = '#fbbf24';
-      priseW.textContent = Math.round(d.prodPriseW || 0);
-      priseCumul.textContent = (d.cumulPriseKWh || 0).toFixed(1) + ' kWh cumulé';
-    } else {
-      priseW.textContent = 'Pas de connexion';
-      priseW.style.color = '#64748b';
-      priseCumul.textContent = '📡 capteur inaccessible';
-    }
-
-    if (d.cabanonOk) {
-      cabW.style.color = '#f97316';
-      cabW.textContent = Math.round(d.prodCabanonW || 0);
-      cabCumul.textContent = (d.cumulCabanonKWh || 0).toFixed(1) + ' kWh cumulé';
-    } else {
-      cabW.textContent = 'Pas de connexion';
-      cabW.style.color = '#64748b';
-      cabCumul.textContent = '📡 capteur inaccessible';
-    }
-
-    var gw = Math.round(d.gridW || 0);
-    gridW.innerHTML = gw + '<span>W</span>';
-    gridW.style.color = gw > 0 ? '#60a5fa' : '#22c55e';
-
-    if (d.autonomie) {
-      gridBadge.innerHTML = '<span class="tag tag-green">✅ Autonome — aucun import réseau</span>';
-    } else {
-      gridBadge.innerHTML = '';
-    }
-
-    gridCumul.textContent = 'Puissance prélevée du réseau · cumulé: ' + (d.cumulGridKWh || 0).toFixed(1) + ' kWh'
-      + (d.cumulGridOk === false ? ' ⚠ cumul partiel (un des deux compteurs muet)' : '');
+    if (timeEl) timeEl.textContent = (d.stale === true || d.stale === 'true') ? ('⛔ ' + ts) : ts;
   }
+
+  // Édition du prix du kWh (appliqué au tarif en cours : base / HP / HC)
+  window.editEnergyPrice = function () {
+    var d = window._energyData || {};
+    var slot = d.priceSlot || 'prix_base';
+    var label = d.priceLabel || 'Base';
+    var cur = ((Number(d.priceKwh) || 0) * 100).toFixed(2).replace('.', ',');
+    var rep = window.prompt('Prix du kWh en c€ TTC (' + label + ') :', cur);
+    if (rep === null) return;
+    var n = parseFloat(String(rep).replace(',', '.'));
+    if (isNaN(n) || n <= 0 || n > 300) { window.alert('Valeur invalide'); return; }
+    var body = { mode: d.priceMode || 'base' };
+    body[slot] = n / 100;
+    fetch('/api/energy-prices', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json(); }).then(function (res) {
+      if (res.ok) { fetchSolaire(); } else { window.alert('Erreur : ' + (res.error || 'inconnue')); }
+    }).catch(function (e) { window.alert('Erreur réseau : ' + e.message); });
+  };
 
   initToggles();
   refreshAll();

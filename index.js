@@ -8,7 +8,7 @@ const path    = require('path');
 
 const app  = express();
 app.use(express.json());
-const PORT = 3015;
+const PORT = parseInt(process.env.PORT, 10) || 3015;
 const OPENROUTER_KEY = process.env.OPENROUTER_KEY || '';
 const OLLAMA_KEY = process.env.OLLAMA_KEY || '';
 const KIMI_API_KEY = process.env.KIMI_API_KEY || '';
@@ -797,6 +797,207 @@ app.get('/api/llm-224', (req, res) => {
   });
 });
 
+// ─── Contrat d'occupation UNIQUE : GET /api/llm-occupancy ───────────────────
+// Un seul contrat, trois consommateurs : le JS de cette page, le plugin cbar
+// (plugin/llm-status.5s.sh) et le tray Windows (windows/llm-tray.ps1).
+//
+// Deux règles de conception, chacune payée par un bug réel :
+//  1. Les sondes d'une machine partent EN PARALLÈLE (2 s max chacune). En séquence
+//     (/health -> /v1/models -> /slots -> /status) une génération lente dépassait 11 s :
+//     le badge n'avait jamais le temps d'apparaître avant le cycle de refresh suivant.
+//  2. busy = OR(/slots[].is_processing, /status.busy). Strata annonce busy avant que le
+//     slot ne soit marqué en traitement : /slots seul fait donc disparaître la tâche en
+//     cours au moment exact où elle commence.
+const OCC_NODES = [
+  { id: 'gabriel', letter: 'G', label: 'Gabriel .224', host: LLM224_HOST, port: LLM224_PORT, engine: 'strata' },
+  { id: 'marie', letter: 'M', label: 'Marie .57', host: '192.168.3.57', port: 8080, engine: 'llama' },
+  { id: 'louis', letter: 'L', label: 'Louis .206', host: '192.168.3.206', port: 8080, engine: 'llama' },
+];
+const OCC_CACHE_MS = 1000;      // cache court : page 3 s + plugin 5 s + tray 5 s = 1 sonde/s max
+const OCC_TIMEOUT_MS = 2000;    // par appel, jamais bloquant
+const OCC = { cache: null, cacheTs: 0, inflight: null, models: {}, modelsTs: {}, prompts: {} };
+
+function occJson(host, port, urlPath) {
+  return new Promise((resolve) => {
+    httpGetJson(host, port, urlPath, OCC_TIMEOUT_MS, (err, data) => {
+      resolve({ ok: !err, data: err ? null : data, error: err ? err.message : null });
+    });
+  });
+}
+
+// /slots[].n_prompt_tokens = le DERNIER prompt traité (ni moyenne ni historique), n_ctx = le
+// contexte DU SLOT (llama.cpp avec -np 2 renvoie le contexte par slot, pas le total).
+function occSlotsStats(slots) {
+  const out = { slots: 0, active: 0, prompt_tokens: null, n_ctx: null };
+  if (!Array.isArray(slots) || slots.length === 0) return out;
+  out.slots = slots.length;
+  let best = null;
+  slots.forEach((s) => {
+    if (!s || typeof s !== 'object') return;
+    if (s.is_processing === true) out.active += 1;
+    const p = (typeof s.n_prompt_tokens === 'number' && s.n_prompt_tokens > 0) ? s.n_prompt_tokens : null;
+    if (p !== null && (best === null || p > best.p)) {
+      best = { p: p, n: (typeof s.n_ctx === 'number' && s.n_ctx > 0) ? s.n_ctx : null };
+    }
+  });
+  if (best) {
+    out.prompt_tokens = best.p;
+    out.n_ctx = best.n;
+  }
+  return out;
+}
+
+// ≈ Compactions : un serveur LLM ne voit que des requêtes HTTP, une compaction est un
+// événement du HARNAIS (réécriture de l'historique). Heuristique honnête : une chute de plus
+// de 40 % du prompt entre deux requêtes successives du même nœud = compaction probable —
+// indiscernable d'une nouvelle session, d'où le « ≈ » affiché et le mot « estimées ».
+function occTrackPrompt(id, promptTokens, ts) {
+  const st = OCC.prompts[id] || (OCC.prompts[id] = { seen: null, changedAt: null, prev: null, compactions: 0, lastDropTs: null });
+  if (typeof promptTokens === 'number' && promptTokens > 0 && st.seen !== promptTokens) {
+    if (typeof st.seen === 'number' && promptTokens < st.seen * 0.6) {
+      st.compactions += 1;
+      st.lastDropTs = ts;
+    }
+    st.prev = st.seen;
+    st.seen = promptTokens;
+    st.changedAt = ts;
+  }
+  return st;
+}
+
+// La carte PC (collecteur SSH/Windows) répond-elle encore ? Elle distingue « serveur arrêté »
+// (machine joignable, LLM éteint) de « hors ligne » (machine muette).
+function occCardFresh(name) {
+  const d = pcCache[name];
+  if (!d) return false;
+  const ts = pcCacheTs[name] || 0;
+  return pcCache[name + 'Ok'] === true && ts > 0 && (Date.now() - ts) < 180000;
+}
+
+async function occProbeNode(node) {
+  const ts = Date.now();
+  let slotsRes = null, statusRes = null, healthRes = null, propsRes = null;
+  if (node.engine === 'strata') {
+    const r = await Promise.all([
+      occJson(node.host, node.port, '/slots'),
+      occJson(node.host, node.port, '/status'),
+      occJson(node.host, node.port, '/health'),
+    ]);
+    slotsRes = r[0]; statusRes = r[1]; healthRes = r[2];
+  } else {
+    // /props pèse ~10 Ko : relu seulement si le modèle est inconnu ou vieux de 5 min.
+    const needProps = !OCC.models[node.id] || (Date.now() - (OCC.modelsTs[node.id] || 0)) > 300000;
+    const r = await Promise.all([
+      occJson(node.host, node.port, '/slots'),
+      needProps ? occJson(node.host, node.port, '/props') : Promise.resolve(null),
+    ]);
+    slotsRes = r[0]; propsRes = r[1];
+  }
+  const slots = (slotsRes && slotsRes.ok && Array.isArray(slotsRes.data)) ? slotsRes.data : null;
+  const st = (statusRes && statusRes.ok && statusRes.data && typeof statusRes.data === 'object') ? statusRes.data : null;
+  const health = (healthRes && healthRes.ok && healthRes.data && typeof healthRes.data === 'object') ? healthRes.data : null;
+  const props = (propsRes && propsRes.ok && propsRes.data && typeof propsRes.data === 'object') ? propsRes.data : null;
+
+  const stats = occSlotsStats(slots);
+
+  let model = OCC.models[node.id] || null;
+  if (health && health.model) model = String(health.model);
+  if (props && props.model_path) model = String(props.model_path).split('/').pop() || model;
+  if (model) { OCC.models[node.id] = model; OCC.modelsTs[node.id] = Date.now(); }
+
+  let nctx = stats.n_ctx;
+  if (!nctx && health && typeof health.max_context === 'number') nctx = health.max_context;
+  if (!nctx && props && props.default_generation_settings && typeof props.default_generation_settings.n_ctx === 'number') {
+    nctx = props.default_generation_settings.n_ctx;
+  }
+
+  const online = !!(slots || st || health);
+  let state = 'online';
+  if (!online) state = occCardFresh(node.id) ? 'stopped' : 'offline';
+
+  const promptTokens = stats.prompt_tokens !== null ? stats.prompt_tokens
+    : ((st && typeof st.prompt_tokens === 'number') ? st.prompt_tokens : null);
+  const track = occTrackPrompt(node.id, promptTokens, ts);
+
+  const active = stats.active;
+  const busySlots = active > 0;
+  const busyStatus = !!(st && st.busy === true);
+  const queued = (st && typeof st.queued === 'number') ? st.queued : 0;
+  const ctxPct = (promptTokens !== null && nctx) ? Math.round((promptTokens / nctx) * 1000) / 10 : null;
+  const ctxAgeS = track.changedAt ? Math.round((ts - track.changedAt) / 1000) : null;
+
+  const errors = [];
+  if (slotsRes && !slotsRes.ok) errors.push('/slots: ' + slotsRes.error);
+  if (statusRes && !statusRes.ok) errors.push('/status: ' + statusRes.error);
+  if (healthRes && !healthRes.ok) errors.push('/health: ' + healthRes.error);
+
+  return {
+    id: node.id, letter: node.letter, label: node.label, engine: node.engine,
+    state: state, model: model, port: node.port,
+    slots: stats.slots || (state === 'online' ? 1 : 0),
+    active: active,
+    queued: queued,
+    busy: (state === 'online') && (busySlots || busyStatus),
+    busy_slots: busySlots,          // debug : ce que dit /slots
+    busy_status: busyStatus,        // debug : ce que dit /status (Strata seul)
+    phase: (st && st.phase) ? String(st.phase) : null,
+    generated: (st && typeof st.generated === 'number') ? st.generated : null,
+    tokens_per_s: (st && typeof st.tokens_per_s === 'number') ? st.tokens_per_s : null,
+    elapsed_s: (st && typeof st.elapsed_s === 'number') ? st.elapsed_s : null,
+    prompt_tokens: promptTokens,
+    prompt_prev: (typeof track.prev === 'number') ? track.prev : null,
+    ctx_age_s: ctxAgeS,
+    n_ctx: nctx,
+    ctx_pct: ctxPct,
+    compactions_est: track.compactions,
+    last_compaction_at: track.lastDropTs ? new Date(track.lastDropTs).toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris' }) : null,
+    vision: !!((health && health.images === true) || (props && props.mmproj_path)),
+    starting: node.engine === 'strata' ? llama224WindowOpen() : false,
+    ts: ts,
+    errors: errors,
+  };
+}
+
+function getOccupancy() {
+  const now = Date.now();
+  if (OCC.cache && (now - OCC.cacheTs) < OCC_CACHE_MS) return Promise.resolve(OCC.cache);
+  if (OCC.inflight) return OCC.inflight;   // une seule sonde à la fois, quel que soit le nombre de clients
+  OCC.inflight = Promise.all(OCC_NODES.map(occProbeNode)).then((nodes) => {
+    const payload = {
+      ts: Date.now(),
+      fetched_at: new Date().toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris' }),
+      nodes: nodes,
+    };
+    OCC.cache = payload;
+    OCC.cacheTs = Date.now();
+    OCC.inflight = null;
+    return payload;
+  }).catch((e) => {
+    OCC.inflight = null;
+    if (OCC.cache) return Object.assign({}, OCC.cache, { error: e.message });
+    return { ts: Date.now(), fetched_at: null, nodes: [], error: e.message };
+  });
+  return OCC.inflight;
+}
+
+app.get('/api/llm-occupancy', (req, res) => {
+  getOccupancy().then((payload) => {
+    const now = Date.now();
+    res.json({
+      ts: payload.ts,
+      fetched_at: payload.fetched_at,
+      age_s: Math.round((now - payload.ts) / 100) / 10,
+      cache_ms: OCC_CACHE_MS,
+      error: payload.error || null,
+      nodes: (payload.nodes || []).map((n) => Object.assign({}, n, {
+        age_s: Math.round((now - (n.ts || payload.ts)) / 100) / 10,
+      })),
+    });
+  }).catch((e) => {
+    res.status(500).json({ nodes: [], error: e.message });
+  });
+});
+
 function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 // API: débit des LLM locaux (t/s à ~100k de contexte) — c'est ce que lit la barre
@@ -1321,6 +1522,10 @@ app.get('/', async (req, res) => {
   .pc-llm{font-size:0.72rem;color:#9ca3af;margin-top:0.3rem}
   .pc-llm strong{color:#e0e0e0;font-weight:500}
   .pc-ctx-badge{display:inline-block;padding:0.08rem 0.4rem;border-radius:8px;font-size:0.62rem;font-weight:600;background:#1e293b;color:#93c5fd;margin-left:0.3rem;vertical-align:middle}
+  .pc-ctx-bar{height:3px;background:#1e293b;border-radius:2px;margin-top:0.25rem;overflow:hidden}
+  .pc-ctx-fill{height:100%;border-radius:2px}
+  .pc-ctx-detail{display:block;font-size:0.62rem;color:#64748b;margin-top:0.15rem}
+  .pc-occ-phase{font-size:0.6rem;color:#6b7280;margin-top:0.1rem}
   .pc-speed-wrap{margin-top:0.5rem;border-top:1px dashed #1f1f1f;padding-top:0.45rem}
   .pc-speed-wrap:empty{display:none;border-top:none;padding-top:0}
   .pc-speed-row{display:flex;justify-content:space-between;align-items:baseline;font-size:0.7rem;color:#888}
@@ -2231,8 +2436,11 @@ app.get('/', async (req, res) => {
       vramHtml +
       countdownHtml +
       '<hr class="divider">' +
-      ((name === 'gabriel')
-        ? '<div class="pc-llm" id="pc-gabriel-llm">🧠 <strong>—</strong> <span class="pc-status idle">⏳ état…</span></div>'
+      ((name === 'gabriel' || name === 'louis' || name === 'marie')
+        ? '<div class="pc-llm" id="pc-' + name + '-llm">' + llmPanelHtml(name,
+            (name === 'gabriel')
+              ? '🧠 <strong>—</strong> <span class="pc-status idle">⏳ état…</span>'
+              : '🧠 <strong>' + llmModelTxt + '</strong>' + llmCtxBadgeTxt + ' ' + llmStateHtml + llmVisionBadge + llmActivityBadge) + '</div>'
         : '<div class="pc-llm" id="pc-' + name + '-llm">🧠 <strong>' + llmModelTxt + '</strong>' + llmCtxBadgeTxt + ' ' + llmStateHtml + llmVisionBadge + llmActivityBadge + '</div>') +
       ((!stale && llmStatus) ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +
       speedBlockHtml(name) +
@@ -2272,68 +2480,145 @@ app.get('/', async (req, res) => {
     updateAlertBanner();
   }
 
-  // ── État du LLM du .224 (Strata ou llama.cpp) ────────────────────────────
-  // Lu sur /api/llm-224 (sonde HTTP /health + /v1/models côté serveur), JAMAIS sur les
-  // process : le .224 change de moteur et Strata (Python) n'a aucun llama-server.
-  // ⚠️ Ce bloc vit dans une template literal : pas de backtick, pas d'interpolation, pas d'antislash.
-  var _llm224Busy = false;
-  var _llm224StartTs = 0;
+  // ── Occupation des LLM locaux : GET /api/llm-occupancy ───────────────────
+  // Ce bloc est le SEUL consommateur front de l occupation (les 3 machines), et le même
+  // contrat est lu par le plugin cbar et le tray Windows.
+  // Trois règles, chacune payée par un bug réel :
+  //  · sonde toutes les 3 s, INDÉPENDAMMENT du refresh 10 s des cartes : avec l ancien
+  //    cycle, une requête LLM de 4 s n apparaissait jamais ;
+  //  · le dernier état connu (_occNodes) n est jamais effacé, et le placeholder « état… »
+  //    ne revient jamais après le premier rendu ;
+  //  · fetch avec AbortController + 5 s : sans timeout, un probe qui traîne figeait le badge
+  //    et le verrou _occBusy bloquait tous les cycles suivants.
+  // ⚠️ Ce bloc vit dans une template literal : pas de backtick, pas d antislash, pas d apostrophe.
+  var _occNodes = {};
+  var _occBusy = false;
 
+  function occNum(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
+
+  function occEsc(s) {
+    return String(s).split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;');
+  }
+
+  function occCtxHtml(n) {
+    var pct = occNum(n.ctx_pct);
+    if (pct === null) { return ''; }
+    var txt = (pct > 0 && pct < 1) ? '< 1 %' : Math.round(pct) + ' %';
+    // prompt_tokens = le DERNIER prompt traité : au-delà de 60 s sans nouvelle requête la
+    // valeur n est plus forcément celle du contexte courant -> « ~ ».
+    var age = occNum(n.ctx_age_s);
+    if (!n.busy && age !== null && age > 60) { txt = '~' + txt; }
+    var col = pct >= 85 ? '#f87171' : (pct >= 60 ? '#facc15' : '#4ade80');
+    var html = ' <span class="pc-ctx-badge">ctx ' + txt + '</span>';
+    html = html + '<div class="pc-ctx-bar"><div class="pc-ctx-fill" style="width:' + Math.min(100, pct) + '%;background:' + col + '"></div></div>';
+    if (occNum(n.prompt_tokens) !== null && occNum(n.n_ctx) !== null) {
+      html = html + '<span class="pc-ctx-detail">' + n.prompt_tokens + ' / ' + n.n_ctx + ' tok</span>';
+    }
+    return html;
+  }
+
+  function occStatusHtml(n) {
+    if (n.state === 'offline') { return '<span class="pc-status off">● Hors ligne</span>'; }
+    if (n.state === 'stopped') { return '<span class="pc-status off">● Arrêté</span>'; }
+    if (n.starting) { return '<span class="pc-status busy">● En cours de démarrage…</span>'; }
+    var html = '<span class="pc-status on">● En marche :' + (n.port || 8080) + '</span>';
+    if (n.vision) { html = html + ' <span class="pc-status img">🖼 vision</span>'; }
+    var queued = occNum(n.queued) || 0;
+    if (n.busy) {
+      html = html + ' <span class="pc-status busy">⚡ TACHE EN COURS</span>';
+      if (queued > 0) { html = html + ' <span class="pc-status busy">⏳ FILE ' + queued + '</span>'; }
+      var det = '';
+      if (occNum(n.tokens_per_s) !== null) { det = det + n.tokens_per_s + ' t/s'; }
+      if (occNum(n.generated) !== null && n.generated > 0) { det = det + (det ? ' · ' : '') + n.generated + ' tok'; }
+      if (occNum(n.elapsed_s) !== null) { det = det + (det ? ' · ' : '') + n.elapsed_s + ' s'; }
+      if (det) { html = html + ' <span class="pc-status idle">' + det + '</span>'; }
+      if (n.phase) { html = html + '<div class="pc-occ-phase">' + occEsc(n.phase) + '</div>'; }
+    } else if (queued > 0) {
+      html = html + ' <span class="pc-status busy">⏳ FILE ' + queued + '</span>';
+    } else {
+      html = html + ' <span class="pc-status idle">LIBRE</span>';
+    }
+    return html;
+  }
+
+  function renderOccNode(n) {
+    if (!n) { return ''; }
+    var modelTxt = n.model ? n.model : (n.state === 'online' ? 'modèle inconnu' : '—');
+    if (modelTxt.length > 46) { modelTxt = modelTxt.slice(0, 43) + '…'; }
+    var html = '🧠 <strong>' + occEsc(modelTxt) + '</strong>';
+    if (n.state === 'online') { html = html + occCtxHtml(n); }
+    html = html + ' ' + occStatusHtml(n);
+    if (occNum(n.compactions_est) > 0) {
+      html = html + ' <span class="pc-ctx-badge">≈ ' + n.compactions_est + ' compaction(s)</span>';
+    }
+    return html;
+  }
+
+  // Rendu d une carte PC : l occupation connue prime sur le repli fourni par renderPc.
+  function llmPanelHtml(name, fallback) {
+    var n = _occNodes[name];
+    if (n) { return renderOccNode(n); }
+    return fallback;
+  }
+
+  // Compatibilité : ancien contrat /api/llm-224 (utilisé après start_llm / kill_llm et par
+  // les tests). On convertit sa forme vers celle d un nœud d occupation.
   function renderLlm224(info) {
     var el = document.getElementById('pc-gabriel-llm');
-    if (!el) return;
-    var html = '';
-    if (info.state === 'stopped') {
-      html = '🧠 <strong>—</strong> <span class="pc-status off">● Arrêté</span>';
-    } else if (info.state === 'starting') {
-      html = '🧠 <strong>démarrage…</strong> <span class="pc-status busy">● En cours de démarrage…</span> <span class="pc-status idle">(66-120 s, première charge)</span>';
-    } else if (info.state === 'running') {
-      var modelTxt = info.model ? info.model : 'modèle inconnu';
-      html = '🧠 <strong>' + modelTxt + '</strong>';
-      if (info.ctx) { html += ' <span class="pc-ctx-badge">ctx ' + formatCtxSize(info.ctx) + '</span>'; }
-      html += ' <span class="pc-status on">● En marche :8080</span>';
-      if (info.images === true) { html += ' <span class="pc-status img">🖼 vision</span>'; }
-      // Occupation — même badge que les cartes Louis/Marie, mais lu sur /slots (Strata n'a
-      // pas de processus llama-server : c'est le badge du backend SSE qui manquait ici).
-      if (info.busy === true) {
-        html += ' <span class="pc-status busy">⚡ TACHE EN COURS</span>';
-        var act = info.activity || null;
-        var det = '';
-        if (act) {
-          if (act.tokens_per_s) { det += act.tokens_per_s + ' t/s'; }
-          if (act.generated) { det += (det ? ' · ' : '') + act.generated + ' tok'; }
-          if (typeof act.elapsed_s === 'number') { det += (det ? ' · ' : '') + act.elapsed_s + ' s'; }
-        }
-        if (det) { html += ' <span class="pc-status idle">' + det + '</span>'; }
-      } else if (info.busy === false) {
-        html += ' <span class="pc-status idle">LIBRE</span>';
-      }
-    } else {
-      html = '🧠 <strong>—</strong> <span class="pc-status off">● État inconnu</span>';
-    }
-    el.innerHTML = html;
+    if (!el || !info) { return; }
+    var act = info.activity || {};
+    var n = {
+      id: 'gabriel',
+      state: info.state === 'running' ? 'online' : (info.state === 'starting' ? 'online' : (info.state === 'stopped' ? 'stopped' : 'offline')),
+      starting: info.state === 'starting',
+      model: info.model || null,
+      port: info.port || 8080,
+      busy: info.busy === true,
+      queued: (occNum(info.queued) !== null) ? info.queued : (occNum(act.queued) || 0),
+      vision: (info.vision === true) || (info.images === true),
+      tokens_per_s: occNum(act.tokens_per_s) !== null ? act.tokens_per_s : occNum(info.tokens_per_s),
+      generated: occNum(act.generated) !== null ? act.generated : occNum(info.generated),
+      elapsed_s: occNum(act.elapsed_s) !== null ? act.elapsed_s : occNum(info.elapsed_s),
+      phase: info.phase || act.phase || null,
+      ctx_pct: occNum(info.ctx_pct),
+      prompt_tokens: occNum(info.prompt_tokens),
+      n_ctx: occNum(info.n_ctx) !== null ? info.n_ctx : occNum(info.ctx),
+      ctx_age_s: 0,
+      compactions_est: occNum(info.compactions_est) || 0
+    };
+    el.innerHTML = renderOccNode(n);
   }
 
-  function refreshLlm224() {
-    if (_llm224Busy) return;
-    _llm224Busy = true;
-    fetch('/api/llm-224').then(function(r) { return r.json(); }).then(function(data) {
-      _llm224Busy = false;
-      renderLlm224(data);
-      // Pendant un démarrage on re-sonde toutes les 5 s, mais jamais plus de 4 min
-      // (au-delà : le démarrage a échoué, on laisse la carte dire « Arrêté »).
-      if (data && data.state === 'starting') {
-        if (!_llm224StartTs) _llm224StartTs = Date.now();
-        if ((Date.now() - _llm224StartTs) < 240000) setTimeout(function() { refreshLlm224(); }, 5000);
-      } else {
-        _llm224StartTs = 0;
-      }
-    }).catch(function(e) {
-      _llm224Busy = false;
-      _llm224StartTs = 0;
-      renderLlm224({ state: 'unknown', error: 'réseau' });
+  function renderOccAll() {
+    ['gabriel', 'louis', 'marie'].forEach(function(id) {
+      var el = document.getElementById('pc-' + id + '-llm');
+      var n = _occNodes[id];
+      if (el && n) { el.innerHTML = renderOccNode(n); }
     });
   }
+
+  function pollOccupancy() {
+    if (_occBusy) { return; }
+    _occBusy = true;
+    var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var opts = { cache: 'no-store' };
+    if (ctl) { opts.signal = ctl.signal; }
+    var tid = setTimeout(function() { if (ctl) { try { ctl.abort(); } catch (e) {} } }, 5000);
+    fetch('/api/llm-occupancy', opts).then(function(r) { return r.json(); }).then(function(data) {
+      clearTimeout(tid);
+      _occBusy = false;
+      var nodes = (data && data.nodes) ? data.nodes : [];
+      for (var i = 0; i < nodes.length; i++) {
+        if (nodes[i] && nodes[i].id) { _occNodes[nodes[i].id] = nodes[i]; }
+      }
+      renderOccAll();
+    }).catch(function() {
+      clearTimeout(tid);
+      _occBusy = false;   // jamais de verrou permanent : le tick suivant retente
+    });
+  }
+
+  function refreshLlm224() { pollOccupancy(); }
 
   function refreshAll() {
     fetch('/api/pc-gabriel').then(function(r){return r.json();}).then(function(d){renderPc(d,'gabriel');}).catch(function(e){console.error('pc-gabriel:',e);});
@@ -2598,6 +2883,10 @@ function fetchSolaire() {
 
   initToggles();
   refreshAll();
+  // Occupation des LLM : sonde dédiée toutes les 3 s, INDÉPENDANTE du refresh 10 s des
+  // cartes. C est ce qui rend visible une requête de 4 s (le cycle de 10 s la manquait).
+  pollOccupancy();
+  setInterval(pollOccupancy, 3000);
   // Refresh adaptatif : 10s onglet visible, 60s onglet caché (économie de requêtes)
   var REFRESH_VISIBLE = 10000;
   var REFRESH_HIDDEN = 60000;

@@ -23,6 +23,15 @@ const HISTORY_FILE = path.join(DATA_DIR, 'credits_history.json');
 const MAX_HISTORY_DAYS = 30;
 const MIN_INTERVAL_HOURS = 4;
 
+// --- Watchdog extinction PC (cron */15) -----------------------------------
+// Etat du watchdog d'extinction (pc-idle-watchdog.py, cron harry) — lisible dans le conteneur
+// via le mount `/ -> /host`. Surchargeable par env (WATCHDOG_STATE_PATH) pour tester sur l'hote.
+const WATCHDOG_STATE = process.env.WATCHDOG_STATE_PATH || '/host/home/lydstyl/.hermes/cron/output/pc-idle-watchdog/state.json';
+const WATCHDOG_MAP = { louis: 'louis', marie: 'marie', boncoin: 'skillorp' };
+const WATCHDOG_IDLE_MIN = 30;
+const WATCHDOG_TICK_MIN = 15;
+const WATCHDOG_MAX_AGE_MS = 2 * WATCHDOG_TICK_MIN * 60000; // etat plus vieux = cron mort : on se tait
+
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -394,8 +403,8 @@ function tag(cond1, cond2, l1, l2, l3) {
 const VISIBILITY_FILE = path.join(DATA_DIR, 'card_visibility.json');
 
 const DEFAULT_VISIBILITY = {
-  'credits': true, 'spending-30d': true, 'spending-24h': true,
-  'cpu': true, 'ram': true, 'disk': true, 'ollama': true,
+  'credits': true, 'depenses': true,
+  'systeme': true, 'ollama': true,
   'pc-gabriel': true, 'pc-louis': true, 'pc-marie': true, 'pc-boncoin': true, 'chart': true,
   'energie': true
 };
@@ -420,8 +429,8 @@ const ORDER_FILE = path.join(DATA_DIR, 'card_order.json');
 
 // Ordre par defaut = ordre de rendu du template (cartes + graphique)
 const DEFAULT_ORDER = [
-  'energie', 'credits', 'spending-30d', 'spending-24h',
-  'cpu', 'ram', 'disk', 'ollama', 'pc-gabriel', 'pc-louis', 'pc-marie', 'pc-boncoin', 'chart'
+  'energie', 'credits', 'depenses',
+  'systeme', 'ollama', 'pc-gabriel', 'pc-louis', 'pc-marie', 'pc-boncoin', 'chart'
 ];
 
 function loadCardOrder() {
@@ -534,6 +543,88 @@ function startPcCache() {
   setInterval(update, 15000); // then every 15s
 }
 
+// --- Compte a rebours d extinction : etat du watchdog PC idle ------------
+let _wdState = null;
+let _wdStateTs = 0;
+
+function loadWatchdogState() {
+  const now = Date.now();
+  if (_wdStateTs && (now - _wdStateTs) < 60000) return _wdState; // cache 60 s
+  _wdStateTs = now;
+  try {
+    const mtime = fs.statSync(WATCHDOG_STATE).mtimeMs;
+    // Cron mort ou desactive : l etat n est plus une prevision, on ne montre rien.
+    if (now - mtime > WATCHDOG_MAX_AGE_MS) { _wdState = null; return _wdState; }
+    _wdState = JSON.parse(fs.readFileSync(WATCHDOG_STATE, 'utf8'));
+  } catch (e) {
+    _wdState = null; // fichier absent (hors conteneur) : pas de compte a rebours
+  }
+  return _wdState;
+}
+
+// ⚠️ Le watchdog ecrit des heures LOCALES (Europe/Paris) SANS fuseau ("2026-10-27T11:45:40").
+// Le conteneur tourne en UTC : new Date() y interprete 11:45 comme 11:45 UTC = 12:45 Paris,
+// soit 1 h d avance -> idleMin negatif et compte a rebours faux. On reconstruit donc
+// l instant en interpretant la chaine comme heure de Paris.
+function parisOffsetMs(epochMs) {
+  try {
+    const p = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Europe/Paris', hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    }).formatToParts(new Date(epochMs)).reduce(function (a, x) { a[x.type] = x.value; return a; }, {});
+    const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, (+p.hour) % 24, +p.minute, +p.second);
+    return asUTC - epochMs;
+  } catch (e) {
+    return 0; // Intl indisponible : on degrade vers un decalage nul plutot que vers une ETA fausse
+  }
+}
+
+function parseParisNaive(str) {
+  if (!str || typeof str !== 'string') return null;
+  if (/[Zz]$|[+-]\d{2}:?\d{2}$/.test(str)) { // deja horodate avec fuseau : lecture directe
+    const t = Date.parse(str);
+    return isNaN(t) ? null : t;
+  }
+  const m = /(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/.exec(str);
+  if (!m) return null;
+  const guess = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  return guess - parisOffsetMs(guess);
+}
+
+// "2026-10-27T13:23:00" -> "13:23" (les chiffres de la chaine, independamment du fuseau)
+function hhmmNaive(str) {
+  const m = /[T ](\d{2}):(\d{2})/.exec(str || '');
+  return m ? m[1] + ':' + m[2] : '—';
+}
+
+// null si PC non gere par le watchdog, actif ou eteint. Sinon :
+//   { blocked, cronAt, shutdownAtMs, idleMin }
+function getAutoShutdown(name) {
+  const key = WATCHDOG_MAP[name];
+  if (!key) return null;
+  const st = loadWatchdogState();
+  if (!st || !st[key]) return null;
+  const pc = st[key];
+  if (!pc.idle_since || pc.off_since) return null;
+  const startMs = parseParisNaive(pc.idle_since);
+  if (startMs === null) return null;
+  if (startMs > Date.now()) return null; // horloge incoherente : aucune prevision fiable
+  const idleMin = Math.floor((Date.now() - startMs) / 60000);
+
+  if (pc.blocked_by_cron) {
+    return { blocked: true, cronAt: hhmmNaive(pc.blocked_by_cron), shutdownAtMs: null, idleMin: idleMin };
+  }
+
+  // ETA = idle_since + IDLE_MIN, arrondi au prochain tick de 15 min du cron.
+  const eta = new Date(startMs + WATCHDOG_IDLE_MIN * 60000);
+  const m = eta.getMinutes();
+  let add = (WATCHDOG_TICK_MIN - (m % WATCHDOG_TICK_MIN)) % WATCHDOG_TICK_MIN;
+  if (add === 0 && eta.getSeconds() !== 0) add = WATCHDOG_TICK_MIN;
+  if (add > 0) eta.setMinutes(m + add, 0, 0); else eta.setSeconds(0, 0);
+  return { blocked: false, cronAt: null, shutdownAtMs: eta.getTime(), idleMin: idleMin };
+}
+
 // ─── Réponse /api/pc-* : marque les données figées ───────────────────
 // Le cache survit à la mort du backend. On expose _stale / _age_s pour que le front
 // n'affiche jamais un vieux relevé comme s'il était live.
@@ -544,6 +635,7 @@ function pcPayload(name) {
   const ageS = ts ? Math.round((Date.now() - ts) / 1000) : null;
   const fresh = pcCache[name + 'Ok'] === true;
   return Object.assign({}, d, {
+    auto_shutdown: getAutoShutdown(name),
     _stale: !fresh || (ageS !== null && ageS > PC_STALE_AFTER_S),
     _age_s: ageS,
     _fetched_at: ts ? new Date(ts).toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris' }) : null,
@@ -1194,6 +1286,10 @@ app.get('/', async (req, res) => {
   .pc-llm-link:hover{background:#0f2540;color:#93c5fd;border-color:#2563eb}
   .pc-llm-link-row{line-height:1.1}
   .pc-stale-banner{background:#2a0a0a;color:#fca5a5;border:1px solid #7f1d1d;border-radius:6px;padding:0.35rem 0.5rem;font-size:0.68rem;margin-bottom:0.45rem;line-height:1.3}
+  .pc-countdown{margin-top:.45rem;font-size:.72rem;font-weight:600;color:#fbbf24}
+  .pc-countdown.warn{color:#fb923c}
+  .pc-countdown.soon{color:#f87171}
+  .pc-countdown.blocked{color:#94a3b8}
   .proc-row{display:flex;justify-content:space-between;align-items:center;font-size:0.7rem;margin-top:0.25rem;font-family:'SF Mono','Fira Code','Consolas',monospace}
   .proc-row .proc-cpu{color:#4ade80;font-weight:600;min-width:2.2rem;text-align:right}
   .proc-row .proc-cmd{color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;margin-left:0.5rem}
@@ -1344,11 +1440,8 @@ app.get('/', async (req, res) => {
   <div class="settings-hint">Glisser-déposer une carte par sa poignée ⠿ pour la placer où tu veux.<button class="settings-reset" onclick="resetCardOrder()">↺ Ordre par défaut</button></div>
   <div class="settings-grid">
     <label class="settings-row" data-card-id="credits"><span class="s-icon">💳</span><input type="checkbox"${vis('credits')?' checked':''}><span class="s-toggle"></span><span class="s-label">Crédits</span></label>
-    <label class="settings-row" data-card-id="spending-30d"><span class="s-icon">📊</span><input type="checkbox"${vis('spending-30d')?' checked':''}><span class="s-toggle"></span><span class="s-label">Dépenses 30j</span></label>
-    <label class="settings-row" data-card-id="spending-24h"><span class="s-icon">⏰</span><input type="checkbox"${vis('spending-24h')?' checked':''}><span class="s-toggle"></span><span class="s-label">Dépenses 24h</span></label>
-    <label class="settings-row" data-card-id="cpu"><span class="s-icon">🖥️</span><input type="checkbox"${vis('cpu')?' checked':''}><span class="s-toggle"></span><span class="s-label">CPU</span></label>
-    <label class="settings-row" data-card-id="ram"><span class="s-icon">🧠</span><input type="checkbox"${vis('ram')?' checked':''}><span class="s-toggle"></span><span class="s-label">RAM</span></label>
-    <label class="settings-row" data-card-id="disk"><span class="s-icon">💾</span><input type="checkbox"${vis('disk')?' checked':''}><span class="s-toggle"></span><span class="s-label">Disque dur</span></label>
+    <label class="settings-row" data-card-id="depenses"><span class="s-icon">💰</span><input type="checkbox"${vis('depenses')?' checked':''}><span class="s-toggle"></span><span class="s-label">Dépenses LLM (30j + 24h)</span></label>
+    <label class="settings-row" data-card-id="systeme"><span class="s-icon">🖥️</span><input type="checkbox"${vis('systeme')?' checked':''}><span class="s-toggle"></span><span class="s-label">Système (CPU/RAM/Disque)</span></label>
     <label class="settings-row" data-card-id="ollama"><span class="s-icon">🦙</span><input type="checkbox"${vis('ollama')?' checked':''}><span class="s-toggle"></span><span class="s-label">Ollama Cloud</span></label>
     <label class="settings-row" data-card-id="pc-gabriel"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-gabriel')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Gabriel</span></label>
     <label class="settings-row" data-card-id="pc-louis"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-louis')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Louis</span></label>
@@ -1398,70 +1491,46 @@ app.get('/', async (req, res) => {
     <a href="https://platform.deepseek.com/top_up" target="_blank" style="color:#4ade80;font-size:0.75rem;display:inline-block;margin-top:0.6rem">↗ Recharger DeepSeek</a>
   </div>
 
-  <!-- DÉPENSES 30 JOURS -->
-  <div class="card ${visHidden('spending-30d')}" data-card-id="spending-30d"${orderOf('spending-30d')} >
-    <div class="card-header"><span class="icon">📊</span><span class="card-title">Dépenses — 30 derniers jours</span></div>
-    <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending.total.toFixed(2)}<span>$</span></div>
+  <!-- DÉPENSES LLM : 30 jours + 24 h dans une seule carte -->
+  <div class="card ${visHidden('depenses')}" data-card-id="depenses"${orderOf('depenses')} >
+    <div class="card-header"><span class="icon">💰</span><span class="card-title">Dépenses LLM</span></div>
+    <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending.total.toFixed(2)}<span>$ · 30 j</span></div>
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:0.4rem;font-size:0.8rem"><span style="color:#888">Dernières 24 h</span><span style="color:#fbbf24;font-weight:700">${spending24h.total.toFixed(3)} $</span></div>
     <hr class="divider">
-    <div class="row"><span class="label">OpenRouter (30j)</span><span class="val" style="color:#60a5fa">${spending.or.toFixed(2)} $</span></div>
+    <div class="row" style="opacity:0.65"><span class="label">Provider</span><span class="val-muted">30 j · 24 h</span></div>
+    <div class="row"><span class="label">OpenRouter</span><span class="val" style="color:#60a5fa">${spending.or.toFixed(2)} $ · ${spending24h.or.toFixed(3)} $</span></div>
     <div class="row"><span class="label">OpenRouter (ce mois, API)</span><span class="val" style="color:#60a5fa">${live.ok ? live.usageMonthly.toFixed(2) + ' $' : '—'}</span></div>
-    <div class="row"><span class="label">Kimi</span><span class="val" style="color:#a78bfa">${spending.kimi.toFixed(2)} $</span></div>
-    <div class="row"><span class="label">DeepSeek</span><span class="val" style="color:#4ade80">${spending.deepseek.toFixed(2)} $</span></div>
-    <div class="note">Basé sur la somme des baisses de solde. Les rechargements ne sont pas comptés comme dépenses.</div>
+    <div class="row"><span class="label">Kimi</span><span class="val" style="color:#a78bfa">${spending.kimi.toFixed(2)} $ · ${spending24h.kimi.toFixed(3)} $</span></div>
+    <div class="row"><span class="label">DeepSeek</span><span class="val" style="color:#4ade80">${spending.deepseek.toFixed(2)} $ · ${spending24h.deepseek.toFixed(3)} $</span></div>
+    <div class="note">Somme des baisses de solde · relevés ~6 h.</div>
   </div>
 
-  <!-- DÉPENSES 24H -->
-  <div class="card ${visHidden('spending-24h')}" data-card-id="spending-24h"${orderOf('spending-24h')} >
-    <div class="card-header"><span class="icon">⏰</span><span class="card-title">Dépenses — 24 dernières heures</span></div>
-    <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending24h.total.toFixed(2)}<span>$</span></div>
-    <hr class="divider">
-    <div class="row"><span class="label">OpenRouter (24h)</span><span class="val" style="color:#60a5fa">${spending24h.or.toFixed(3)} $</span></div>
-    <div class="row"><span class="label">Kimi (24h)</span><span class="val" style="color:#a78bfa">${spending24h.kimi.toFixed(3)} $</span></div>
-    <div class="row"><span class="label">DeepSeek (24h)</span><span class="val" style="color:#4ade80">${spending24h.deepseek.toFixed(3)} $</span></div>
-    <div class="note">Basé sur les relevés de solde ~toutes les 6h.</div>
-  </div>
-
-  <!-- CPU -->
-  <div class="card ${visHidden('cpu')}" data-card-id="cpu"${orderOf('cpu')} >
-    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">CPU</span></div>
+  <!-- SYSTÈME : CPU + RAM + Disque réunis dans une seule carte -->
+  <div class="card ${visHidden('systeme')}" data-card-id="systeme"${orderOf('systeme')} >
+    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">Système — serveur</span></div>
     <div class="big-value" style="color:${cc}">${sys.cpuPct}<span>%</span></div>
     ${bar(sys.cpuPct, cc)}
-    <hr class="divider">
     <div class="row"><span class="label">Load avg (1m)</span><span class="val">${sys.load1}</span></div>
     <div class="row"><span class="label">Cœurs logiques</span><span class="val">${sys.cpuCount}</span></div>
     ${tag(parseFloat(sys.cpuPct) < 50, parseFloat(sys.cpuPct) < 80, '✓ Normal', '⚠ Élevé', '✕ Critique')}
-    <hr class="divider">
     <div id="top-processes">
       <div class="proc-row" style="text-align:center;padding:0;color:#444;font-size:0.7rem">⏳ Top process…</div>
     </div>
-  </div>
-
-  <!-- RAM -->
-  <div class="card ${visHidden('ram')}" data-card-id="ram"${orderOf('ram')} >
-    <div class="card-header"><span class="icon">🧠</span><span class="card-title">Mémoire RAM</span></div>
+    <hr class="divider">
     <div class="big-value" style="color:${rc}">${mem.usedByApps}<span>GB apps</span></div>
     <div class="bar-bg">
       <div class="bar-fill" style="width:${Math.min(100,parseFloat(mem.appsPct))}%;background:${rc}"></div>
       <div class="bar-fill bar-cache" style="width:${Math.min(100,parseFloat(mem.appsPct)+parseFloat(cachePct))}%;background:#4ade80;opacity:0.12"></div>
     </div>
-    <hr class="divider">
     <div class="row"><span class="label">Disponible pour apps</span><span class="val" style="color:#4ade80">${mem.available} GB</span></div>
     <div class="row"><span class="label">Cache disque (libérable)</span><span class="val-muted">${mem.cache} GB</span></div>
     <div class="row"><span class="label">Total VM</span><span class="val">${mem.total} GB</span></div>
     ${parseFloat(mem.swapUsed) > 0.01 ? `<div class="row"><span class="label">Swap utilisé</span><span class="val" style="color:#facc15">${mem.swapUsed} / ${mem.swapTotal} GB</span></div>` : ''}
     ${tag(parseFloat(mem.appsPct) < 50, parseFloat(mem.appsPct) < 75, '✓ Normal', '⚠ Élevé', '✕ Critique')}
-    <div class="note">
-      <strong>Proxmox affiche ${mem.proxmoxPct}% utilisé</strong> car il compte le cache disque.<br>
-      Le vrai usage par les processus est <strong style="color:#aaa">${mem.appsPct}%</strong> — ${mem.available} GB sont librement disponibles.
-    </div>
-  </div>
-
-  <!-- DISK -->
-  <div class="card ${visHidden('disk')}" data-card-id="disk"${orderOf('disk')} >
-    <div class="card-header"><span class="icon">💾</span><span class="card-title">Disque dur</span></div>
+    <div class="note">Proxmox affiche ${mem.proxmoxPct}% (cache disque inclus) · usage réel des processus <strong style="color:#aaa">${mem.appsPct}%</strong> · ${mem.available} GB libres</div>
+    <hr class="divider">
     <div class="big-value" style="color:${dc}">${disk.used}<span>GB utilisés</span></div>
     ${bar(disk.usedPct, dc)}
-    <hr class="divider">
     <div class="row"><span class="label">Espace libre</span><span class="val" style="color:#4ade80">${disk.avail} GB</span></div>
     <div class="row"><span class="label">Capacité totale</span><span class="val">${disk.total} GB</span></div>
     <div class="row"><span class="label">Utilisation</span><span class="val">${disk.usedPct}%</span></div>
@@ -2131,6 +2200,23 @@ app.get('/', async (req, res) => {
         '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + vramDetail + '</span><span>' + vramTemp + '</span></div>';
     }
 
+    // Compte a rebours d extinction (watchdog PC idle). PC actif => aucune ligne.
+    var countdownHtml = '';
+    var asd = data.auto_shutdown;
+    if (asd && !stale) {
+      if (asd.blocked) {
+        countdownHtml = '<div class="pc-countdown blocked">⏻ Extinction suspendue (cron ' + (asd.cronAt || '—') + ')</div>';
+      } else if (asd.shutdownAtMs) {
+        var remaining = Math.round((asd.shutdownAtMs - Date.now()) / 60000);
+        if (remaining <= 0) {
+          countdownHtml = '<div class="pc-countdown soon">⏻ Extinction imminente</div>';
+        } else {
+          var cdCls = remaining <= 5 ? ' soon' : (remaining <= 10 ? ' warn' : '');
+          countdownHtml = '<div class="pc-countdown' + cdCls + '">⏻ Extinction dans ' + remaining + ' min</div>';
+        }
+      }
+    }
+
     var staleBanner = stale
       ? '<div class="pc-stale-banner">⛔ Données figées — backend injoignable. Dernier relevé il y a ' + staleAge + ' (' + (data.timestamp || '?') + ')</div>'
       : '';
@@ -2143,6 +2229,7 @@ app.get('/', async (req, res) => {
       '<div class="pc-mini-bar"><div class="pc-mini-fill" style="width:' + Math.min(100,memPct) + '%;background:' + c(memPct,60,80) + '"></div></div>' +
       '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + memUsed + ' / ' + memTotal + '</span><span>libre ' + memAvail + '</span></div>' +
       vramHtml +
+      countdownHtml +
       '<hr class="divider">' +
       ((name === 'gabriel')
         ? '<div class="pc-llm" id="pc-gabriel-llm">🧠 <strong>—</strong> <span class="pc-status idle">⏳ état…</span></div>'

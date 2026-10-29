@@ -1556,6 +1556,8 @@ app.get('/', async (req, res) => {
   .pc-btn:disabled{opacity:0.4;cursor:not-allowed}
   .pc-btn-danger{background:#2a0a0a;color:#f87171;border-color:#7f1d1d}
   .pc-btn-danger:hover{background:#3b0a0a;border-color:#dc2626}
+  .pc-btn-boot{background:#0a1a2a;color:#93c5fd;border-color:#1e3a5f}
+  .pc-btn-boot:hover{background:#0f2540;border-color:#2563eb}
   .pc-plug-toggle{display:inline-flex;align-items:center;gap:0.3rem;cursor:pointer;font-size:0.72rem;color:#888;padding:0.15rem 0.35rem;user-select:none}
   .pc-plug-slider{width:28px;height:14px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;position:relative;transition:all 0.2s;flex-shrink:0;display:inline-block}
   .pc-plug-slider::after{content:'';position:absolute;top:1.5px;left:2px;width:8px;height:8px;background:#555;border-radius:50%;transition:all 0.2s}
@@ -1758,6 +1760,7 @@ app.get('/', async (req, res) => {
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>
     <div class="pc-actions" id="pc-gabriel-actions" style="display:none">
+      <button class="pc-btn pc-btn-boot" onclick="bootPc('gabriel')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('gabriel','start_llm')">▶ Démarrer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','kill_llm')">⏹ Arrêter LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','shutdown')">⏻ Éteindre</button>
@@ -1776,6 +1779,7 @@ app.get('/', async (req, res) => {
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>
     <div class="pc-actions" id="pc-louis-actions" style="display:none">
+      <button class="pc-btn pc-btn-boot" onclick="bootPc('louis')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('louis','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('louis','kill_llm')">⏹ Kill LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('louis','shutdown')">⏻ Éteindre</button>
@@ -1794,6 +1798,7 @@ app.get('/', async (req, res) => {
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>
     <div class="pc-actions" id="pc-marie-actions" style="display:none">
+      <button class="pc-btn pc-btn-boot" onclick="bootPc('marie')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('marie','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('marie','kill_llm')">⏹ Kill LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('marie','shutdown')">⏻ Éteindre</button>
@@ -1812,6 +1817,7 @@ app.get('/', async (req, res) => {
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>
     <div class="pc-actions" id="pc-boncoin-actions" style="display:none">
+      <button class="pc-btn pc-btn-boot" onclick="bootPc('boncoin')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('boncoin','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('boncoin','kill_llm')">⏹ Kill LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('boncoin','shutdown')">⏻ Éteindre</button>
@@ -2464,11 +2470,13 @@ app.get('/', async (req, res) => {
         };
       }
 
-    // Show last action result
+    // Show last action result (un message Boot + LLM en cours prime sur last_action :
+    // renderPc reconstruit la carte toutes les 10 s et effacerait l avancement)
     var resultEl = document.getElementById('pc-' + name + '-result');
     if (resultEl) {
-      resultEl.textContent = data.last_action || '';
-      if (data.last_action) {
+      var bootMsg = bootMsgs && bootMsgs[name];
+      resultEl.textContent = bootMsg ? bootMsg : (data.last_action || '');
+      if (!bootMsg && data.last_action) {
         setTimeout(function() {
           if (resultEl) resultEl.textContent = '';
         }, 5000);
@@ -2646,6 +2654,8 @@ app.get('/', async (req, res) => {
   // PC Action handler (exposed globally for onclick)
   window.pcAction = function(pc, action, value) {
     var resultEl = document.getElementById('pc-' + pc + '-result');
+    // Un message Boot + LLM n a plus de sens dès qu on lance/arrête à la main
+    if (bootMsgs && action !== 'set_auto_kill') bootMsgs[pc] = '';
     // Feedback visuel immédiat pendant la requête (start_llm peut prendre plusieurs secondes)
     if (resultEl && action === 'start_llm') resultEl.textContent = '⏳ Lancement…';
     if (resultEl && action === 'kill_llm' && pc === 'gabriel') resultEl.textContent = '⏳ Arrêt en cours…';
@@ -2706,6 +2716,76 @@ app.get('/', async (req, res) => {
       if (resultEl) resultEl.textContent = '❌ Erreur réseau';
     });
   };
+
+  // ─── Boot + LLM : un seul bouton (prise -> boot -> LLM) ───────────────────
+  // Le job tourne cote serveur (POST /api/pc-boot) : la page ne fait que lire
+  // l avancement, donc un rechargement (meta refresh 30 s) ne le perd pas.
+  var bootPolling = {};
+  var bootMsgs = {};   // dernier message par PC, re-affiché après chaque renderPc
+
+  window.bootPc = function(pc) {
+    var el = document.getElementById('pc-' + pc + '-result');
+    bootMsgs[pc] = '⏳ Allumage + chargement du LLM…';
+    if (el) el.textContent = bootMsgs[pc];
+    fetch('/api/pc-boot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pc: pc })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(res) {
+      if (!res.ok) { if (el) el.textContent = '❌ ' + (res.error || 'Erreur'); return; }
+      pollBoot(pc);
+    })
+    .catch(function(e) {
+      console.error('bootPc(' + pc + '):', e);
+      if (el) el.textContent = '❌ Erreur réseau';
+    });
+  };
+
+  function bootPhaseLabel(j) {
+    if (j.phase === 'plug') return 'Prise…';
+    if (j.phase === 'boot') return 'Boot en cours';
+    if (j.phase === 'llm') return 'Chargement du LLM';
+    if (j.phase === 'done') return 'LLM prêt';
+    if (j.phase === 'error') return 'Échec';
+    return 'Démarrage';
+  }
+
+  function pollBoot(pc) {
+    if (bootPolling[pc]) return;
+    bootPolling[pc] = true;
+    function tick() {
+      fetch('/api/pc-boot/' + pc)
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (!j || j.idle) { bootPolling[pc] = false; return; }
+        var el = document.getElementById('pc-' + pc + '-result');
+        var line;
+        if (j.done && j.ok) line = '✅ LLM prêt en ' + j.elapsedS + ' s';
+        else if (j.done) line = '❌ ' + (j.error || 'Échec');
+        else line = '⏳ ' + bootPhaseLabel(j) + ' · ' + j.elapsedS + ' s' + (j.lastStep ? ' — ' + j.lastStep : '');
+        if (el) el.textContent = line;
+        bootMsgs[pc] = line;
+        if (!j.done) { setTimeout(tick, 4000); return; }
+        bootPolling[pc] = false;
+        fetch('/api/pc-' + pc).then(function(r) { return r.json(); }).then(function(d) { renderPc(d, pc); }).catch(function() {});
+        fetchPlugState(pc);
+      })
+      .catch(function(e) { console.error('pollBoot(' + pc + '):', e); bootPolling[pc] = false; });
+    }
+    tick();
+  }
+
+  // Au chargement : reprendre l affichage d un job encore en cours (page rechargee)
+  function resumeBoots() {
+    ['gabriel', 'louis', 'marie', 'boncoin'].forEach(function(pc) {
+      fetch('/api/pc-boot/' + pc).then(function(r) { return r.json(); }).then(function(j) {
+        if (j && !j.idle && !j.done) pollBoot(pc);
+      }).catch(function() {});
+    });
+  }
+  resumeBoots();
 
   // Format court d'un montant en euros (3 décimales sous 0,10 €)
   function fmtEurShort(v) {
@@ -3164,6 +3244,180 @@ function fetchSolaire() {
 </html>`);
 });
 
+
+// ─── Boot + LLM : allumer la prise → attendre le boot SSH → lancer le LLM ───
+// Un seul appui, trois étapes, un état lisible par la carte. Contraintes de
+// conception (chacune évite un échec silencieux) :
+//  · la requête HTTP ne dure jamais plus de quelques ms : le travail est un JOB
+//    en mémoire, le front lit l avancement (GET /api/pc-boot/:pc) toutes les 4 s ;
+//  · on n allume JAMAIS une prise vers OFF (le PC peut héberger ce dashboard) :
+//    cette fonctionnalité ne fait que turn_on ;
+//  · une machine déjà debout ne fait pas perdre 5 min d attente : la sonde SSH
+//    est immédiate, l attente ne dure que ce que le boot dure ;
+//  · le LLM n est déclaré prêt que quand /health répond 200 côté machine
+//    (pgrep prouve un process, pas un modèle chargé).
+const BOOT_TARGETS = {
+  gabriel: { ip: '192.168.3.224', ssh: 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6 gab@192.168.3.224' },
+  louis:   { ip: '192.168.3.206', ssh: 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6 gab@192.168.3.206' },
+  marie:   { ip: '192.168.3.57',  ssh: 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6 -i /root/.ssh/id_ed25519_marie gab@192.168.3.57' },
+  boncoin: { ip: '192.168.3.249', ssh: 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6 gab@192.168.3.249' },
+};
+const BOOT_POLL_MS = 8000;      // sonde SSH pendant le boot
+const BOOT_WAIT_MS = 300000;    // 5 min : BIOS + OS (le .224 peut afficher GRUB)
+const LLM_WAIT_MS  = 420000;    // 7 min : chargement (Strata 66-120 s, GGUF 27B ~60 s)
+const bootJobs = {};            // pc -> job en mémoire
+
+function bootElapsedS(job) { return Math.round((Date.now() - job.startedAt) / 1000); }
+
+function bootStep(job, text) {
+  job.steps.push({ s: bootElapsedS(job), text: text });
+  if (job.steps.length > 8) job.steps.shift();
+}
+
+function bootPublic(job) {
+  if (!job) return { ok: true, idle: true, done: true, phase: 'idle', steps: [] };
+  return {
+    ok: !!job.ok, idle: false, pc: job.pc, phase: job.phase, done: job.done, error: job.error,
+    elapsedS: bootElapsedS(job),
+    lastStep: job.steps.length ? job.steps[job.steps.length - 1].text : '',
+    steps: job.steps,
+  };
+}
+
+async function haSwitchState(entityId) {
+  const r = await axios.get(`${HA_BASE}/api/states/${entityId}`, { headers: HA_HEADERS, timeout: 5000 });
+  return r.data.state;
+}
+
+async function haSwitchOn(entityId) {
+  await axios.post(`${HA_BASE}/api/services/switch/turn_on`, { entity_id: entityId }, { headers: HA_HEADERS, timeout: 5000 });
+}
+
+function sshReachable(ssh) {
+  try {
+    return execSync(ssh + " 'echo UP'", { timeout: 20000 }).toString().indexOf('UP') !== -1;
+  } catch (e) { return false; }
+}
+
+// /health répond 200 quand le modèle est chargé, 503 pendant le chargement
+function sshLlmReady(ssh) {
+  try {
+    const out = execSync(ssh + " 'curl -s -m 4 -o /dev/null -w %{http_code} http://127.0.0.1:8080/health'", { timeout: 20000 }).toString().trim();
+    return out.indexOf('200') !== -1;
+  } catch (e) { return false; }
+}
+
+async function runBootJob(pc) {
+  const job = bootJobs[pc];
+  const t = BOOT_TARGETS[pc];
+  try {
+    // 1. Prise
+    job.phase = 'plug';
+    const entityId = getPlugEntity(pc);
+    if (!entityId) {
+      bootStep(job, 'Pas de prise HA pour ce PC');
+    } else {
+      let st = null;
+      try { st = await haSwitchState(entityId); } catch (e) { bootStep(job, 'Etat prise illisible : ' + e.message); }
+      if (st === 'on') {
+        bootStep(job, 'Prise déjà ON');
+      } else {
+        await haSwitchOn(entityId);
+        bootStep(job, 'Prise allumée — attente du courant');
+        for (let i = 0; i < 8; i++) {
+          await sleepMs(2000);
+          try { if (await haSwitchState(entityId) === 'on') break; } catch (e) { /* on continue */ }
+        }
+      }
+    }
+
+    // 2. Machine debout (SSH)
+    job.phase = 'boot';
+    const bootDeadline = Date.now() + BOOT_WAIT_MS;
+    let up = false;
+    let announced = false;
+    while (Date.now() < bootDeadline) {
+      if (sshReachable(t.ssh)) { up = true; break; }
+      if (!announced) { bootStep(job, 'SSH absent — boot en cours'); announced = true; }
+      await sleepMs(BOOT_POLL_MS);
+    }
+    if (!up) {
+      throw new Error('Machine injoignable en SSH après ' + Math.round(BOOT_WAIT_MS / 1000) + ' s (' + t.ip +
+        ') — PC éteint, mauvais OS au boot, ou sshd indisponible');
+    }
+    bootStep(job, 'SSH OK à ' + bootElapsedS(job) + ' s');
+
+    // 3. LLM — ne JAMAIS relancer un serveur déjà prêt : /health 200 avant le
+    //    lancement prouve que le modèle est chargé. Sans ce test, un appui sur
+    //    Boot alors que le LLM tourne déclarait « prêt » en 17 s (le 200 venait
+    //    de l ANCIEN process, que le script allait tuer juste après).
+    job.phase = 'llm';
+    let already = false;
+    if (pc === 'gabriel') {
+      const info0 = await probeLlama224Async(true);
+      already = !!(info0 && info0.health === true);
+    } else {
+      already = sshLlmReady(t.ssh);
+    }
+    if (already) {
+      job.ok = true;
+      job.phase = 'done';
+      bootStep(job, 'LLM déjà en marche sur :8080 — rien à lancer');
+      return;
+    }
+    const launchCmd = t.ssh + " 'nohup ~/script/start-default-llm.sh >/tmp/start-default-llm-dashboard.log 2>&1 & echo OK'";
+    if (pc === 'gabriel') {
+      startLlama224Window(LLM_WAIT_MS);
+      spawnDetached(launchCmd);
+    } else {
+      execSync(launchCmd, { timeout: 20000 });
+    }
+    bootStep(job, 'Lancement LLM demandé');
+
+    const llmDeadline = Date.now() + LLM_WAIT_MS;
+    let ready = false;
+    while (Date.now() < llmDeadline) {
+      await sleepMs(8000);
+      if (pc === 'gabriel') {
+        const info = await probeLlama224Async(true);
+        ready = !!(info && info.health === true);
+      } else {
+        ready = sshLlmReady(t.ssh);
+      }
+      if (ready) break;
+    }
+    if (!ready) {
+      throw new Error('LLM pas prêt après ' + Math.round(LLM_WAIT_MS / 1000) + ' s — voir ' +
+        '/tmp/start-default-llm-dashboard.log sur ' + pc);
+    }
+    job.ok = true;
+    job.phase = 'done';
+    bootStep(job, 'LLM prêt sur :8080 à ' + bootElapsedS(job) + ' s');
+  } catch (e) {
+    job.ok = false;
+    job.phase = 'error';
+    job.error = e.message;
+    bootStep(job, 'Échec : ' + e.message);
+  } finally {
+    job.done = true;
+  }
+}
+
+app.post('/api/pc-boot', (req, res) => {
+  const pc = (req.body || {}).pc;
+  if (!BOOT_TARGETS[pc]) return res.status(400).json({ ok: false, error: 'PC inconnu' });
+  const running = bootJobs[pc];
+  if (running && !running.done) return res.json({ ok: true, already: true, job: bootPublic(running) });
+  bootJobs[pc] = { pc: pc, startedAt: Date.now(), done: false, ok: null, phase: 'plug', error: null, steps: [] };
+  runBootJob(pc).catch((e) => {
+    bootJobs[pc].done = true; bootJobs[pc].ok = false; bootJobs[pc].phase = 'error'; bootJobs[pc].error = e.message;
+  });
+  res.json({ ok: true, started: true, job: bootPublic(bootJobs[pc]) });
+});
+
+app.get('/api/pc-boot/:pc', (req, res) => {
+  res.json(bootPublic(bootJobs[req.params.pc]));
+});
 
 // ─── PC Action (POST) — direct SSH to target machine
 app.post('/api/pc-action', async (req, res) => {

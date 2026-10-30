@@ -8,7 +8,7 @@ const path    = require('path');
 
 const app  = express();
 app.use(express.json());
-const PORT = 3015;
+const PORT = parseInt(process.env.PORT, 10) || 3015;
 const OPENROUTER_KEY = process.env.OPENROUTER_KEY || '';
 const OLLAMA_KEY = process.env.OLLAMA_KEY || '';
 const KIMI_API_KEY = process.env.KIMI_API_KEY || '';
@@ -22,6 +22,15 @@ const DATA_DIR  = path.join(__dirname, 'data');
 const HISTORY_FILE = path.join(DATA_DIR, 'credits_history.json');
 const MAX_HISTORY_DAYS = 30;
 const MIN_INTERVAL_HOURS = 4;
+
+// --- Watchdog extinction PC (cron */15) -----------------------------------
+// Etat du watchdog d'extinction (pc-idle-watchdog.py, cron harry) — lisible dans le conteneur
+// via le mount `/ -> /host`. Surchargeable par env (WATCHDOG_STATE_PATH) pour tester sur l'hote.
+const WATCHDOG_STATE = process.env.WATCHDOG_STATE_PATH || '/host/home/lydstyl/.hermes/cron/output/pc-idle-watchdog/state.json';
+const WATCHDOG_MAP = { louis: 'louis', marie: 'marie', boncoin: 'skillorp' };
+const WATCHDOG_IDLE_MIN = 30;
+const WATCHDOG_TICK_MIN = 15;
+const WATCHDOG_MAX_AGE_MS = 2 * WATCHDOG_TICK_MIN * 60000; // etat plus vieux = cron mort : on se tait
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -394,8 +403,8 @@ function tag(cond1, cond2, l1, l2, l3) {
 const VISIBILITY_FILE = path.join(DATA_DIR, 'card_visibility.json');
 
 const DEFAULT_VISIBILITY = {
-  'credits': true, 'spending-30d': true, 'spending-24h': true,
-  'cpu': true, 'ram': true, 'disk': true, 'ollama': true,
+  'credits': true, 'depenses': true,
+  'systeme': true, 'ollama': true,
   'pc-gabriel': true, 'pc-louis': true, 'pc-marie': true, 'pc-boncoin': true, 'chart': true,
   'energie': true
 };
@@ -420,8 +429,8 @@ const ORDER_FILE = path.join(DATA_DIR, 'card_order.json');
 
 // Ordre par defaut = ordre de rendu du template (cartes + graphique)
 const DEFAULT_ORDER = [
-  'energie', 'credits', 'spending-30d', 'spending-24h',
-  'cpu', 'ram', 'disk', 'ollama', 'pc-gabriel', 'pc-louis', 'pc-marie', 'pc-boncoin', 'chart'
+  'energie', 'credits', 'depenses',
+  'systeme', 'ollama', 'pc-gabriel', 'pc-louis', 'pc-marie', 'pc-boncoin', 'chart'
 ];
 
 function loadCardOrder() {
@@ -534,6 +543,88 @@ function startPcCache() {
   setInterval(update, 15000); // then every 15s
 }
 
+// --- Compte a rebours d extinction : etat du watchdog PC idle ------------
+let _wdState = null;
+let _wdStateTs = 0;
+
+function loadWatchdogState() {
+  const now = Date.now();
+  if (_wdStateTs && (now - _wdStateTs) < 60000) return _wdState; // cache 60 s
+  _wdStateTs = now;
+  try {
+    const mtime = fs.statSync(WATCHDOG_STATE).mtimeMs;
+    // Cron mort ou desactive : l etat n est plus une prevision, on ne montre rien.
+    if (now - mtime > WATCHDOG_MAX_AGE_MS) { _wdState = null; return _wdState; }
+    _wdState = JSON.parse(fs.readFileSync(WATCHDOG_STATE, 'utf8'));
+  } catch (e) {
+    _wdState = null; // fichier absent (hors conteneur) : pas de compte a rebours
+  }
+  return _wdState;
+}
+
+// ⚠️ Le watchdog ecrit des heures LOCALES (Europe/Paris) SANS fuseau ("2026-10-27T11:45:40").
+// Le conteneur tourne en UTC : new Date() y interprete 11:45 comme 11:45 UTC = 12:45 Paris,
+// soit 1 h d avance -> idleMin negatif et compte a rebours faux. On reconstruit donc
+// l instant en interpretant la chaine comme heure de Paris.
+function parisOffsetMs(epochMs) {
+  try {
+    const p = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Europe/Paris', hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    }).formatToParts(new Date(epochMs)).reduce(function (a, x) { a[x.type] = x.value; return a; }, {});
+    const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, (+p.hour) % 24, +p.minute, +p.second);
+    return asUTC - epochMs;
+  } catch (e) {
+    return 0; // Intl indisponible : on degrade vers un decalage nul plutot que vers une ETA fausse
+  }
+}
+
+function parseParisNaive(str) {
+  if (!str || typeof str !== 'string') return null;
+  if (/[Zz]$|[+-]\d{2}:?\d{2}$/.test(str)) { // deja horodate avec fuseau : lecture directe
+    const t = Date.parse(str);
+    return isNaN(t) ? null : t;
+  }
+  const m = /(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/.exec(str);
+  if (!m) return null;
+  const guess = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  return guess - parisOffsetMs(guess);
+}
+
+// "2026-10-27T13:23:00" -> "13:23" (les chiffres de la chaine, independamment du fuseau)
+function hhmmNaive(str) {
+  const m = /[T ](\d{2}):(\d{2})/.exec(str || '');
+  return m ? m[1] + ':' + m[2] : '—';
+}
+
+// null si PC non gere par le watchdog, actif ou eteint. Sinon :
+//   { blocked, cronAt, shutdownAtMs, idleMin }
+function getAutoShutdown(name) {
+  const key = WATCHDOG_MAP[name];
+  if (!key) return null;
+  const st = loadWatchdogState();
+  if (!st || !st[key]) return null;
+  const pc = st[key];
+  if (!pc.idle_since || pc.off_since) return null;
+  const startMs = parseParisNaive(pc.idle_since);
+  if (startMs === null) return null;
+  if (startMs > Date.now()) return null; // horloge incoherente : aucune prevision fiable
+  const idleMin = Math.floor((Date.now() - startMs) / 60000);
+
+  if (pc.blocked_by_cron) {
+    return { blocked: true, cronAt: hhmmNaive(pc.blocked_by_cron), shutdownAtMs: null, idleMin: idleMin };
+  }
+
+  // ETA = idle_since + IDLE_MIN, arrondi au prochain tick de 15 min du cron.
+  const eta = new Date(startMs + WATCHDOG_IDLE_MIN * 60000);
+  const m = eta.getMinutes();
+  let add = (WATCHDOG_TICK_MIN - (m % WATCHDOG_TICK_MIN)) % WATCHDOG_TICK_MIN;
+  if (add === 0 && eta.getSeconds() !== 0) add = WATCHDOG_TICK_MIN;
+  if (add > 0) eta.setMinutes(m + add, 0, 0); else eta.setSeconds(0, 0);
+  return { blocked: false, cronAt: null, shutdownAtMs: eta.getTime(), idleMin: idleMin };
+}
+
 // ─── Réponse /api/pc-* : marque les données figées ───────────────────
 // Le cache survit à la mort du backend. On expose _stale / _age_s pour que le front
 // n'affiche jamais un vieux relevé comme s'il était live.
@@ -544,6 +635,7 @@ function pcPayload(name) {
   const ageS = ts ? Math.round((Date.now() - ts) / 1000) : null;
   const fresh = pcCache[name + 'Ok'] === true;
   return Object.assign({}, d, {
+    auto_shutdown: getAutoShutdown(name),
     _stale: !fresh || (ageS !== null && ageS > PC_STALE_AFTER_S),
     _age_s: ageS,
     _fetched_at: ts ? new Date(ts).toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris' }) : null,
@@ -702,6 +794,207 @@ app.get('/api/llm-224', (req, res) => {
       return res.json({ state: 'stopped', model: null, ctx: null, images: null, health: false, age_s: null, error: err ? err.message : 'sonde indisponible' });
     }
     res.json(Object.assign({ host: LLM224_HOST, port: LLM224_PORT, starting: llama224WindowOpen() }, info));
+  });
+});
+
+// ─── Contrat d'occupation UNIQUE : GET /api/llm-occupancy ───────────────────
+// Un seul contrat, trois consommateurs : le JS de cette page, le plugin cbar
+// (plugin/llm-status.5s.sh) et le tray Windows (windows/llm-tray.ps1).
+//
+// Deux règles de conception, chacune payée par un bug réel :
+//  1. Les sondes d'une machine partent EN PARALLÈLE (2 s max chacune). En séquence
+//     (/health -> /v1/models -> /slots -> /status) une génération lente dépassait 11 s :
+//     le badge n'avait jamais le temps d'apparaître avant le cycle de refresh suivant.
+//  2. busy = OR(/slots[].is_processing, /status.busy). Strata annonce busy avant que le
+//     slot ne soit marqué en traitement : /slots seul fait donc disparaître la tâche en
+//     cours au moment exact où elle commence.
+const OCC_NODES = [
+  { id: 'gabriel', letter: 'G', label: 'Gabriel .224', host: LLM224_HOST, port: LLM224_PORT, engine: 'strata' },
+  { id: 'marie', letter: 'M', label: 'Marie .57', host: '192.168.3.57', port: 8080, engine: 'llama' },
+  { id: 'louis', letter: 'L', label: 'Louis .206', host: '192.168.3.206', port: 8080, engine: 'llama' },
+];
+const OCC_CACHE_MS = 1000;      // cache court : page 3 s + plugin 5 s + tray 5 s = 1 sonde/s max
+const OCC_TIMEOUT_MS = 2000;    // par appel, jamais bloquant
+const OCC = { cache: null, cacheTs: 0, inflight: null, models: {}, modelsTs: {}, prompts: {} };
+
+function occJson(host, port, urlPath) {
+  return new Promise((resolve) => {
+    httpGetJson(host, port, urlPath, OCC_TIMEOUT_MS, (err, data) => {
+      resolve({ ok: !err, data: err ? null : data, error: err ? err.message : null });
+    });
+  });
+}
+
+// /slots[].n_prompt_tokens = le DERNIER prompt traité (ni moyenne ni historique), n_ctx = le
+// contexte DU SLOT (llama.cpp avec -np 2 renvoie le contexte par slot, pas le total).
+function occSlotsStats(slots) {
+  const out = { slots: 0, active: 0, prompt_tokens: null, n_ctx: null };
+  if (!Array.isArray(slots) || slots.length === 0) return out;
+  out.slots = slots.length;
+  let best = null;
+  slots.forEach((s) => {
+    if (!s || typeof s !== 'object') return;
+    if (s.is_processing === true) out.active += 1;
+    const p = (typeof s.n_prompt_tokens === 'number' && s.n_prompt_tokens > 0) ? s.n_prompt_tokens : null;
+    if (p !== null && (best === null || p > best.p)) {
+      best = { p: p, n: (typeof s.n_ctx === 'number' && s.n_ctx > 0) ? s.n_ctx : null };
+    }
+  });
+  if (best) {
+    out.prompt_tokens = best.p;
+    out.n_ctx = best.n;
+  }
+  return out;
+}
+
+// ≈ Compactions : un serveur LLM ne voit que des requêtes HTTP, une compaction est un
+// événement du HARNAIS (réécriture de l'historique). Heuristique honnête : une chute de plus
+// de 40 % du prompt entre deux requêtes successives du même nœud = compaction probable —
+// indiscernable d'une nouvelle session, d'où le « ≈ » affiché et le mot « estimées ».
+function occTrackPrompt(id, promptTokens, ts) {
+  const st = OCC.prompts[id] || (OCC.prompts[id] = { seen: null, changedAt: null, prev: null, compactions: 0, lastDropTs: null });
+  if (typeof promptTokens === 'number' && promptTokens > 0 && st.seen !== promptTokens) {
+    if (typeof st.seen === 'number' && promptTokens < st.seen * 0.6) {
+      st.compactions += 1;
+      st.lastDropTs = ts;
+    }
+    st.prev = st.seen;
+    st.seen = promptTokens;
+    st.changedAt = ts;
+  }
+  return st;
+}
+
+// La carte PC (collecteur SSH/Windows) répond-elle encore ? Elle distingue « serveur arrêté »
+// (machine joignable, LLM éteint) de « hors ligne » (machine muette).
+function occCardFresh(name) {
+  const d = pcCache[name];
+  if (!d) return false;
+  const ts = pcCacheTs[name] || 0;
+  return pcCache[name + 'Ok'] === true && ts > 0 && (Date.now() - ts) < 180000;
+}
+
+async function occProbeNode(node) {
+  const ts = Date.now();
+  let slotsRes = null, statusRes = null, healthRes = null, propsRes = null;
+  if (node.engine === 'strata') {
+    const r = await Promise.all([
+      occJson(node.host, node.port, '/slots'),
+      occJson(node.host, node.port, '/status'),
+      occJson(node.host, node.port, '/health'),
+    ]);
+    slotsRes = r[0]; statusRes = r[1]; healthRes = r[2];
+  } else {
+    // /props pèse ~10 Ko : relu seulement si le modèle est inconnu ou vieux de 5 min.
+    const needProps = !OCC.models[node.id] || (Date.now() - (OCC.modelsTs[node.id] || 0)) > 300000;
+    const r = await Promise.all([
+      occJson(node.host, node.port, '/slots'),
+      needProps ? occJson(node.host, node.port, '/props') : Promise.resolve(null),
+    ]);
+    slotsRes = r[0]; propsRes = r[1];
+  }
+  const slots = (slotsRes && slotsRes.ok && Array.isArray(slotsRes.data)) ? slotsRes.data : null;
+  const st = (statusRes && statusRes.ok && statusRes.data && typeof statusRes.data === 'object') ? statusRes.data : null;
+  const health = (healthRes && healthRes.ok && healthRes.data && typeof healthRes.data === 'object') ? healthRes.data : null;
+  const props = (propsRes && propsRes.ok && propsRes.data && typeof propsRes.data === 'object') ? propsRes.data : null;
+
+  const stats = occSlotsStats(slots);
+
+  let model = OCC.models[node.id] || null;
+  if (health && health.model) model = String(health.model);
+  if (props && props.model_path) model = String(props.model_path).split('/').pop() || model;
+  if (model) { OCC.models[node.id] = model; OCC.modelsTs[node.id] = Date.now(); }
+
+  let nctx = stats.n_ctx;
+  if (!nctx && health && typeof health.max_context === 'number') nctx = health.max_context;
+  if (!nctx && props && props.default_generation_settings && typeof props.default_generation_settings.n_ctx === 'number') {
+    nctx = props.default_generation_settings.n_ctx;
+  }
+
+  const online = !!(slots || st || health);
+  let state = 'online';
+  if (!online) state = occCardFresh(node.id) ? 'stopped' : 'offline';
+
+  const promptTokens = stats.prompt_tokens !== null ? stats.prompt_tokens
+    : ((st && typeof st.prompt_tokens === 'number') ? st.prompt_tokens : null);
+  const track = occTrackPrompt(node.id, promptTokens, ts);
+
+  const active = stats.active;
+  const busySlots = active > 0;
+  const busyStatus = !!(st && st.busy === true);
+  const queued = (st && typeof st.queued === 'number') ? st.queued : 0;
+  const ctxPct = (promptTokens !== null && nctx) ? Math.round((promptTokens / nctx) * 1000) / 10 : null;
+  const ctxAgeS = track.changedAt ? Math.round((ts - track.changedAt) / 1000) : null;
+
+  const errors = [];
+  if (slotsRes && !slotsRes.ok) errors.push('/slots: ' + slotsRes.error);
+  if (statusRes && !statusRes.ok) errors.push('/status: ' + statusRes.error);
+  if (healthRes && !healthRes.ok) errors.push('/health: ' + healthRes.error);
+
+  return {
+    id: node.id, letter: node.letter, label: node.label, engine: node.engine,
+    state: state, model: model, port: node.port,
+    slots: stats.slots || (state === 'online' ? 1 : 0),
+    active: active,
+    queued: queued,
+    busy: (state === 'online') && (busySlots || busyStatus),
+    busy_slots: busySlots,          // debug : ce que dit /slots
+    busy_status: busyStatus,        // debug : ce que dit /status (Strata seul)
+    phase: (st && st.phase) ? String(st.phase) : null,
+    generated: (st && typeof st.generated === 'number') ? st.generated : null,
+    tokens_per_s: (st && typeof st.tokens_per_s === 'number') ? st.tokens_per_s : null,
+    elapsed_s: (st && typeof st.elapsed_s === 'number') ? st.elapsed_s : null,
+    prompt_tokens: promptTokens,
+    prompt_prev: (typeof track.prev === 'number') ? track.prev : null,
+    ctx_age_s: ctxAgeS,
+    n_ctx: nctx,
+    ctx_pct: ctxPct,
+    compactions_est: track.compactions,
+    last_compaction_at: track.lastDropTs ? new Date(track.lastDropTs).toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris' }) : null,
+    vision: !!((health && health.images === true) || (props && props.mmproj_path)),
+    starting: node.engine === 'strata' ? llama224WindowOpen() : false,
+    ts: ts,
+    errors: errors,
+  };
+}
+
+function getOccupancy() {
+  const now = Date.now();
+  if (OCC.cache && (now - OCC.cacheTs) < OCC_CACHE_MS) return Promise.resolve(OCC.cache);
+  if (OCC.inflight) return OCC.inflight;   // une seule sonde à la fois, quel que soit le nombre de clients
+  OCC.inflight = Promise.all(OCC_NODES.map(occProbeNode)).then((nodes) => {
+    const payload = {
+      ts: Date.now(),
+      fetched_at: new Date().toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris' }),
+      nodes: nodes,
+    };
+    OCC.cache = payload;
+    OCC.cacheTs = Date.now();
+    OCC.inflight = null;
+    return payload;
+  }).catch((e) => {
+    OCC.inflight = null;
+    if (OCC.cache) return Object.assign({}, OCC.cache, { error: e.message });
+    return { ts: Date.now(), fetched_at: null, nodes: [], error: e.message };
+  });
+  return OCC.inflight;
+}
+
+app.get('/api/llm-occupancy', (req, res) => {
+  getOccupancy().then((payload) => {
+    const now = Date.now();
+    res.json({
+      ts: payload.ts,
+      fetched_at: payload.fetched_at,
+      age_s: Math.round((now - payload.ts) / 100) / 10,
+      cache_ms: OCC_CACHE_MS,
+      error: payload.error || null,
+      nodes: (payload.nodes || []).map((n) => Object.assign({}, n, {
+        age_s: Math.round((now - (n.ts || payload.ts)) / 100) / 10,
+      })),
+    });
+  }).catch((e) => {
+    res.status(500).json({ nodes: [], error: e.message });
   });
 });
 
@@ -1194,6 +1487,10 @@ app.get('/', async (req, res) => {
   .pc-llm-link:hover{background:#0f2540;color:#93c5fd;border-color:#2563eb}
   .pc-llm-link-row{line-height:1.1}
   .pc-stale-banner{background:#2a0a0a;color:#fca5a5;border:1px solid #7f1d1d;border-radius:6px;padding:0.35rem 0.5rem;font-size:0.68rem;margin-bottom:0.45rem;line-height:1.3}
+  .pc-countdown{margin-top:.45rem;font-size:.72rem;font-weight:600;color:#fbbf24}
+  .pc-countdown.warn{color:#fb923c}
+  .pc-countdown.soon{color:#f87171}
+  .pc-countdown.blocked{color:#94a3b8}
   .proc-row{display:flex;justify-content:space-between;align-items:center;font-size:0.7rem;margin-top:0.25rem;font-family:'SF Mono','Fira Code','Consolas',monospace}
   .proc-row .proc-cpu{color:#4ade80;font-weight:600;min-width:2.2rem;text-align:right}
   .proc-row .proc-cmd{color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;margin-left:0.5rem}
@@ -1225,6 +1522,10 @@ app.get('/', async (req, res) => {
   .pc-llm{font-size:0.72rem;color:#9ca3af;margin-top:0.3rem}
   .pc-llm strong{color:#e0e0e0;font-weight:500}
   .pc-ctx-badge{display:inline-block;padding:0.08rem 0.4rem;border-radius:8px;font-size:0.62rem;font-weight:600;background:#1e293b;color:#93c5fd;margin-left:0.3rem;vertical-align:middle}
+  .pc-ctx-bar{height:3px;background:#1e293b;border-radius:2px;margin-top:0.25rem;overflow:hidden}
+  .pc-ctx-fill{height:100%;border-radius:2px}
+  .pc-ctx-detail{display:block;font-size:0.62rem;color:#64748b;margin-top:0.15rem}
+  .pc-occ-phase{font-size:0.6rem;color:#6b7280;margin-top:0.1rem}
   .pc-speed-wrap{margin-top:0.5rem;border-top:1px dashed #1f1f1f;padding-top:0.45rem}
   .pc-speed-wrap:empty{display:none;border-top:none;padding-top:0}
   .pc-speed-row{display:flex;justify-content:space-between;align-items:baseline;font-size:0.7rem;color:#888}
@@ -1255,6 +1556,8 @@ app.get('/', async (req, res) => {
   .pc-btn:disabled{opacity:0.4;cursor:not-allowed}
   .pc-btn-danger{background:#2a0a0a;color:#f87171;border-color:#7f1d1d}
   .pc-btn-danger:hover{background:#3b0a0a;border-color:#dc2626}
+  .pc-btn-boot{background:#0a1a2a;color:#93c5fd;border-color:#1e3a5f}
+  .pc-btn-boot:hover{background:#0f2540;border-color:#2563eb}
   .pc-plug-toggle{display:inline-flex;align-items:center;gap:0.3rem;cursor:pointer;font-size:0.72rem;color:#888;padding:0.15rem 0.35rem;user-select:none}
   .pc-plug-slider{width:28px;height:14px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;position:relative;transition:all 0.2s;flex-shrink:0;display:inline-block}
   .pc-plug-slider::after{content:'';position:absolute;top:1.5px;left:2px;width:8px;height:8px;background:#555;border-radius:50%;transition:all 0.2s}
@@ -1311,6 +1614,7 @@ app.get('/', async (req, res) => {
   /* Solaire */
   .solaire-kw{font-size:0.8rem;color:#666;margin-top:-0.2rem}
   .solaire-cols{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+  .solaire-gauge-row{grid-column:1 / -1;text-align:center}
   .solaire-col-label{font-size:0.7rem;color:#555;margin-bottom:0.3rem}
   .solaire-col-val{font-size:1.15rem;font-weight:700;line-height:1.1}
   .solaire-col-sub{font-size:0.7rem;color:#555;margin-top:0.2rem}
@@ -1321,6 +1625,16 @@ app.get('/', async (req, res) => {
   .solaire-detail{font-size:0.68rem;color:#555;margin-top:0.15rem}
   .solaire-price{font-size:0.65rem;color:#3a3a3a;margin-top:0.5rem;cursor:pointer}
   .solaire-price:hover{color:#60a5fa}
+  .gauge-wrap{width:100%;max-width:235px;margin:0 auto}
+  .gauge-svg{width:100%;height:auto;display:block}
+  .gauge-arc{stroke-width:8;opacity:0.9;stroke-linecap:round}
+  .gauge-ticks line{stroke:#9ca3af;stroke-width:2}
+  .gauge-labels text{fill:#6b7280;font-size:9px;text-anchor:middle}
+  .gauge-needle{transform-box:fill-box;transform-origin:50% 100%;transition:transform 0.9s cubic-bezier(0.4,0,0.2,1)}
+  .gauge-needle polygon{fill:#1f2937}
+  .gauge-hub{fill:#1f2937}
+  .gauge-value{text-align:center;font-size:1.55rem;font-weight:700;color:#fbbf24;line-height:1.1;margin-top:-1px}
+  .gauge-unit{font-size:0.7rem;font-weight:400}
 </style>
 </head>
 <body>
@@ -1344,11 +1658,8 @@ app.get('/', async (req, res) => {
   <div class="settings-hint">Glisser-déposer une carte par sa poignée ⠿ pour la placer où tu veux.<button class="settings-reset" onclick="resetCardOrder()">↺ Ordre par défaut</button></div>
   <div class="settings-grid">
     <label class="settings-row" data-card-id="credits"><span class="s-icon">💳</span><input type="checkbox"${vis('credits')?' checked':''}><span class="s-toggle"></span><span class="s-label">Crédits</span></label>
-    <label class="settings-row" data-card-id="spending-30d"><span class="s-icon">📊</span><input type="checkbox"${vis('spending-30d')?' checked':''}><span class="s-toggle"></span><span class="s-label">Dépenses 30j</span></label>
-    <label class="settings-row" data-card-id="spending-24h"><span class="s-icon">⏰</span><input type="checkbox"${vis('spending-24h')?' checked':''}><span class="s-toggle"></span><span class="s-label">Dépenses 24h</span></label>
-    <label class="settings-row" data-card-id="cpu"><span class="s-icon">🖥️</span><input type="checkbox"${vis('cpu')?' checked':''}><span class="s-toggle"></span><span class="s-label">CPU</span></label>
-    <label class="settings-row" data-card-id="ram"><span class="s-icon">🧠</span><input type="checkbox"${vis('ram')?' checked':''}><span class="s-toggle"></span><span class="s-label">RAM</span></label>
-    <label class="settings-row" data-card-id="disk"><span class="s-icon">💾</span><input type="checkbox"${vis('disk')?' checked':''}><span class="s-toggle"></span><span class="s-label">Disque dur</span></label>
+    <label class="settings-row" data-card-id="depenses"><span class="s-icon">💰</span><input type="checkbox"${vis('depenses')?' checked':''}><span class="s-toggle"></span><span class="s-label">Dépenses LLM (30j + 24h)</span></label>
+    <label class="settings-row" data-card-id="systeme"><span class="s-icon">🖥️</span><input type="checkbox"${vis('systeme')?' checked':''}><span class="s-toggle"></span><span class="s-label">Système (CPU/RAM/Disque)</span></label>
     <label class="settings-row" data-card-id="ollama"><span class="s-icon">🦙</span><input type="checkbox"${vis('ollama')?' checked':''}><span class="s-toggle"></span><span class="s-label">Ollama Cloud</span></label>
     <label class="settings-row" data-card-id="pc-gabriel"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-gabriel')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Gabriel</span></label>
     <label class="settings-row" data-card-id="pc-louis"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-louis')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC Louis</span></label>
@@ -1365,9 +1676,21 @@ app.get('/', async (req, res) => {
   <div class="card ${visHidden('energie')}" data-card-id="energie"${orderOf('energie')} >
     <div class="card-header"><span class="icon">⚡</span><span class="card-title">Énergie en temps réel</span></div>
     <div class="solaire-cols">
-      <div class="solaire-col">
+      <div class="solaire-gauge-row">
         <div class="solaire-col-label">☀️ Production solaire</div>
-        <div class="solaire-col-val" style="color:#fbbf24"><span id="energie-prod-w">—<span style="font-size:0.7rem;font-weight:400">W</span></span></div>
+        <div class="gauge-wrap">
+          <svg class="gauge-svg" viewBox="0 0 220 124" aria-hidden="true">
+            <defs><linearGradient id="gaugeGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#22c55e"/><stop offset="0.6" stop-color="#fbbf24"/><stop offset="1" stop-color="#ef4444"/></linearGradient></defs>
+            <path class="gauge-arc" d="M 22 110 A 88 88 0 0 1 198 110" fill="none" stroke="url(#gaugeGrad)"/>
+            <g class="gauge-ticks"><line x1="32" y1="110" x2="22" y2="110"/><line x1="54.9" y1="54.9" x2="47.8" y2="47.8"/><line x1="110" y1="32" x2="110" y2="22"/><line x1="165.2" y1="54.9" x2="172.3" y2="47.8"/><line x1="188" y1="110" x2="198" y2="110"/></g>
+            <g class="gauge-labels"><text x="46" y="114">0</text><text x="64.7" y="67.7">250</text><text x="110" y="49">500</text><text x="155.3" y="67.7">750</text><text x="174" y="114">1000</text></g>
+            <g id="energie-gauge-needle" class="gauge-needle" style="transform:rotate(-90deg)"><polygon points="110,36 106,110 114,110"/></g>
+            <circle class="gauge-hub" cx="110" cy="110" r="7"/>
+          </svg>
+          <div class="gauge-value" id="energie-prod-w">—<span class="gauge-unit">W</span></div>
+        </div>
+      </div>
+      <div class="solaire-col">
         <div class="solaire-col-sub" id="energie-prod-kw">—</div>
         <div class="solaire-eur" id="energie-prod-eur" style="color:#fbbf24">—</div>
         <div class="solaire-detail" id="energie-prod-detail">—</div>
@@ -1398,70 +1721,46 @@ app.get('/', async (req, res) => {
     <a href="https://platform.deepseek.com/top_up" target="_blank" style="color:#4ade80;font-size:0.75rem;display:inline-block;margin-top:0.6rem">↗ Recharger DeepSeek</a>
   </div>
 
-  <!-- DÉPENSES 30 JOURS -->
-  <div class="card ${visHidden('spending-30d')}" data-card-id="spending-30d"${orderOf('spending-30d')} >
-    <div class="card-header"><span class="icon">📊</span><span class="card-title">Dépenses — 30 derniers jours</span></div>
-    <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending.total.toFixed(2)}<span>$</span></div>
+  <!-- DÉPENSES LLM : 30 jours + 24 h dans une seule carte -->
+  <div class="card ${visHidden('depenses')}" data-card-id="depenses"${orderOf('depenses')} >
+    <div class="card-header"><span class="icon">💰</span><span class="card-title">Dépenses LLM</span></div>
+    <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending.total.toFixed(2)}<span>$ · 30 j</span></div>
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:0.4rem;font-size:0.8rem"><span style="color:#888">Dernières 24 h</span><span style="color:#fbbf24;font-weight:700">${spending24h.total.toFixed(3)} $</span></div>
     <hr class="divider">
-    <div class="row"><span class="label">OpenRouter (30j)</span><span class="val" style="color:#60a5fa">${spending.or.toFixed(2)} $</span></div>
+    <div class="row" style="opacity:0.65"><span class="label">Provider</span><span class="val-muted">30 j · 24 h</span></div>
+    <div class="row"><span class="label">OpenRouter</span><span class="val" style="color:#60a5fa">${spending.or.toFixed(2)} $ · ${spending24h.or.toFixed(3)} $</span></div>
     <div class="row"><span class="label">OpenRouter (ce mois, API)</span><span class="val" style="color:#60a5fa">${live.ok ? live.usageMonthly.toFixed(2) + ' $' : '—'}</span></div>
-    <div class="row"><span class="label">Kimi</span><span class="val" style="color:#a78bfa">${spending.kimi.toFixed(2)} $</span></div>
-    <div class="row"><span class="label">DeepSeek</span><span class="val" style="color:#4ade80">${spending.deepseek.toFixed(2)} $</span></div>
-    <div class="note">Basé sur la somme des baisses de solde. Les rechargements ne sont pas comptés comme dépenses.</div>
+    <div class="row"><span class="label">Kimi</span><span class="val" style="color:#a78bfa">${spending.kimi.toFixed(2)} $ · ${spending24h.kimi.toFixed(3)} $</span></div>
+    <div class="row"><span class="label">DeepSeek</span><span class="val" style="color:#4ade80">${spending.deepseek.toFixed(2)} $ · ${spending24h.deepseek.toFixed(3)} $</span></div>
+    <div class="note">Somme des baisses de solde · relevés ~6 h.</div>
   </div>
 
-  <!-- DÉPENSES 24H -->
-  <div class="card ${visHidden('spending-24h')}" data-card-id="spending-24h"${orderOf('spending-24h')} >
-    <div class="card-header"><span class="icon">⏰</span><span class="card-title">Dépenses — 24 dernières heures</span></div>
-    <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending24h.total.toFixed(2)}<span>$</span></div>
-    <hr class="divider">
-    <div class="row"><span class="label">OpenRouter (24h)</span><span class="val" style="color:#60a5fa">${spending24h.or.toFixed(3)} $</span></div>
-    <div class="row"><span class="label">Kimi (24h)</span><span class="val" style="color:#a78bfa">${spending24h.kimi.toFixed(3)} $</span></div>
-    <div class="row"><span class="label">DeepSeek (24h)</span><span class="val" style="color:#4ade80">${spending24h.deepseek.toFixed(3)} $</span></div>
-    <div class="note">Basé sur les relevés de solde ~toutes les 6h.</div>
-  </div>
-
-  <!-- CPU -->
-  <div class="card ${visHidden('cpu')}" data-card-id="cpu"${orderOf('cpu')} >
-    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">CPU</span></div>
+  <!-- SYSTÈME : CPU + RAM + Disque réunis dans une seule carte -->
+  <div class="card ${visHidden('systeme')}" data-card-id="systeme"${orderOf('systeme')} >
+    <div class="card-header"><span class="icon">🖥️</span><span class="card-title">Système — serveur</span></div>
     <div class="big-value" style="color:${cc}">${sys.cpuPct}<span>%</span></div>
     ${bar(sys.cpuPct, cc)}
-    <hr class="divider">
     <div class="row"><span class="label">Load avg (1m)</span><span class="val">${sys.load1}</span></div>
     <div class="row"><span class="label">Cœurs logiques</span><span class="val">${sys.cpuCount}</span></div>
     ${tag(parseFloat(sys.cpuPct) < 50, parseFloat(sys.cpuPct) < 80, '✓ Normal', '⚠ Élevé', '✕ Critique')}
-    <hr class="divider">
     <div id="top-processes">
       <div class="proc-row" style="text-align:center;padding:0;color:#444;font-size:0.7rem">⏳ Top process…</div>
     </div>
-  </div>
-
-  <!-- RAM -->
-  <div class="card ${visHidden('ram')}" data-card-id="ram"${orderOf('ram')} >
-    <div class="card-header"><span class="icon">🧠</span><span class="card-title">Mémoire RAM</span></div>
+    <hr class="divider">
     <div class="big-value" style="color:${rc}">${mem.usedByApps}<span>GB apps</span></div>
     <div class="bar-bg">
       <div class="bar-fill" style="width:${Math.min(100,parseFloat(mem.appsPct))}%;background:${rc}"></div>
       <div class="bar-fill bar-cache" style="width:${Math.min(100,parseFloat(mem.appsPct)+parseFloat(cachePct))}%;background:#4ade80;opacity:0.12"></div>
     </div>
-    <hr class="divider">
     <div class="row"><span class="label">Disponible pour apps</span><span class="val" style="color:#4ade80">${mem.available} GB</span></div>
     <div class="row"><span class="label">Cache disque (libérable)</span><span class="val-muted">${mem.cache} GB</span></div>
     <div class="row"><span class="label">Total VM</span><span class="val">${mem.total} GB</span></div>
     ${parseFloat(mem.swapUsed) > 0.01 ? `<div class="row"><span class="label">Swap utilisé</span><span class="val" style="color:#facc15">${mem.swapUsed} / ${mem.swapTotal} GB</span></div>` : ''}
     ${tag(parseFloat(mem.appsPct) < 50, parseFloat(mem.appsPct) < 75, '✓ Normal', '⚠ Élevé', '✕ Critique')}
-    <div class="note">
-      <strong>Proxmox affiche ${mem.proxmoxPct}% utilisé</strong> car il compte le cache disque.<br>
-      Le vrai usage par les processus est <strong style="color:#aaa">${mem.appsPct}%</strong> — ${mem.available} GB sont librement disponibles.
-    </div>
-  </div>
-
-  <!-- DISK -->
-  <div class="card ${visHidden('disk')}" data-card-id="disk"${orderOf('disk')} >
-    <div class="card-header"><span class="icon">💾</span><span class="card-title">Disque dur</span></div>
+    <div class="note">Proxmox affiche ${mem.proxmoxPct}% (cache disque inclus) · usage réel des processus <strong style="color:#aaa">${mem.appsPct}%</strong> · ${mem.available} GB libres</div>
+    <hr class="divider">
     <div class="big-value" style="color:${dc}">${disk.used}<span>GB utilisés</span></div>
     ${bar(disk.usedPct, dc)}
-    <hr class="divider">
     <div class="row"><span class="label">Espace libre</span><span class="val" style="color:#4ade80">${disk.avail} GB</span></div>
     <div class="row"><span class="label">Capacité totale</span><span class="val">${disk.total} GB</span></div>
     <div class="row"><span class="label">Utilisation</span><span class="val">${disk.usedPct}%</span></div>
@@ -1484,6 +1783,7 @@ app.get('/', async (req, res) => {
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>
     <div class="pc-actions" id="pc-gabriel-actions" style="display:none">
+      <button class="pc-btn pc-btn-boot" onclick="bootPc('gabriel')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('gabriel','start_llm')">▶ Démarrer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','kill_llm')">⏹ Arrêter LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','shutdown')">⏻ Éteindre</button>
@@ -1502,6 +1802,7 @@ app.get('/', async (req, res) => {
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>
     <div class="pc-actions" id="pc-louis-actions" style="display:none">
+      <button class="pc-btn pc-btn-boot" onclick="bootPc('louis')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('louis','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('louis','kill_llm')">⏹ Kill LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('louis','shutdown')">⏻ Éteindre</button>
@@ -1520,6 +1821,7 @@ app.get('/', async (req, res) => {
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>
     <div class="pc-actions" id="pc-marie-actions" style="display:none">
+      <button class="pc-btn pc-btn-boot" onclick="bootPc('marie')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('marie','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('marie','kill_llm')">⏹ Kill LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('marie','shutdown')">⏻ Éteindre</button>
@@ -1538,6 +1840,7 @@ app.get('/', async (req, res) => {
       <div style="text-align:center;padding:1rem 0;color:#555;font-size:0.8rem">⏳ Chargement…</div>
     </div>
     <div class="pc-actions" id="pc-boncoin-actions" style="display:none">
+      <button class="pc-btn pc-btn-boot" onclick="bootPc('boncoin')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('boncoin','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('boncoin','kill_llm')">⏹ Kill LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('boncoin','shutdown')">⏻ Éteindre</button>
@@ -2131,6 +2434,23 @@ app.get('/', async (req, res) => {
         '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + vramDetail + '</span><span>' + vramTemp + '</span></div>';
     }
 
+    // Compte a rebours d extinction (watchdog PC idle). PC actif => aucune ligne.
+    var countdownHtml = '';
+    var asd = data.auto_shutdown;
+    if (asd && !stale) {
+      if (asd.blocked) {
+        countdownHtml = '<div class="pc-countdown blocked">⏻ Extinction suspendue (cron ' + (asd.cronAt || '—') + ')</div>';
+      } else if (asd.shutdownAtMs) {
+        var remaining = Math.round((asd.shutdownAtMs - Date.now()) / 60000);
+        if (remaining <= 0) {
+          countdownHtml = '<div class="pc-countdown soon">⏻ Extinction imminente</div>';
+        } else {
+          var cdCls = remaining <= 5 ? ' soon' : (remaining <= 10 ? ' warn' : '');
+          countdownHtml = '<div class="pc-countdown' + cdCls + '">⏻ Extinction dans ' + remaining + ' min</div>';
+        }
+      }
+    }
+
     var staleBanner = stale
       ? '<div class="pc-stale-banner">⛔ Données figées — backend injoignable. Dernier relevé il y a ' + staleAge + ' (' + (data.timestamp || '?') + ')</div>'
       : '';
@@ -2143,9 +2463,13 @@ app.get('/', async (req, res) => {
       '<div class="pc-mini-bar"><div class="pc-mini-fill" style="width:' + Math.min(100,memPct) + '%;background:' + c(memPct,60,80) + '"></div></div>' +
       '<div style="font-size:0.7rem;color:#666;margin-top:0.15rem;display:flex;justify-content:space-between"><span>' + memUsed + ' / ' + memTotal + '</span><span>libre ' + memAvail + '</span></div>' +
       vramHtml +
+      countdownHtml +
       '<hr class="divider">' +
-      ((name === 'gabriel')
-        ? '<div class="pc-llm" id="pc-gabriel-llm">🧠 <strong>—</strong> <span class="pc-status idle">⏳ état…</span></div>'
+      ((name === 'gabriel' || name === 'louis' || name === 'marie')
+        ? '<div class="pc-llm" id="pc-' + name + '-llm">' + llmPanelHtml(name,
+            (name === 'gabriel')
+              ? '🧠 <strong>—</strong> <span class="pc-status idle">⏳ état…</span>'
+              : '🧠 <strong>' + llmModelTxt + '</strong>' + llmCtxBadgeTxt + ' ' + llmStateHtml + llmVisionBadge + llmActivityBadge) + '</div>'
         : '<div class="pc-llm" id="pc-' + name + '-llm">🧠 <strong>' + llmModelTxt + '</strong>' + llmCtxBadgeTxt + ' ' + llmStateHtml + llmVisionBadge + llmActivityBadge + '</div>') +
       ((!stale && llmStatus) ? '<div class="pc-llm" style="margin-top:0.15rem;font-size:0.68rem">RSS: ' + llmRss + ' · ↑ ' + llmUptime + '</div>' : '') +
       speedBlockHtml(name) +
@@ -2169,11 +2493,13 @@ app.get('/', async (req, res) => {
         };
       }
 
-    // Show last action result
+    // Show last action result (un message Boot + LLM en cours prime sur last_action :
+    // renderPc reconstruit la carte toutes les 10 s et effacerait l avancement)
     var resultEl = document.getElementById('pc-' + name + '-result');
     if (resultEl) {
-      resultEl.textContent = data.last_action || '';
-      if (data.last_action) {
+      var bootMsg = bootMsgs && bootMsgs[name];
+      resultEl.textContent = bootMsg ? bootMsg : (data.last_action || '');
+      if (!bootMsg && data.last_action) {
         setTimeout(function() {
           if (resultEl) resultEl.textContent = '';
         }, 5000);
@@ -2185,68 +2511,145 @@ app.get('/', async (req, res) => {
     updateAlertBanner();
   }
 
-  // ── État du LLM du .224 (Strata ou llama.cpp) ────────────────────────────
-  // Lu sur /api/llm-224 (sonde HTTP /health + /v1/models côté serveur), JAMAIS sur les
-  // process : le .224 change de moteur et Strata (Python) n'a aucun llama-server.
-  // ⚠️ Ce bloc vit dans une template literal : pas de backtick, pas d'interpolation, pas d'antislash.
-  var _llm224Busy = false;
-  var _llm224StartTs = 0;
+  // ── Occupation des LLM locaux : GET /api/llm-occupancy ───────────────────
+  // Ce bloc est le SEUL consommateur front de l occupation (les 3 machines), et le même
+  // contrat est lu par le plugin cbar et le tray Windows.
+  // Trois règles, chacune payée par un bug réel :
+  //  · sonde toutes les 3 s, INDÉPENDAMMENT du refresh 10 s des cartes : avec l ancien
+  //    cycle, une requête LLM de 4 s n apparaissait jamais ;
+  //  · le dernier état connu (_occNodes) n est jamais effacé, et le placeholder « état… »
+  //    ne revient jamais après le premier rendu ;
+  //  · fetch avec AbortController + 5 s : sans timeout, un probe qui traîne figeait le badge
+  //    et le verrou _occBusy bloquait tous les cycles suivants.
+  // ⚠️ Ce bloc vit dans une template literal : pas de backtick, pas d antislash, pas d apostrophe.
+  var _occNodes = {};
+  var _occBusy = false;
 
+  function occNum(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
+
+  function occEsc(s) {
+    return String(s).split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;');
+  }
+
+  function occCtxHtml(n) {
+    var pct = occNum(n.ctx_pct);
+    if (pct === null) { return ''; }
+    var txt = (pct > 0 && pct < 1) ? '< 1 %' : Math.round(pct) + ' %';
+    // prompt_tokens = le DERNIER prompt traité : au-delà de 60 s sans nouvelle requête la
+    // valeur n est plus forcément celle du contexte courant -> « ~ ».
+    var age = occNum(n.ctx_age_s);
+    if (!n.busy && age !== null && age > 60) { txt = '~' + txt; }
+    var col = pct >= 85 ? '#f87171' : (pct >= 60 ? '#facc15' : '#4ade80');
+    var html = ' <span class="pc-ctx-badge">ctx ' + txt + '</span>';
+    html = html + '<div class="pc-ctx-bar"><div class="pc-ctx-fill" style="width:' + Math.min(100, pct) + '%;background:' + col + '"></div></div>';
+    if (occNum(n.prompt_tokens) !== null && occNum(n.n_ctx) !== null) {
+      html = html + '<span class="pc-ctx-detail">' + n.prompt_tokens + ' / ' + n.n_ctx + ' tok</span>';
+    }
+    return html;
+  }
+
+  function occStatusHtml(n) {
+    if (n.state === 'offline') { return '<span class="pc-status off">● Hors ligne</span>'; }
+    if (n.state === 'stopped') { return '<span class="pc-status off">● Arrêté</span>'; }
+    if (n.starting) { return '<span class="pc-status busy">● En cours de démarrage…</span>'; }
+    var html = '<span class="pc-status on">● En marche :' + (n.port || 8080) + '</span>';
+    if (n.vision) { html = html + ' <span class="pc-status img">🖼 vision</span>'; }
+    var queued = occNum(n.queued) || 0;
+    if (n.busy) {
+      html = html + ' <span class="pc-status busy">⚡ TACHE EN COURS</span>';
+      if (queued > 0) { html = html + ' <span class="pc-status busy">⏳ FILE ' + queued + '</span>'; }
+      var det = '';
+      if (occNum(n.tokens_per_s) !== null) { det = det + n.tokens_per_s + ' t/s'; }
+      if (occNum(n.generated) !== null && n.generated > 0) { det = det + (det ? ' · ' : '') + n.generated + ' tok'; }
+      if (occNum(n.elapsed_s) !== null) { det = det + (det ? ' · ' : '') + n.elapsed_s + ' s'; }
+      if (det) { html = html + ' <span class="pc-status idle">' + det + '</span>'; }
+      if (n.phase) { html = html + '<div class="pc-occ-phase">' + occEsc(n.phase) + '</div>'; }
+    } else if (queued > 0) {
+      html = html + ' <span class="pc-status busy">⏳ FILE ' + queued + '</span>';
+    } else {
+      html = html + ' <span class="pc-status idle">LIBRE</span>';
+    }
+    return html;
+  }
+
+  function renderOccNode(n) {
+    if (!n) { return ''; }
+    var modelTxt = n.model ? n.model : (n.state === 'online' ? 'modèle inconnu' : '—');
+    if (modelTxt.length > 46) { modelTxt = modelTxt.slice(0, 43) + '…'; }
+    var html = '🧠 <strong>' + occEsc(modelTxt) + '</strong>';
+    if (n.state === 'online') { html = html + occCtxHtml(n); }
+    html = html + ' ' + occStatusHtml(n);
+    if (occNum(n.compactions_est) > 0) {
+      html = html + ' <span class="pc-ctx-badge">≈ ' + n.compactions_est + ' compaction(s)</span>';
+    }
+    return html;
+  }
+
+  // Rendu d une carte PC : l occupation connue prime sur le repli fourni par renderPc.
+  function llmPanelHtml(name, fallback) {
+    var n = _occNodes[name];
+    if (n) { return renderOccNode(n); }
+    return fallback;
+  }
+
+  // Compatibilité : ancien contrat /api/llm-224 (utilisé après start_llm / kill_llm et par
+  // les tests). On convertit sa forme vers celle d un nœud d occupation.
   function renderLlm224(info) {
     var el = document.getElementById('pc-gabriel-llm');
-    if (!el) return;
-    var html = '';
-    if (info.state === 'stopped') {
-      html = '🧠 <strong>—</strong> <span class="pc-status off">● Arrêté</span>';
-    } else if (info.state === 'starting') {
-      html = '🧠 <strong>démarrage…</strong> <span class="pc-status busy">● En cours de démarrage…</span> <span class="pc-status idle">(66-120 s, première charge)</span>';
-    } else if (info.state === 'running') {
-      var modelTxt = info.model ? info.model : 'modèle inconnu';
-      html = '🧠 <strong>' + modelTxt + '</strong>';
-      if (info.ctx) { html += ' <span class="pc-ctx-badge">ctx ' + formatCtxSize(info.ctx) + '</span>'; }
-      html += ' <span class="pc-status on">● En marche :8080</span>';
-      if (info.images === true) { html += ' <span class="pc-status img">🖼 vision</span>'; }
-      // Occupation — même badge que les cartes Louis/Marie, mais lu sur /slots (Strata n'a
-      // pas de processus llama-server : c'est le badge du backend SSE qui manquait ici).
-      if (info.busy === true) {
-        html += ' <span class="pc-status busy">⚡ TACHE EN COURS</span>';
-        var act = info.activity || null;
-        var det = '';
-        if (act) {
-          if (act.tokens_per_s) { det += act.tokens_per_s + ' t/s'; }
-          if (act.generated) { det += (det ? ' · ' : '') + act.generated + ' tok'; }
-          if (typeof act.elapsed_s === 'number') { det += (det ? ' · ' : '') + act.elapsed_s + ' s'; }
-        }
-        if (det) { html += ' <span class="pc-status idle">' + det + '</span>'; }
-      } else if (info.busy === false) {
-        html += ' <span class="pc-status idle">LIBRE</span>';
-      }
-    } else {
-      html = '🧠 <strong>—</strong> <span class="pc-status off">● État inconnu</span>';
-    }
-    el.innerHTML = html;
+    if (!el || !info) { return; }
+    var act = info.activity || {};
+    var n = {
+      id: 'gabriel',
+      state: info.state === 'running' ? 'online' : (info.state === 'starting' ? 'online' : (info.state === 'stopped' ? 'stopped' : 'offline')),
+      starting: info.state === 'starting',
+      model: info.model || null,
+      port: info.port || 8080,
+      busy: info.busy === true,
+      queued: (occNum(info.queued) !== null) ? info.queued : (occNum(act.queued) || 0),
+      vision: (info.vision === true) || (info.images === true),
+      tokens_per_s: occNum(act.tokens_per_s) !== null ? act.tokens_per_s : occNum(info.tokens_per_s),
+      generated: occNum(act.generated) !== null ? act.generated : occNum(info.generated),
+      elapsed_s: occNum(act.elapsed_s) !== null ? act.elapsed_s : occNum(info.elapsed_s),
+      phase: info.phase || act.phase || null,
+      ctx_pct: occNum(info.ctx_pct),
+      prompt_tokens: occNum(info.prompt_tokens),
+      n_ctx: occNum(info.n_ctx) !== null ? info.n_ctx : occNum(info.ctx),
+      ctx_age_s: 0,
+      compactions_est: occNum(info.compactions_est) || 0
+    };
+    el.innerHTML = renderOccNode(n);
   }
 
-  function refreshLlm224() {
-    if (_llm224Busy) return;
-    _llm224Busy = true;
-    fetch('/api/llm-224').then(function(r) { return r.json(); }).then(function(data) {
-      _llm224Busy = false;
-      renderLlm224(data);
-      // Pendant un démarrage on re-sonde toutes les 5 s, mais jamais plus de 4 min
-      // (au-delà : le démarrage a échoué, on laisse la carte dire « Arrêté »).
-      if (data && data.state === 'starting') {
-        if (!_llm224StartTs) _llm224StartTs = Date.now();
-        if ((Date.now() - _llm224StartTs) < 240000) setTimeout(function() { refreshLlm224(); }, 5000);
-      } else {
-        _llm224StartTs = 0;
-      }
-    }).catch(function(e) {
-      _llm224Busy = false;
-      _llm224StartTs = 0;
-      renderLlm224({ state: 'unknown', error: 'réseau' });
+  function renderOccAll() {
+    ['gabriel', 'louis', 'marie'].forEach(function(id) {
+      var el = document.getElementById('pc-' + id + '-llm');
+      var n = _occNodes[id];
+      if (el && n) { el.innerHTML = renderOccNode(n); }
     });
   }
+
+  function pollOccupancy() {
+    if (_occBusy) { return; }
+    _occBusy = true;
+    var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var opts = { cache: 'no-store' };
+    if (ctl) { opts.signal = ctl.signal; }
+    var tid = setTimeout(function() { if (ctl) { try { ctl.abort(); } catch (e) {} } }, 5000);
+    fetch('/api/llm-occupancy', opts).then(function(r) { return r.json(); }).then(function(data) {
+      clearTimeout(tid);
+      _occBusy = false;
+      var nodes = (data && data.nodes) ? data.nodes : [];
+      for (var i = 0; i < nodes.length; i++) {
+        if (nodes[i] && nodes[i].id) { _occNodes[nodes[i].id] = nodes[i]; }
+      }
+      renderOccAll();
+    }).catch(function() {
+      clearTimeout(tid);
+      _occBusy = false;   // jamais de verrou permanent : le tick suivant retente
+    });
+  }
+
+  function refreshLlm224() { pollOccupancy(); }
 
   function refreshAll() {
     fetch('/api/pc-gabriel').then(function(r){return r.json();}).then(function(d){renderPc(d,'gabriel');}).catch(function(e){console.error('pc-gabriel:',e);});
@@ -2274,6 +2677,8 @@ app.get('/', async (req, res) => {
   // PC Action handler (exposed globally for onclick)
   window.pcAction = function(pc, action, value) {
     var resultEl = document.getElementById('pc-' + pc + '-result');
+    // Un message Boot + LLM n a plus de sens dès qu on lance/arrête à la main
+    if (bootMsgs && action !== 'set_auto_kill') bootMsgs[pc] = '';
     // Feedback visuel immédiat pendant la requête (start_llm peut prendre plusieurs secondes)
     if (resultEl && action === 'start_llm') resultEl.textContent = '⏳ Lancement…';
     if (resultEl && action === 'kill_llm' && pc === 'gabriel') resultEl.textContent = '⏳ Arrêt en cours…';
@@ -2334,6 +2739,76 @@ app.get('/', async (req, res) => {
       if (resultEl) resultEl.textContent = '❌ Erreur réseau';
     });
   };
+
+  // ─── Boot + LLM : un seul bouton (prise -> boot -> LLM) ───────────────────
+  // Le job tourne cote serveur (POST /api/pc-boot) : la page ne fait que lire
+  // l avancement, donc un rechargement (meta refresh 30 s) ne le perd pas.
+  var bootPolling = {};
+  var bootMsgs = {};   // dernier message par PC, re-affiché après chaque renderPc
+
+  window.bootPc = function(pc) {
+    var el = document.getElementById('pc-' + pc + '-result');
+    bootMsgs[pc] = '⏳ Allumage + chargement du LLM…';
+    if (el) el.textContent = bootMsgs[pc];
+    fetch('/api/pc-boot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pc: pc })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(res) {
+      if (!res.ok) { if (el) el.textContent = '❌ ' + (res.error || 'Erreur'); return; }
+      pollBoot(pc);
+    })
+    .catch(function(e) {
+      console.error('bootPc(' + pc + '):', e);
+      if (el) el.textContent = '❌ Erreur réseau';
+    });
+  };
+
+  function bootPhaseLabel(j) {
+    if (j.phase === 'plug') return 'Prise…';
+    if (j.phase === 'boot') return 'Boot en cours';
+    if (j.phase === 'llm') return 'Chargement du LLM';
+    if (j.phase === 'done') return 'LLM prêt';
+    if (j.phase === 'error') return 'Échec';
+    return 'Démarrage';
+  }
+
+  function pollBoot(pc) {
+    if (bootPolling[pc]) return;
+    bootPolling[pc] = true;
+    function tick() {
+      fetch('/api/pc-boot/' + pc)
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (!j || j.idle) { bootPolling[pc] = false; return; }
+        var el = document.getElementById('pc-' + pc + '-result');
+        var line;
+        if (j.done && j.ok) line = '✅ LLM prêt en ' + j.elapsedS + ' s';
+        else if (j.done) line = '❌ ' + (j.error || 'Échec');
+        else line = '⏳ ' + bootPhaseLabel(j) + ' · ' + j.elapsedS + ' s' + (j.lastStep ? ' — ' + j.lastStep : '');
+        if (el) el.textContent = line;
+        bootMsgs[pc] = line;
+        if (!j.done) { setTimeout(tick, 4000); return; }
+        bootPolling[pc] = false;
+        fetch('/api/pc-' + pc).then(function(r) { return r.json(); }).then(function(d) { renderPc(d, pc); }).catch(function() {});
+        fetchPlugState(pc);
+      })
+      .catch(function(e) { console.error('pollBoot(' + pc + '):', e); bootPolling[pc] = false; });
+    }
+    tick();
+  }
+
+  // Au chargement : reprendre l affichage d un job encore en cours (page rechargee)
+  function resumeBoots() {
+    ['gabriel', 'louis', 'marie', 'boncoin'].forEach(function(pc) {
+      fetch('/api/pc-boot/' + pc).then(function(r) { return r.json(); }).then(function(j) {
+        if (j && !j.idle && !j.done) pollBoot(pc);
+      }).catch(function() {});
+    });
+  }
+  resumeBoots();
 
   // Format court d'un montant en euros (3 décimales sous 0,10 €)
   function fmtEurShort(v) {
@@ -2411,7 +2886,10 @@ function fetchSolaire() {
 
     if (!d || !d.ok) {
       window._energyData = {};
-      prodW.textContent = '—';
+      prodW.innerHTML = '— ' + W('W');
+      prodW.style.color = '#fbbf24';
+      var needleBad = document.getElementById('energie-gauge-needle');
+      if (needleBad) needleBad.style.transform = 'rotate(-90deg)';
       prodKw.textContent = '⛔ Énergie indisponible';
       prodEur.textContent = '';
       prodDetail.textContent = '';
@@ -2434,6 +2912,12 @@ function fetchSolaire() {
     var cabOk = d.cabanonOk === true || d.cabanonOk === 'true';
 
     prodW.innerHTML = prod + ' ' + W('W');
+    var gauge = document.getElementById('energie-gauge-needle');
+    if (gauge) {
+      var frac = Math.max(0, Math.min(1, (d.prodW || 0) / 1000));
+      gauge.style.transform = 'rotate(' + (-90 + 180 * frac) + 'deg)';
+      prodW.style.color = prod > 1000 ? '#ef4444' : '#fbbf24';
+    }
     prodKw.textContent = ((d.prodW || 0) / 1000).toFixed(2).replace('.', ',') + ' kW';
     prodEur.textContent = '💰 ' + eur(d.prodEurH) + ' / h · ≈ ' + eur(d.prodEurMonth) + ' / mois économisés';
     prodEur.title = 'Économie estimée au rythme actuel : par heure puis projection sur 30 jours (720 h)';
@@ -2511,6 +2995,10 @@ function fetchSolaire() {
 
   initToggles();
   refreshAll();
+  // Occupation des LLM : sonde dédiée toutes les 3 s, INDÉPENDANTE du refresh 10 s des
+  // cartes. C est ce qui rend visible une requête de 4 s (le cycle de 10 s la manquait).
+  pollOccupancy();
+  setInterval(pollOccupancy, 3000);
   // Refresh adaptatif : 10s onglet visible, 60s onglet caché (économie de requêtes)
   var REFRESH_VISIBLE = 10000;
   var REFRESH_HIDDEN = 60000;
@@ -2788,6 +3276,180 @@ function fetchSolaire() {
 </html>`);
 });
 
+
+// ─── Boot + LLM : allumer la prise → attendre le boot SSH → lancer le LLM ───
+// Un seul appui, trois étapes, un état lisible par la carte. Contraintes de
+// conception (chacune évite un échec silencieux) :
+//  · la requête HTTP ne dure jamais plus de quelques ms : le travail est un JOB
+//    en mémoire, le front lit l avancement (GET /api/pc-boot/:pc) toutes les 4 s ;
+//  · on n allume JAMAIS une prise vers OFF (le PC peut héberger ce dashboard) :
+//    cette fonctionnalité ne fait que turn_on ;
+//  · une machine déjà debout ne fait pas perdre 5 min d attente : la sonde SSH
+//    est immédiate, l attente ne dure que ce que le boot dure ;
+//  · le LLM n est déclaré prêt que quand /health répond 200 côté machine
+//    (pgrep prouve un process, pas un modèle chargé).
+const BOOT_TARGETS = {
+  gabriel: { ip: '192.168.3.224', ssh: 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6 gab@192.168.3.224' },
+  louis:   { ip: '192.168.3.206', ssh: 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6 gab@192.168.3.206' },
+  marie:   { ip: '192.168.3.57',  ssh: 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6 -i /root/.ssh/id_ed25519_marie gab@192.168.3.57' },
+  boncoin: { ip: '192.168.3.249', ssh: 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6 gab@192.168.3.249' },
+};
+const BOOT_POLL_MS = 8000;      // sonde SSH pendant le boot
+const BOOT_WAIT_MS = 300000;    // 5 min : BIOS + OS (le .224 peut afficher GRUB)
+const LLM_WAIT_MS  = 420000;    // 7 min : chargement (Strata 66-120 s, GGUF 27B ~60 s)
+const bootJobs = {};            // pc -> job en mémoire
+
+function bootElapsedS(job) { return Math.round((Date.now() - job.startedAt) / 1000); }
+
+function bootStep(job, text) {
+  job.steps.push({ s: bootElapsedS(job), text: text });
+  if (job.steps.length > 8) job.steps.shift();
+}
+
+function bootPublic(job) {
+  if (!job) return { ok: true, idle: true, done: true, phase: 'idle', steps: [] };
+  return {
+    ok: !!job.ok, idle: false, pc: job.pc, phase: job.phase, done: job.done, error: job.error,
+    elapsedS: bootElapsedS(job),
+    lastStep: job.steps.length ? job.steps[job.steps.length - 1].text : '',
+    steps: job.steps,
+  };
+}
+
+async function haSwitchState(entityId) {
+  const r = await axios.get(`${HA_BASE}/api/states/${entityId}`, { headers: HA_HEADERS, timeout: 5000 });
+  return r.data.state;
+}
+
+async function haSwitchOn(entityId) {
+  await axios.post(`${HA_BASE}/api/services/switch/turn_on`, { entity_id: entityId }, { headers: HA_HEADERS, timeout: 5000 });
+}
+
+function sshReachable(ssh) {
+  try {
+    return execSync(ssh + " 'echo UP'", { timeout: 20000 }).toString().indexOf('UP') !== -1;
+  } catch (e) { return false; }
+}
+
+// /health répond 200 quand le modèle est chargé, 503 pendant le chargement
+function sshLlmReady(ssh) {
+  try {
+    const out = execSync(ssh + " 'curl -s -m 4 -o /dev/null -w %{http_code} http://127.0.0.1:8080/health'", { timeout: 20000 }).toString().trim();
+    return out.indexOf('200') !== -1;
+  } catch (e) { return false; }
+}
+
+async function runBootJob(pc) {
+  const job = bootJobs[pc];
+  const t = BOOT_TARGETS[pc];
+  try {
+    // 1. Prise
+    job.phase = 'plug';
+    const entityId = getPlugEntity(pc);
+    if (!entityId) {
+      bootStep(job, 'Pas de prise HA pour ce PC');
+    } else {
+      let st = null;
+      try { st = await haSwitchState(entityId); } catch (e) { bootStep(job, 'Etat prise illisible : ' + e.message); }
+      if (st === 'on') {
+        bootStep(job, 'Prise déjà ON');
+      } else {
+        await haSwitchOn(entityId);
+        bootStep(job, 'Prise allumée — attente du courant');
+        for (let i = 0; i < 8; i++) {
+          await sleepMs(2000);
+          try { if (await haSwitchState(entityId) === 'on') break; } catch (e) { /* on continue */ }
+        }
+      }
+    }
+
+    // 2. Machine debout (SSH)
+    job.phase = 'boot';
+    const bootDeadline = Date.now() + BOOT_WAIT_MS;
+    let up = false;
+    let announced = false;
+    while (Date.now() < bootDeadline) {
+      if (sshReachable(t.ssh)) { up = true; break; }
+      if (!announced) { bootStep(job, 'SSH absent — boot en cours'); announced = true; }
+      await sleepMs(BOOT_POLL_MS);
+    }
+    if (!up) {
+      throw new Error('Machine injoignable en SSH après ' + Math.round(BOOT_WAIT_MS / 1000) + ' s (' + t.ip +
+        ') — PC éteint, mauvais OS au boot, ou sshd indisponible');
+    }
+    bootStep(job, 'SSH OK à ' + bootElapsedS(job) + ' s');
+
+    // 3. LLM — ne JAMAIS relancer un serveur déjà prêt : /health 200 avant le
+    //    lancement prouve que le modèle est chargé. Sans ce test, un appui sur
+    //    Boot alors que le LLM tourne déclarait « prêt » en 17 s (le 200 venait
+    //    de l ANCIEN process, que le script allait tuer juste après).
+    job.phase = 'llm';
+    let already = false;
+    if (pc === 'gabriel') {
+      const info0 = await probeLlama224Async(true);
+      already = !!(info0 && info0.health === true);
+    } else {
+      already = sshLlmReady(t.ssh);
+    }
+    if (already) {
+      job.ok = true;
+      job.phase = 'done';
+      bootStep(job, 'LLM déjà en marche sur :8080 — rien à lancer');
+      return;
+    }
+    const launchCmd = t.ssh + " 'nohup ~/script/start-default-llm.sh >/tmp/start-default-llm-dashboard.log 2>&1 & echo OK'";
+    if (pc === 'gabriel') {
+      startLlama224Window(LLM_WAIT_MS);
+      spawnDetached(launchCmd);
+    } else {
+      execSync(launchCmd, { timeout: 20000 });
+    }
+    bootStep(job, 'Lancement LLM demandé');
+
+    const llmDeadline = Date.now() + LLM_WAIT_MS;
+    let ready = false;
+    while (Date.now() < llmDeadline) {
+      await sleepMs(8000);
+      if (pc === 'gabriel') {
+        const info = await probeLlama224Async(true);
+        ready = !!(info && info.health === true);
+      } else {
+        ready = sshLlmReady(t.ssh);
+      }
+      if (ready) break;
+    }
+    if (!ready) {
+      throw new Error('LLM pas prêt après ' + Math.round(LLM_WAIT_MS / 1000) + ' s — voir ' +
+        '/tmp/start-default-llm-dashboard.log sur ' + pc);
+    }
+    job.ok = true;
+    job.phase = 'done';
+    bootStep(job, 'LLM prêt sur :8080 à ' + bootElapsedS(job) + ' s');
+  } catch (e) {
+    job.ok = false;
+    job.phase = 'error';
+    job.error = e.message;
+    bootStep(job, 'Échec : ' + e.message);
+  } finally {
+    job.done = true;
+  }
+}
+
+app.post('/api/pc-boot', (req, res) => {
+  const pc = (req.body || {}).pc;
+  if (!BOOT_TARGETS[pc]) return res.status(400).json({ ok: false, error: 'PC inconnu' });
+  const running = bootJobs[pc];
+  if (running && !running.done) return res.json({ ok: true, already: true, job: bootPublic(running) });
+  bootJobs[pc] = { pc: pc, startedAt: Date.now(), done: false, ok: null, phase: 'plug', error: null, steps: [] };
+  runBootJob(pc).catch((e) => {
+    bootJobs[pc].done = true; bootJobs[pc].ok = false; bootJobs[pc].phase = 'error'; bootJobs[pc].error = e.message;
+  });
+  res.json({ ok: true, started: true, job: bootPublic(bootJobs[pc]) });
+});
+
+app.get('/api/pc-boot/:pc', (req, res) => {
+  res.json(bootPublic(bootJobs[req.params.pc]));
+});
 
 // ─── PC Action (POST) — direct SSH to target machine
 app.post('/api/pc-action', async (req, res) => {

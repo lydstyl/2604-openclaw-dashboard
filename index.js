@@ -1614,6 +1614,7 @@ app.get('/', async (req, res) => {
   /* Solaire */
   .solaire-kw{font-size:0.8rem;color:#666;margin-top:-0.2rem}
   .solaire-cols{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+  .solaire-gauge-row{grid-column:1 / -1;text-align:center}
   .solaire-col-label{font-size:0.7rem;color:#555;margin-bottom:0.3rem}
   .solaire-col-val{font-size:1.15rem;font-weight:700;line-height:1.1}
   .solaire-col-sub{font-size:0.7rem;color:#555;margin-top:0.2rem}
@@ -1624,6 +1625,16 @@ app.get('/', async (req, res) => {
   .solaire-detail{font-size:0.68rem;color:#555;margin-top:0.15rem}
   .solaire-price{font-size:0.65rem;color:#3a3a3a;margin-top:0.5rem;cursor:pointer}
   .solaire-price:hover{color:#60a5fa}
+  .gauge-wrap{width:100%;max-width:235px;margin:0 auto}
+  .gauge-svg{width:100%;height:auto;display:block}
+  .gauge-arc{stroke-width:8;opacity:0.9;stroke-linecap:round}
+  .gauge-ticks line{stroke:#9ca3af;stroke-width:2}
+  .gauge-labels text{fill:#6b7280;font-size:9px;text-anchor:middle}
+  .gauge-needle{transform-box:fill-box;transform-origin:50% 100%;transition:transform 0.9s cubic-bezier(0.4,0,0.2,1)}
+  .gauge-needle polygon{fill:#1f2937}
+  .gauge-hub{fill:#1f2937}
+  .gauge-value{text-align:center;font-size:1.55rem;font-weight:700;color:#fbbf24;line-height:1.1;margin-top:-1px}
+  .gauge-unit{font-size:0.7rem;font-weight:400}
 </style>
 </head>
 <body>
@@ -1665,9 +1676,21 @@ app.get('/', async (req, res) => {
   <div class="card ${visHidden('energie')}" data-card-id="energie"${orderOf('energie')} >
     <div class="card-header"><span class="icon">⚡</span><span class="card-title">Énergie en temps réel</span></div>
     <div class="solaire-cols">
-      <div class="solaire-col">
+      <div class="solaire-gauge-row">
         <div class="solaire-col-label">☀️ Production solaire</div>
-        <div class="solaire-col-val" style="color:#fbbf24"><span id="energie-prod-w">—<span style="font-size:0.7rem;font-weight:400">W</span></span></div>
+        <div class="gauge-wrap">
+          <svg class="gauge-svg" viewBox="0 0 220 124" aria-hidden="true">
+            <defs><linearGradient id="gaugeGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#22c55e"/><stop offset="0.6" stop-color="#fbbf24"/><stop offset="1" stop-color="#ef4444"/></linearGradient></defs>
+            <path class="gauge-arc" d="M 22 110 A 88 88 0 0 1 198 110" fill="none" stroke="url(#gaugeGrad)"/>
+            <g class="gauge-ticks"><line x1="32" y1="110" x2="22" y2="110"/><line x1="54.9" y1="54.9" x2="47.8" y2="47.8"/><line x1="110" y1="32" x2="110" y2="22"/><line x1="165.2" y1="54.9" x2="172.3" y2="47.8"/><line x1="188" y1="110" x2="198" y2="110"/></g>
+            <g class="gauge-labels"><text x="46" y="114">0</text><text x="64.7" y="67.7">250</text><text x="110" y="49">500</text><text x="155.3" y="67.7">750</text><text x="174" y="114">1000</text></g>
+            <g id="energie-gauge-needle" class="gauge-needle" style="transform:rotate(-90deg)"><polygon points="110,36 106,110 114,110"/></g>
+            <circle class="gauge-hub" cx="110" cy="110" r="7"/>
+          </svg>
+          <div class="gauge-value" id="energie-prod-w">—<span class="gauge-unit">W</span></div>
+        </div>
+      </div>
+      <div class="solaire-col">
         <div class="solaire-col-sub" id="energie-prod-kw">—</div>
         <div class="solaire-eur" id="energie-prod-eur" style="color:#fbbf24">—</div>
         <div class="solaire-detail" id="energie-prod-detail">—</div>
@@ -2863,7 +2886,10 @@ function fetchSolaire() {
 
     if (!d || !d.ok) {
       window._energyData = {};
-      prodW.textContent = '—';
+      prodW.innerHTML = '— ' + W('W');
+      prodW.style.color = '#fbbf24';
+      var needleBad = document.getElementById('energie-gauge-needle');
+      if (needleBad) needleBad.style.transform = 'rotate(-90deg)';
       prodKw.textContent = '⛔ Énergie indisponible';
       prodEur.textContent = '';
       prodDetail.textContent = '';
@@ -2886,6 +2912,12 @@ function fetchSolaire() {
     var cabOk = d.cabanonOk === true || d.cabanonOk === 'true';
 
     prodW.innerHTML = prod + ' ' + W('W');
+    var gauge = document.getElementById('energie-gauge-needle');
+    if (gauge) {
+      var frac = Math.max(0, Math.min(1, (d.prodW || 0) / 1000));
+      gauge.style.transform = 'rotate(' + (-90 + 180 * frac) + 'deg)';
+      prodW.style.color = prod > 1000 ? '#ef4444' : '#fbbf24';
+    }
     prodKw.textContent = ((d.prodW || 0) / 1000).toFixed(2).replace('.', ',') + ' kW';
     prodEur.textContent = '💰 ' + eur(d.prodEurH) + ' / h · ≈ ' + eur(d.prodEurMonth) + ' / mois économisés';
     prodEur.title = 'Économie estimée au rythme actuel : par heure puis projection sur 30 jours (720 h)';

@@ -2784,8 +2784,17 @@ document.addEventListener('click', function(e){
     var html = '<span class="pc-status on">● En marche :' + (n.port || 8080) + '</span>';
     if (n.vision) { html = html + ' <span class="pc-status img">🖼 vision</span>'; }
     var queued = occNum(n.queued) || 0;
+    // Compteur de slots : affiche X/N taches quand le serveur a PLUSIEURS slots (Marie :
+    // parallel 2). Les nœuds à 1 slot gardent le badge générique, sinon "0/1" = bruit.
+    var slotsTot = occNum(n.slots);
+    var slotsAct = occNum(n.active);
+    var multiSlots = slotsTot !== null && slotsTot > 1 && slotsAct !== null;
     if (n.busy) {
-      html = html + ' <span class="pc-status busy">⚡ TACHE EN COURS</span>';
+      if (multiSlots && slotsAct > 0) {
+        html = html + ' <span class="pc-status busy">⚡ ' + slotsAct + '/' + slotsTot + (slotsAct > 1 ? ' tâches' : ' tâche') + ' en cours</span>';
+      } else {
+        html = html + ' <span class="pc-status busy">⚡ TACHE EN COURS</span>';
+      }
       if (queued > 0) { html = html + ' <span class="pc-status busy">⏳ FILE ' + queued + '</span>'; }
       var det = '';
       if (occNum(n.tokens_per_s) !== null) { det = det + n.tokens_per_s + ' t/s'; }
@@ -2795,6 +2804,8 @@ document.addEventListener('click', function(e){
       if (n.phase) { html = html + '<div class="pc-occ-phase">' + occEsc(n.phase) + '</div>'; }
     } else if (queued > 0) {
       html = html + ' <span class="pc-status busy">⏳ FILE ' + queued + '</span>';
+    } else if (multiSlots) {
+      html = html + ' <span class="pc-status idle">LIBRE · 0/' + slotsTot + ' tâche</span>';
     } else {
       html = html + ' <span class="pc-status idle">LIBRE</span>';
     }

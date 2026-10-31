@@ -888,6 +888,7 @@ const OCC_NODES = [
   { id: 'gabriel', letter: 'G', label: 'Gabriel .224', host: LLM224_HOST, port: LLM224_PORT, engine: 'strata' },
   { id: 'marie', letter: 'M', label: 'Marie .57', host: '192.168.3.57', port: 8080, engine: 'llama' },
   { id: 'louis', letter: 'L', label: 'Louis .206', host: '192.168.3.206', port: 8080, engine: 'llama' },
+  { id: 'boncoin', letter: 'S', label: 'SkillORP .249', host: '192.168.3.249', port: 8080, engine: 'llama' },
 ];
 const OCC_CACHE_MS = 1000;      // cache court : page 3 s + plugin 5 s + tray 5 s = 1 sonde/s max
 const OCC_TIMEOUT_MS = 2000;    // par appel, jamais bloquant
@@ -2693,7 +2694,7 @@ document.addEventListener('click', function(e){
       vramHtml +
       countdownHtml +
       '<hr class="divider">' +
-      ((name === 'gabriel' || name === 'louis' || name === 'marie')
+      ((name === 'gabriel' || name === 'louis' || name === 'marie' || name === 'boncoin')
         ? '<div class="pc-llm" id="pc-' + name + '-llm">' + llmPanelHtml(name,
             (name === 'gabriel')
               ? '🧠 <strong>—</strong> <span class="pc-status idle">⏳ état…</span>'
@@ -2849,7 +2850,7 @@ document.addEventListener('click', function(e){
   }
 
   function renderOccAll() {
-    ['gabriel', 'louis', 'marie'].forEach(function(id) {
+    ['gabriel', 'louis', 'marie', 'boncoin'].forEach(function(id) {
       var el = document.getElementById('pc-' + id + '-llm');
       var n = _occNodes[id];
       if (el && n) { el.innerHTML = renderOccNode(n); }

@@ -8,6 +8,8 @@ const path    = require('path');
 
 const app  = express();
 app.use(express.json());
+// SortableJS servi en local (pas de dep CDN : le dashboard tourne en LAN)
+app.get('/sortable.min.js', (req, res) => res.sendFile(path.join(__dirname, 'sortable.min.js')));
 const PORT = parseInt(process.env.PORT, 10) || 3015;
 const OPENROUTER_KEY = process.env.OPENROUTER_KEY || '';
 const OLLAMA_KEY = process.env.OLLAMA_KEY || '';
@@ -403,6 +405,7 @@ function tag(cond1, cond2, l1, l2, l3) {
 const VISIBILITY_FILE = path.join(DATA_DIR, 'card_visibility.json');
 
 const DEFAULT_VISIBILITY = {
+  'meteo': true, 'liens': true,
   'credits': true, 'depenses': true,
   'systeme': true, 'ollama': true,
   'pc-gabriel': true, 'pc-louis': true, 'pc-marie': true, 'pc-boncoin': true, 'chart': true,
@@ -429,7 +432,7 @@ const ORDER_FILE = path.join(DATA_DIR, 'card_order.json');
 
 // Ordre par defaut = ordre de rendu du template (cartes + graphique)
 const DEFAULT_ORDER = [
-  'energie', 'credits', 'depenses',
+  'energie', 'meteo', 'liens', 'credits', 'depenses',
   'systeme', 'ollama', 'pc-gabriel', 'pc-louis', 'pc-marie', 'pc-boncoin', 'chart'
 ];
 
@@ -462,6 +465,79 @@ function saveCardOrder(order) {
   DEFAULT_ORDER.forEach(function(id) { if (clean.indexOf(id) === -1) clean.push(id); });
   fs.writeFileSync(ORDER_FILE, JSON.stringify(clean, null, 2));
   return clean;
+}
+
+// ─── Météo Valenciennes (Open-Meteo, sans clé) ────────────────────────────
+// Prévisions 3 jours (aujourd'hui / demain / après-demain). Cache 15 min en mémoire
+// pour ne pas marteler l'API à chaque refresh de page (meta refresh 30 s).
+const WEATHER_CACHE = { ts: 0, data: null };
+const WEATHER_TTL_MS = 15 * 60 * 1000;
+
+// Codes météo WMO → icône + libellé (soleil / pluie en priorité)
+const WMO_MAP = {
+  0: ['☀️', 'Ensoleillé'], 1: ['⛅', 'Plutôt beau'], 2: ['⛅', 'Variable'], 3: ['☁️', 'Couvert'],
+  45: ['🌫️', 'Brouillard'], 48: ['🌫️', 'Brouillard givrant'],
+  51: ['🌦️', 'Bruine'], 53: ['🌦️', 'Bruine'], 55: ['🌦️', 'Bruine forte'],
+  56: ['🌧️', 'Bruine verglaçante'], 57: ['🌧️', 'Bruine verglaçante'],
+  61: ['🌧️', 'Pluie faible'], 63: ['🌧️', 'Pluie'], 65: ['🌧️', 'Pluie forte'],
+  66: ['🌧️', 'Pluie verglaçante'], 67: ['🌧️', 'Pluie verglaçante'],
+  71: ['🌨️', 'Neige faible'], 73: ['🌨️', 'Neige'], 75: ['🌨️', 'Neige forte'], 77: ['❄️', 'Grains de neige'],
+  80: ['🌧️', 'Averses'], 81: ['🌧️', 'Averses modérées'], 82: ['⛈️', 'Averses fortes'],
+  85: ['🌨️', 'Averses de neige'], 86: ['🌨️', 'Averses de neige fortes'],
+  95: ['⛈️', 'Orage'], 96: ['⛈️', 'Orage avec grêle'], 99: ['⛈️', 'Orage avec grêle']
+};
+function wmo(code) { return WMO_MAP[code] || ['❓', 'Inconnu']; }
+
+async function getWeather() {
+  if (WEATHER_CACHE.data && (Date.now() - WEATHER_CACHE.ts) < WEATHER_TTL_MS) return WEATHER_CACHE.data;
+  try {
+    const url = 'https://api.open-meteo.com/v1/forecast?latitude=50.3597&longitude=3.5271'
+      + '&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max'
+      + '&timezone=Europe%2FParis&forecast_days=3&wind_speed_unit=kn';
+    const r = await axios.get(url, { timeout: 8000 });
+    const d = r.data;
+    const days = (d.daily && d.daily.time ? d.daily.time : []).map(function(t, i) {
+      const code = d.daily.weathercode[i];
+      const w = wmo(code);
+      return {
+        date: t,
+        icon: w[0],
+        label: w[1],
+        tmin: d.daily.temperature_2m_min[i],
+        tmax: d.daily.temperature_2m_max[i],
+        rainPct: (d.daily.precipitation_probability_max && d.daily.precipitation_probability_max[i] != null) ? d.daily.precipitation_probability_max[i] : null,
+        windKts: (d.daily.wind_speed_10m_max && d.daily.wind_speed_10m_max[i] != null) ? d.daily.wind_speed_10m_max[i] : null,
+        gustKts: (d.daily.wind_gusts_10m_max && d.daily.wind_gusts_10m_max[i] != null) ? d.daily.wind_gusts_10m_max[i] : null
+      };
+    });
+    WEATHER_CACHE.data = { ok: true, days: days, fetchedAt: new Date().toISOString() };
+    return WEATHER_CACHE.data;
+  } catch (e) {
+    // API KO : on renvoie le cache même périmé (stale) plutôt que de casser la carte
+    if (WEATHER_CACHE.data) return WEATHER_CACHE.data;
+    return { ok: false, days: [], error: e.message };
+  }
+}
+
+// ─── Liens (carte cliquable) ───────────────────────────────────────────────
+const LINKS_FILE = path.join(DATA_DIR, 'links.json');
+const DEFAULT_LINKS = [
+  { id: 'gtd', label: 'GTD', url: 'https://gtd3.duckdns.org' }
+];
+function loadLinks() {
+  try {
+    if (fs.existsSync(LINKS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(LINKS_FILE, 'utf8'));
+      return Array.isArray(data) && data.length ? data : DEFAULT_LINKS.slice();
+    }
+  } catch (e) { console.error('[links] erreur lecture:', e.message); }
+  // Premier démarrage : on persiste le lien GTD par défaut
+  try { ensureDataDir(); fs.writeFileSync(LINKS_FILE, JSON.stringify(DEFAULT_LINKS, null, 2)); } catch (e) {}
+  return DEFAULT_LINKS.slice();
+}
+function saveLinks(links) {
+  ensureDataDir();
+  fs.writeFileSync(LINKS_FILE, JSON.stringify(links, null, 2));
 }
 
 // ─── Routes ────────────────────────────────────────────────────────────────
@@ -1057,6 +1133,39 @@ app.post('/api/card-order', (req, res) => {
   }
 });
 
+// API: liens (carte cliquable)
+app.get('/api/links', (req, res) => {
+  res.json({ ok: true, links: loadLinks() });
+});
+app.post('/api/links', (req, res) => {
+  try {
+    const body = req.body || {};
+    const label = String(body.label || '').trim();
+    const url = String(body.url || '').trim();
+    if (!label || !url) return res.status(400).json({ ok: false, error: 'label et url requis' });
+    // Normalise l'URL (ajoute https:// si pas de scheme)
+    let u = url;
+    if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+    const links = loadLinks();
+    const id = 'l' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    links.push({ id: id, label: label, url: u });
+    saveLinks(links);
+    res.json({ ok: true, links: links });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+app.delete('/api/links/:id', (req, res) => {
+  try {
+    const id = req.params.id;
+    const links = loadLinks().filter(function(l) { return l.id !== id; });
+    saveLinks(links);
+    res.json({ ok: true, links: links });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // API: top processes
 app.get('/api/top-processes', (req, res) => {
   res.json(getTopProcesses());
@@ -1419,7 +1528,10 @@ app.post('/api/pc-toggle-plug', async (req, res) => {
 app.get('/', async (req, res) => {
   const spending = calcSpending();
   const spending24h = calcSpendingLast24h();
-  const [credits, sys, ollama, live] = await Promise.all([getAllCredits(), Promise.resolve(getSystem()), getOllamaUsage(), getLiveUsage()]);
+  const [credits, sys, ollama, live, weather, links] = await Promise.all([
+    getAllCredits(), Promise.resolve(getSystem()), getOllamaUsage(), getLiveUsage(),
+    getWeather(), Promise.resolve(loadLinks())
+  ]);
   const mem = sys.mem;
   const disk = getDisk();
   const cc  = cpuColor(parseFloat(sys.cpuPct));
@@ -1443,6 +1555,42 @@ app.get('/', async (req, res) => {
     var idx = cardOrder.indexOf(id);
     return 'style="order:' + (idx === -1 ? cardOrder.length : idx) + '"';
   }
+
+  // ─── Météo : construction des 3 lignes (aujourd'hui / demain / après-demain) ──
+  const dayLabels = ['Aujourd\u2019hui', 'Demain', 'Apr\u00e8s-demain'];
+  let weatherRowsHtml = '';
+  if (weather && weather.ok && weather.days && weather.days.length) {
+    weatherRowsHtml = weather.days.map(function(day, i) {
+      const label = dayLabels[i] || day.date;
+      const rain = (day.rainPct != null) ? ' · 💧' + day.rainPct + '%' : '';
+      const wind = (day.windKts != null)
+        ? '<div class="meteo-wind">🌬 ' + day.windKts + ' kts · raf ' + (day.gustKts != null ? day.gustKts : '—') + '</div>'
+        : '';
+      return '<div class="meteo-row">'
+        + '<span class="meteo-day">' + label + '</span>'
+        + '<div class="meteo-main">'
+        +   '<div class="meteo-top">'
+        +     '<span class="meteo-icon">' + day.icon + '</span>'
+        +     '<span class="meteo-label">' + day.label + rain + '</span>'
+        +     '<span class="meteo-temp">' + (day.tmin != null ? day.tmin : '—') + '° / ' + (day.tmax != null ? day.tmax : '—') + '°</span>'
+        +   '</div>'
+        +   wind
+        + '</div>'
+        + '</div>';
+    }).join('');
+  } else {
+    weatherRowsHtml = '<div class="meteo-row" style="color:#666">⚠️ Météo indisponible' + (weather && weather.error ? ' (' + weather.error + ')' : '') + '</div>';
+  }
+
+  // ─── Liens : construction de la liste + formulaire d'ajout ──
+  function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+  const linksListHtml = (links && links.length ? links : []).map(function(l) {
+    return '<div class="link-row">'
+      + '<a class="link-anchor" href="' + esc(l.url) + '" target="_blank" rel="noopener">↗ ' + esc(l.label) + '</a>'
+      + '<span class="link-url" title="' + esc(l.url) + '">' + esc(l.url.replace(/^https?:\/\//i, '')) + '</span>'
+      + '<button class="link-del" data-link-id="' + esc(l.id) + '" title="Supprimer">×</button>'
+      + '</div>';
+  }).join('');
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -1579,11 +1727,33 @@ app.get('/', async (req, res) => {
   .pc-action-result{font-size:0.62rem;color:#888;margin-top:0.3rem;min-height:1rem}
   /* Card visibility */
   .card-hidden{display:none!important}
+  /* --- Météo --- */
+  .meteo-row{display:flex;align-items:flex-start;gap:0.6rem;padding:0.55rem 0;border-bottom:1px solid #1a1a1a}
+  .meteo-row:last-child{border-bottom:none}
+  .meteo-day{width:95px;flex-shrink:0;font-size:0.8rem;color:#aaa;font-weight:600;padding-top:0.15rem}
+  .meteo-main{flex:1;min-width:0}
+  .meteo-top{display:flex;align-items:center;gap:0.5rem}
+  .meteo-icon{font-size:1.4rem;line-height:1}
+  .meteo-label{flex:1;font-size:0.82rem;color:#e0e0e0}
+  .meteo-temp{font-size:0.82rem;color:#60a5fa;font-weight:700;white-space:nowrap}
+  .meteo-wind{font-size:0.66rem;color:#94a3b8;margin-top:0.2rem;white-space:nowrap}
+  /* --- Liens --- */
+  .link-row{display:flex;align-items:center;gap:0.5rem;padding:0.45rem 0;border-bottom:1px solid #1a1a1a}
+  .link-row:last-child{border-bottom:none}
+  .link-anchor{color:#60a5fa;font-size:0.9rem;font-weight:600;text-decoration:none;white-space:nowrap}
+  .link-anchor:hover{text-decoration:underline}
+  .link-url{flex:1;font-size:0.7rem;color:#555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .link-del{background:transparent;border:1px solid #2a2a2a;color:#666;border-radius:6px;width:24px;height:24px;line-height:1;cursor:pointer;font-size:0.95rem;flex-shrink:0}
+  .link-del:hover{border-color:#ef4444;color:#ef4444}
+  .link-input{background:#0a0a0a;border:1px solid #2a2a2a;color:#e0e0e0;border-radius:6px;padding:0.4rem 0.5rem;font-size:0.8rem}
+  .link-input:focus{outline:none;border-color:#3b82f6}
+  .link-add-btn{background:#1d4ed8;border:none;color:#fff;border-radius:6px;padding:0.4rem 0.7rem;font-size:0.8rem;cursor:pointer;white-space:nowrap}
+  .link-add-btn:hover{background:#2563eb}
   /* --- Glisser-deposer des cartes --- */
   .grid > [data-card-id]{position:relative}
   .grid > .chart-section{grid-column:1/-1;margin-top:0}
   .grid > [data-card-id] .card-header{padding-right:1.7rem}
-  .card-drag-handle{position:absolute;top:0.3rem;right:0.35rem;width:26px;height:30px;display:flex;align-items:center;justify-content:center;cursor:grab;user-select:none;-webkit-user-select:none;border:1px solid #262626;border-radius:8px;background:#141414;transition:background .15s,border-color .15s;z-index:5}
+  .card-drag-handle{position:absolute;top:0.3rem;right:0.35rem;width:32px;height:36px;display:flex;align-items:center;justify-content:center;cursor:grab;user-select:none;-webkit-user-select:none;touch-action:none;border:1px solid #262626;border-radius:8px;background:#141414;transition:background .15s,border-color .15s;z-index:5}
   .card-drag-handle::before{content:"";width:12px;height:16px;background-image:radial-gradient(#b4b4b4 1.7px,transparent 1.8px);background-size:6px 6px;background-position:0 0}
   .card-drag-handle:hover{background:#1d2430;border-color:#3b82f6}
   .card-drag-handle:hover::before{background-image:radial-gradient(#60a5fa 1.7px,transparent 1.8px)}
@@ -1667,6 +1837,8 @@ app.get('/', async (req, res) => {
     <label class="settings-row" data-card-id="pc-boncoin"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-boncoin')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC SkillORP</span></label>
     <label class="settings-row" data-card-id="chart"><span class="s-icon">📈</span><input type="checkbox"${vis('chart')?' checked':''}><span class="s-toggle"></span><span class="s-label">Graphique</span></label>
     <label class="settings-row" data-card-id="energie"><span class="s-icon">⚡</span><input type="checkbox"${vis('energie')?' checked':''}><span class="s-toggle"></span><span class="s-label">Énergie (solaire + Linky)</span></label>
+    <label class="settings-row" data-card-id="meteo"><span class="s-icon">🌦️</span><input type="checkbox"${vis('meteo')?' checked':''}><span class="s-toggle"></span><span class="s-label">Météo (Valenciennes)</span></label>
+    <label class="settings-row" data-card-id="liens"><span class="s-icon">🔗</span><input type="checkbox"${vis('liens')?' checked':''}><span class="s-toggle"></span><span class="s-label">Liens</span></label>
   </div>
 </div>
 
@@ -1708,6 +1880,24 @@ app.get('/', async (req, res) => {
     <div class="solaire-detail" id="energie-hc" style="margin-top:0.55rem">—</div>
     <div class="solaire-price" id="energie-price" onclick="editEnergyPrice()" title="Cliquer pour changer le prix du kWh">—</div>
     <div class="solaire-time" id="energie-time">—</div>
+  </div>
+
+  <!-- MÉTÉO : Valenciennes, 3 jours (soleil / pluie) -->
+  <div class="card ${visHidden('meteo')}" data-card-id="meteo"${orderOf('meteo')} >
+    <div class="card-header"><span class="icon">🌦️</span><span class="card-title">Météo — Valenciennes</span></div>
+    ${weatherRowsHtml}
+    <div class="note">Open-Meteo · renouvelé toutes les 15 min.</div>
+  </div>
+
+  <!-- LIENS : raccourcis cliquables, ajout/suppression -->
+  <div class="card ${visHidden('liens')}" data-card-id="liens"${orderOf('liens')} id="liens-card">
+    <div class="card-header"><span class="icon">🔗</span><span class="card-title">Liens</span></div>
+    <div id="links-list">${linksListHtml}</div>
+    <form id="link-add-form" onsubmit="return addLink(event)" style="display:flex;gap:0.4rem;margin-top:0.75rem;flex-wrap:wrap">
+      <input id="link-label" class="link-input" type="text" placeholder="Nom (ex : NAS)" style="width:110px" required>
+      <input id="link-url" class="link-input" type="text" placeholder="https://…" style="flex:1;min-width:120px" required>
+      <button class="link-add-btn" type="submit">＋ Ajouter</button>
+    </form>
   </div>
 
   <!-- CREDITS -->
@@ -2072,6 +2262,44 @@ app.get('/', async (req, res) => {
     })
     .catch(function(err){ console.error('Delegation stats error:', err); });
 })();
+</script>
+<script>
+// ─── Carte Liens : ajout / suppression ───────────────────────────────
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function stripScheme(u){ var s=String(u); if(s.indexOf('https://')===0){return s.slice(8);} if(s.indexOf('http://')===0){return s.slice(7);} return s; }
+function renderLinks(links){
+  var el = document.getElementById('links-list');
+  if(!el) return;
+  el.innerHTML = (links||[]).map(function(l){
+    return '<div class="link-row">'
+      + '<a class="link-anchor" href="' + esc(l.url) + '" target="_blank" rel="noopener">↗ ' + esc(l.label) + '</a>'
+      + '<span class="link-url" title="' + esc(l.url) + '">' + esc(stripScheme(l.url)) + '</span>'
+      + '<button class="link-del" data-link-id="' + esc(l.id) + '" title="Supprimer">×</button>'
+      + '</div>';
+  }).join('') || '<div class="link-url" style="padding:0.4rem 0">Aucun lien.</div>';
+}
+function addLink(ev){
+  ev.preventDefault();
+  var label = document.getElementById('link-label').value.trim();
+  var url   = document.getElementById('link-url').value.trim();
+  if(!label || !url) return false;
+  fetch('/api/links', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({label:label,url:url}) })
+    .then(function(r){ return r.json(); })
+    .then(function(d){ if(d.ok){ renderLinks(d.links); document.getElementById('link-label').value=''; document.getElementById('link-url').value=''; } })
+    .catch(function(e){ console.error('addLink:', e); });
+  return false;
+}
+function delLink(id){
+  fetch('/api/links/' + encodeURIComponent(id), { method:'DELETE' })
+    .then(function(r){ return r.json(); })
+    .then(function(d){ if(d.ok){ renderLinks(d.links); } })
+    .catch(function(e){ console.error('delLink:', e); });
+}
+// Delégation : remplace les onclick inline (les apostrophes échappées cassent dans la template literal)
+document.addEventListener('click', function(e){
+  var b = e.target && e.target.closest ? e.target.closest('.link-del') : null;
+  if (b && b.getAttribute('data-link-id')) { delLink(b.getAttribute('data-link-id')); }
+});
 </script>
 <script>
 // PC Health cards + alertes
@@ -3109,17 +3337,14 @@ function fetchSolaire() {
 })();
 </script>
 
-<!-- Card drag &amp; drop JS -->
+<!-- Card drag &amp; drop JS (SortableJS : souris ET tactile) -->
+<script src="/sortable.min.js"></script>
 <script>
 (function(){
   var grid = document.querySelector(".grid");
   if (!grid) { return; }
-  if (grid.querySelector(".card-drag-handle")) { return; }   // anti double-init
-  var draggingEl = null;
-  var currentTarget = null;
-  var currentPos = null;
 
-  // Seuls les enfants porteurs d un data-card-id sont deplacables (jamais les <script> eventuels)
+  // Seuls les enfants porteurs d un data-card-id sont deplacables
   function gridCards(){
     var out = [];
     var kids = grid.children;
@@ -3129,43 +3354,11 @@ function fetchSolaire() {
     return out;
   }
 
-  // Ordre VISUEL = tri par la propriete CSS order (la grille reordonne l affichage, pas le DOM)
-  function getVisualOrder(){
-    return gridCards().sort(function(a, b){
-      var oa = parseInt(a.style.order, 10);
-      var ob = parseInt(b.style.order, 10);
-      if (isNaN(oa)) { oa = 0; }
-      if (isNaN(ob)) { ob = 0; }
-      return oa - ob;
-    });
-  }
-
-  function clearDropClasses(){
-    var kids = grid.children;
-    for (var i = 0; i < kids.length; i++) {
-      kids[i].classList.remove("drop-before");
-      kids[i].classList.remove("drop-after");
-    }
-  }
-
-  function findCard(node){
-    var t = node;
-    while (t && t !== grid) {
-      if (t.getAttribute && t.getAttribute("data-card-id")) { return t; }
-      t = t.parentNode;
-    }
-    return null;
-  }
-
-  function applyOrder(ids){
-    var map = {};
+  function currentIds(){
+    var ids = [];
     var kids = gridCards();
-    for (var i = 0; i < kids.length; i++) {
-      map[kids[i].getAttribute("data-card-id")] = kids[i];
-    }
-    for (var j = 0; j < ids.length; j++) {
-      if (map[ids[j]]) { map[ids[j]].style.order = j; }
-    }
+    for (var i = 0; i < kids.length; i++) { ids.push(kids[i].getAttribute("data-card-id")); }
+    return ids;
   }
 
   function sendOrder(ids){
@@ -3173,92 +3366,49 @@ function fetchSolaire() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ order: ids })
-    }).then(function(r){ return r.json(); }).then(function(data){
-      if (data && data.ok && data.order) { applyOrder(data.order); }
-    }).catch(function(){});
+    }).then(function(r){ return r.json(); }).catch(function(){});
   }
+
+  // Reordonne le DOM pour coller a l ordre des ids (la grille est pilotee par l ordre DOM)
+  function applyOrder(ids){
+    var map = {};
+    var kids = gridCards();
+    for (var i = 0; i < kids.length; i++) { map[kids[i].getAttribute("data-card-id")] = kids[i]; }
+    for (var j = 0; j < ids.length; j++) {
+      if (map[ids[j]]) { grid.appendChild(map[ids[j]]); }
+    }
+  }
+
+  // Au chargement, le serveur a rendu l ordre via CSS order (progressive enhancement).
+  // On le materialise dans le DOM, puis on retire CSS order : SortableJS opere sur l ordre DOM.
+  var cards = gridCards();
+  cards.sort(function(a, b){
+    var oa = parseInt(a.style.order, 10); if (isNaN(oa)) { oa = 0; }
+    var ob = parseInt(b.style.order, 10); if (isNaN(ob)) { ob = 0; }
+    return oa - ob;
+  });
+  cards.forEach(function(c){ grid.appendChild(c); });
+  cards.forEach(function(c){ c.style.order = ""; });
 
   // Poignee de glissement (la carte entiere n est pas draggable : clics et selection de texte preserves)
   var kids = gridCards();
   for (var i = 0; i < kids.length; i++) {
     (function(card){
+      if (card.querySelector(".card-drag-handle")) { return; }
       var handle = document.createElement("span");
       handle.className = "card-drag-handle";
-      handle.title = "Glisser pour déplacer cette carte";
+      handle.title = "Glisser pour deplacer cette carte";
       card.insertBefore(handle, card.firstChild);
-
-      handle.addEventListener("mousedown", function(){ card.draggable = true; });
-
-      card.addEventListener("dragstart", function(e){
-        draggingEl = card;
-        card.classList.add("dragging");
-        if (e.dataTransfer) {
-          e.dataTransfer.effectAllowed = "move";
-          e.dataTransfer.setData("text/plain", card.getAttribute("data-card-id") || "");
-        }
-      });
-
-      card.addEventListener("dragend", function(){
-        card.draggable = false;
-        card.classList.remove("dragging");
-        clearDropClasses();
-        draggingEl = null;
-        currentTarget = null;
-        currentPos = null;
-      });
     })(kids[i]);
   }
 
-  // Un simple clic sur la poignee (sans drag) ne doit pas laisser la carte draggable
-  document.addEventListener("mouseup", function(){
-    if (draggingEl) { return; }
-    var k = gridCards();
-    for (var n = 0; n < k.length; n++) { k[n].draggable = false; }
-  });
-
-  grid.addEventListener("dragover", function(e){
-    e.preventDefault();
-    if (!draggingEl) { return; }
-    var target = findCard(e.target);
-    if (!target || target === draggingEl) {
-      clearDropClasses();
-      currentTarget = null;
-      currentPos = null;
-      return;
+  new Sortable(grid, {
+    handle: ".card-drag-handle",
+    animation: 150,
+    ghostClass: "dragging",
+    onEnd: function(){
+      sendOrder(currentIds());
     }
-    clearDropClasses();
-    var rect = target.getBoundingClientRect();
-    var isBefore = e.clientX < rect.left + rect.width / 2;
-    target.classList.add(isBefore ? "drop-before" : "drop-after");
-    currentTarget = target;
-    currentPos = isBefore ? "before" : "after";
-  });
-
-  grid.addEventListener("dragleave", function(e){
-    if (e.target === grid) { clearDropClasses(); }
-  });
-
-  grid.addEventListener("drop", function(e){
-    e.preventDefault();
-    if (!draggingEl || !currentTarget || !currentPos) {
-      clearDropClasses();
-      return;
-    }
-    var visual = getVisualOrder();
-    var fromIdx = visual.indexOf(draggingEl);
-    if (fromIdx === -1) { clearDropClasses(); return; }
-    visual.splice(fromIdx, 1);
-    var toIdx = visual.indexOf(currentTarget);
-    if (toIdx === -1) { clearDropClasses(); return; }
-    if (currentPos === "after") { toIdx = toIdx + 1; }
-    visual.splice(toIdx, 0, draggingEl);
-    var ids = [];
-    for (var i = 0; i < visual.length; i++) {
-      visual[i].style.order = i;
-      ids.push(visual[i].getAttribute("data-card-id"));
-    }
-    sendOrder(ids);
-    clearDropClasses();
   });
 
   window.resetCardOrder = function(){

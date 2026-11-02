@@ -1977,7 +1977,7 @@ app.get('/', async (req, res) => {
       <button class="pc-btn pc-btn-boot" onclick="bootPc('gabriel')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('gabriel','start_llm')">▶ Démarrer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','kill_llm')">⏹ Arrêter LLM</button>
-      <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','shutdown')">⏻ Éteindre</button>
+      <button class="pc-btn pc-btn-danger" onclick="shutPc('gabriel')" title="Kill le LLM, éteindre le PC, vérifier l'extinction, couper la prise">⏻ Éteindre + prise</button>
       <label class="pc-plug-toggle" id="pc-gabriel-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-gabriel-plug-slider"></span><span class="pc-plug-status" id="pc-gabriel-plug-status">❓</span><span class="pc-plug-power" id="pc-gabriel-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
         <input type="checkbox" id="auto-kill-gabriel">
@@ -1996,7 +1996,7 @@ app.get('/', async (req, res) => {
       <button class="pc-btn pc-btn-boot" onclick="bootPc('louis')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('louis','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('louis','kill_llm')">⏹ Kill LLM</button>
-      <button class="pc-btn pc-btn-danger" onclick="pcAction('louis','shutdown')">⏻ Éteindre</button>
+      <button class="pc-btn pc-btn-danger" onclick="shutPc('louis')" title="Kill le LLM, éteindre le PC, vérifier l'extinction, couper la prise">⏻ Éteindre + prise</button>
       <label class="pc-plug-toggle" id="pc-louis-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-louis-plug-slider"></span><span class="pc-plug-status" id="pc-louis-plug-status">❓</span><span class="pc-plug-power" id="pc-louis-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
         <input type="checkbox" id="auto-kill-louis">
@@ -2015,7 +2015,7 @@ app.get('/', async (req, res) => {
       <button class="pc-btn pc-btn-boot" onclick="bootPc('marie')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('marie','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('marie','kill_llm')">⏹ Kill LLM</button>
-      <button class="pc-btn pc-btn-danger" onclick="pcAction('marie','shutdown')">⏻ Éteindre</button>
+      <button class="pc-btn pc-btn-danger" onclick="shutPc('marie')" title="Kill le LLM, éteindre le PC, vérifier l'extinction, couper la prise">⏻ Éteindre + prise</button>
       <label class="pc-plug-toggle" id="pc-marie-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-marie-plug-slider"></span><span class="pc-plug-status" id="pc-marie-plug-status">❓</span><span class="pc-plug-power" id="pc-marie-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
         <input type="checkbox" id="auto-kill-marie">
@@ -2034,7 +2034,7 @@ app.get('/', async (req, res) => {
       <button class="pc-btn pc-btn-boot" onclick="bootPc('boncoin')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('boncoin','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('boncoin','kill_llm')">⏹ Kill LLM</button>
-      <button class="pc-btn pc-btn-danger" onclick="pcAction('boncoin','shutdown')">⏻ Éteindre</button>
+      <button class="pc-btn pc-btn-danger" onclick="shutPc('boncoin')" title="Kill le LLM, éteindre le PC, vérifier l'extinction, couper la prise">⏻ Éteindre + prise</button>
       <label class="pc-plug-toggle" id="pc-boncoin-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-boncoin-plug-slider"></span><span class="pc-plug-status" id="pc-boncoin-plug-status">❓</span><span class="pc-plug-power" id="pc-boncoin-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM >90%">
         <input type="checkbox" id="auto-kill-boncoin">
@@ -2726,7 +2726,7 @@ document.addEventListener('click', function(e){
     // renderPc reconstruit la carte toutes les 10 s et effacerait l avancement)
     var resultEl = document.getElementById('pc-' + name + '-result');
     if (resultEl) {
-      var bootMsg = bootMsgs && bootMsgs[name];
+      var bootMsg = (shutMsgs && shutMsgs[name]) || (bootMsgs && bootMsgs[name]);
       resultEl.textContent = bootMsg ? bootMsg : (data.last_action || '');
       if (!bootMsg && data.last_action) {
         setTimeout(function() {
@@ -2919,6 +2919,7 @@ document.addEventListener('click', function(e){
     var resultEl = document.getElementById('pc-' + pc + '-result');
     // Un message Boot + LLM n a plus de sens dès qu on lance/arrête à la main
     if (bootMsgs && action !== 'set_auto_kill') bootMsgs[pc] = '';
+    if (shutMsgs && action !== 'set_auto_kill') shutMsgs[pc] = '';
     // Feedback visuel immédiat pendant la requête (start_llm peut prendre plusieurs secondes)
     if (resultEl && action === 'start_llm') resultEl.textContent = '⏳ Lancement…';
     if (resultEl && action === 'kill_llm' && pc === 'gabriel') resultEl.textContent = '⏳ Arrêt en cours…';
@@ -2985,6 +2986,7 @@ document.addEventListener('click', function(e){
   // l avancement, donc un rechargement (meta refresh 30 s) ne le perd pas.
   var bootPolling = {};
   var bootMsgs = {};   // dernier message par PC, re-affiché après chaque renderPc
+  var shutMsgs = {};   // idem pour le job Extinction + prise
 
   window.bootPc = function(pc) {
     var el = document.getElementById('pc-' + pc + '-result');
@@ -3049,6 +3051,72 @@ document.addEventListener('click', function(e){
     });
   }
   resumeBoots();
+
+  // ─── Extinction + prise : un seul bouton (LLM -> poweroff -> eteint -> prise OFF) ──
+  var shutPolling = {};
+
+  window.shutPc = function(pc) {
+    var el = document.getElementById('pc-' + pc + '-result');
+    shutMsgs[pc] = '⏳ Arrêt du LLM + extinction du PC…';
+    if (el) el.textContent = shutMsgs[pc];
+    fetch('/api/pc-shut', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pc: pc })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(res) {
+      if (!res.ok) { if (el) el.textContent = '❌ ' + (res.error || 'Erreur'); return; }
+      pollShut(pc);
+    })
+    .catch(function(e) {
+      console.error('shutPc(' + pc + '):', e);
+      if (el) el.textContent = '❌ Erreur réseau';
+    });
+  };
+
+  function shutPhaseLabel(j) {
+    if (j.phase === 'kill') return 'Arrêt du LLM';
+    if (j.phase === 'off') return 'Extinction du PC';
+    if (j.phase === 'plug') return 'Coupure de la prise';
+    if (j.phase === 'done') return 'Terminé';
+    if (j.phase === 'error') return 'Échec';
+    return 'Extinction';
+  }
+
+  function pollShut(pc) {
+    if (shutPolling[pc]) return;
+    shutPolling[pc] = true;
+    function tick() {
+      fetch('/api/pc-shut/' + pc)
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (!j || j.idle) { shutPolling[pc] = false; return; }
+        var el = document.getElementById('pc-' + pc + '-result');
+        var line;
+        if (j.done && j.ok) line = '✅ PC éteint — prise coupée en ' + j.elapsedS + ' s';
+        else if (j.done) line = '❌ ' + (j.error || 'Échec');
+        else line = '⏳ ' + shutPhaseLabel(j) + ' · ' + j.elapsedS + ' s' + (j.lastStep ? ' — ' + j.lastStep : '');
+        if (el) el.textContent = line;
+        shutMsgs[pc] = line;
+        if (!j.done) { setTimeout(tick, 4000); return; }
+        shutPolling[pc] = false;
+        fetch('/api/pc-' + pc).then(function(r) { return r.json(); }).then(function(d) { renderPc(d, pc); }).catch(function() {});
+        fetchPlugState(pc);
+      })
+      .catch(function(e) { console.error('pollShut(' + pc + '):', e); shutPolling[pc] = false; });
+    }
+    tick();
+  }
+
+  function resumeShuts() {
+    ['gabriel', 'louis', 'marie', 'boncoin'].forEach(function(pc) {
+      fetch('/api/pc-shut/' + pc).then(function(r) { return r.json(); }).then(function(j) {
+        if (j && !j.idle && !j.done) pollShut(pc);
+      }).catch(function() {});
+    });
+  }
+  resumeShuts();
 
   // Format court d'un montant en euros (3 décimales sous 0,10 €)
   function fmtEurShort(v) {
@@ -3611,6 +3679,174 @@ app.post('/api/pc-boot', (req, res) => {
 
 app.get('/api/pc-boot/:pc', (req, res) => {
   res.json(bootPublic(bootJobs[req.params.pc]));
+});
+
+// ─── Extinction : kill LLM → poweroff PC → vérifier l'extinction → couper la prise ───
+// Image miroir du job Boot : job en mémoire + polling du front (GET /api/pc-shut/:pc),
+// un rechargement de page (meta refresh 30 s) ne perd pas l'avancement.
+// L'extinction est vérifiée sur DEUX critères avant de couper la prise (jamais de
+// coupure brutale sur une machine qui tourne encore) :
+//  · SSH ne répond plus (3 échecs consécutifs = 15 s, pour éliminer un blip réseau),
+//  · la conso du capteur de puissance de la prise passe sous SHUT_IDLE_W si lisible
+//    (un SSH mort peut être un réseau mort ; une conso basse est une preuve physique).
+// Si l'un des critères n'est pas atteint à l'échéance → la prise reste ON, on le signale.
+const SHUT_OFF_WAIT_MS = 180000;   // 3 min pour une extinction complète
+const SHUT_POLL_MS = 5000;         // intervalle de sonde
+const SHUT_IDLE_W = 10;            // « éteint » = conso prise < 10 W (veille USB)
+const SHUT_STUCK_W = 30;           // SSH mort mais conso > 30 W = extinction en cours/bloquée
+const SHUT_SSH_DOWN_NEEDED = 3;    // échecs SSH consécutifs requis sans capteur lisible
+const shutJobs = {};
+
+function shutElapsedS(job) { return Math.round((Date.now() - job.startedAt) / 1000); }
+
+function shutStep(job, text) {
+  job.steps.push({ s: shutElapsedS(job), text: text });
+  if (job.steps.length > 8) job.steps.shift();
+}
+
+function shutPublic(job) {
+  if (!job) return { ok: true, idle: true, done: true, phase: 'idle', steps: [] };
+  return {
+    ok: !!job.ok, idle: false, pc: job.pc, phase: job.phase, done: job.done, error: job.error,
+    elapsedS: shutElapsedS(job),
+    lastStep: job.steps.length ? job.steps[job.steps.length - 1].text : '',
+    steps: job.steps,
+  };
+}
+
+function haSwitchOff(entityId) {
+  return axios.post(`${HA_BASE}/api/services/switch/turn_off`, { entity_id: entityId }, { headers: HA_HEADERS, timeout: 5000 });
+}
+
+async function haPlugPowerW(name) {
+  const id = getPlugPowerEntity(name);
+  if (!id) return null;
+  try {
+    const r = await axios.get(`${HA_BASE}/api/states/${id}`, { headers: HA_HEADERS, timeout: 5000 });
+    if (!r.data || r.data.state === 'unknown' || r.data.state === 'unavailable') return null;
+    const v = parseFloat(r.data.state);
+    return isNaN(v) ? null : v;
+  } catch (e) { return null; }
+}
+
+async function runShutJob(pc) {
+  const job = shutJobs[pc];
+  const t = BOOT_TARGETS[pc];
+  try {
+    // 1. Kill du LLM (si la machine est debout)
+    job.phase = 'kill';
+    let up = sshReachable(t.ssh);
+    if (!up) {
+      shutStep(job, 'SSH absent — PC déjà éteint, LLM ignoré');
+    } else {
+      if (pc === 'gabriel') {
+        // .224 : Strata + llama.cpp, stop-strata.sh gère Strata (jamais pkill -f llama)
+        execSync(t.ssh + " '~/script/stop-strata.sh >/tmp/stop-strata-dashboard.log 2>&1; pkill -x llama-server 2>/dev/null; echo OK'", { timeout: 90000 });
+      } else {
+        execSync(t.ssh + " 'pkill llama-server 2>/dev/null; sleep 2; pgrep llama-server >/dev/null 2>&1 && pkill -9 llama-server; echo KILLED'", { timeout: 30000 });
+      }
+      await sleepMs(3000);
+      // Confirmation : le process est vraiment parti (un port mort ne prouve pas un modèle arrêté)
+      if (pc === 'gabriel') {
+        const info = await probeLlama224Async(true);
+        if (info && info.health === true) throw new Error('Le port 8080 repond encore sur 192.168.3.224 — arret LLM non confirme, extinction annulee');
+      } else {
+        let alive = false;
+        try {
+          alive = execSync(t.ssh + " 'pgrep llama-server >/dev/null 2>&1 && echo ALIVE || echo DEAD'", { timeout: 20000 }).toString().indexOf('ALIVE') !== -1;
+        } catch (e) { alive = false; }
+        if (alive) {
+          execSync(t.ssh + " 'pkill -9 llama-server 2>/dev/null; echo OK'", { timeout: 20000 });
+          await sleepMs(2000);
+        }
+      }
+      shutStep(job, 'LLM arrete');
+    }
+
+    // 2. Extinction du PC
+    job.phase = 'off';
+    if (up) {
+      const poCmd = t.ssh + " '" + (pc === 'louis' ? 'sudo poweroff' : (pc === 'boncoin' ? 'sudo -n shutdown -h now' : 'sudo shutdown -h now')) + "'";
+      try {
+        execSync(poCmd, { timeout: 30000 });
+      } catch (e) {
+        // Attendu : la connexion SSH meurt avec la machine (exit 255 / « closed »)
+        if (!/255|closed|timed? ?out/i.test(e.message)) throw e;
+      }
+      shutStep(job, 'Commande d extinction envoyee — attente qu elle meure');
+    }
+
+    // 3. Attente d extinction reelle (SSH + conso prise)
+    const offDeadline = Date.now() + SHUT_OFF_WAIT_MS;
+    let off = false;
+    let sshDown = 0;
+    while (Date.now() < offDeadline) {
+      const stillUp = sshReachable(t.ssh);
+      const w = await haPlugPowerW(pc);
+      if (stillUp) {
+        sshDown = 0;
+      } else {
+        sshDown++;
+        if (w !== null) {
+          if (w < SHUT_IDLE_W) { off = true; shutStep(job, 'Extinction confirmee (SSH mort, ' + Math.round(w) + ' W)'); break; }
+          if (w > SHUT_STUCK_W) shutStep(job, 'SSH mort mais ' + Math.round(w) + ' W encore — extinction en cours');
+        } else if (sshDown >= SHUT_SSH_DOWN_NEEDED) {
+          off = true; shutStep(job, 'SSH absent ×' + sshDown + ' (capteur illisible) — considere comme eteint');
+          break;
+        }
+      }
+      await sleepMs(SHUT_POLL_MS);
+    }
+    if (!off) throw new Error('Machine pas confirme eteinte apres ' + Math.round(SHUT_OFF_WAIT_MS / 1000) + ' s — prise LAISSEE ON, verifier ' + pc);
+
+    // 4. Coupure de la prise
+    job.phase = 'plug';
+    const entityId = getPlugEntity(pc);
+    if (!entityId) {
+      shutStep(job, 'Pas de prise HA pour ce PC — PC eteint');
+    } else {
+      let st = null;
+      try { st = await haSwitchState(entityId); } catch (e) { shutStep(job, 'Etat prise illisible : ' + e.message); }
+      if (st === 'off') {
+        shutStep(job, 'Prise deja OFF');
+      } else {
+        await haSwitchOff(entityId);
+        let confirmed = false;
+        for (let i = 0; i < 5 && !confirmed; i++) {
+          await sleepMs(2000);
+          try { if (await haSwitchState(entityId) === 'off') confirmed = true; } catch (e) { /* on retente */ }
+        }
+        if (!confirmed) throw new Error('Prise : commande OFF envoyee mais etat non confirme — verifier HA');
+        shutStep(job, 'Prise OFF — fini');
+      }
+    }
+    job.ok = true;
+    job.phase = 'done';
+    shutStep(job, 'PC eteint, prise coupee');
+  } catch (e) {
+    job.ok = false;
+    job.phase = 'error';
+    job.error = e.message;
+    shutStep(job, 'Échec : ' + e.message);
+  } finally {
+    job.done = true;
+  }
+}
+
+app.post('/api/pc-shut', (req, res) => {
+  const pc = (req.body || {}).pc;
+  if (!BOOT_TARGETS[pc]) return res.status(400).json({ ok: false, error: 'PC inconnu' });
+  const running = shutJobs[pc];
+  if (running && !running.done) return res.json({ ok: true, already: true, job: shutPublic(running) });
+  shutJobs[pc] = { pc: pc, startedAt: Date.now(), done: false, ok: null, phase: 'kill', error: null, steps: [] };
+  runShutJob(pc).catch((e) => {
+    shutJobs[pc].done = true; shutJobs[pc].ok = false; shutJobs[pc].phase = 'error'; shutJobs[pc].error = e.message;
+  });
+  res.json({ ok: true, started: true, job: shutPublic(shutJobs[pc]) });
+});
+
+app.get('/api/pc-shut/:pc', (req, res) => {
+  res.json(shutPublic(shutJobs[req.params.pc]));
 });
 
 // ─── PC Action (POST) — direct SSH to target machine

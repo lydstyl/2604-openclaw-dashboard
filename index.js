@@ -409,7 +409,7 @@ const DEFAULT_VISIBILITY = {
   'credits': true, 'depenses': true,
   'systeme': true, 'ollama': true,
   'pc-gabriel': true, 'pc-louis': true, 'pc-marie': true, 'pc-boncoin': true, 'chart': true,
-  'energie': true
+  'energie': true, 'pour-ia': true
 };
 
 function loadCardVisibility() {
@@ -432,7 +432,7 @@ const ORDER_FILE = path.join(DATA_DIR, 'card_order.json');
 
 // Ordre par defaut = ordre de rendu du template (cartes + graphique)
 const DEFAULT_ORDER = [
-  'energie', 'meteo', 'liens', 'credits', 'depenses',
+  'energie', 'pour-ia', 'meteo', 'liens', 'credits', 'depenses',
   'systeme', 'ollama', 'pc-gabriel', 'pc-louis', 'pc-marie', 'pc-boncoin', 'chart'
 ];
 
@@ -539,6 +539,292 @@ function saveLinks(links) {
   ensureDataDir();
   fs.writeFileSync(LINKS_FILE, JSON.stringify(links, null, 2));
 }
+
+// ─── GTD Pour IA (file écrite par le cron pour-ia-dispatch, profil ron) ───
+const POUR_IA_FILE = process.env.POUR_IA_FILE || path.join(DATA_DIR, 'pour-ia.json');
+const POUR_IA_LOCK_DIR = '/host/home/lydstyl/.hermes/state/pour-ia';
+const POUR_IA_AGENTS = ['luna', 'harry', 'ron', 'dobby']; // même liste que pour-ia-dispatch.py
+// Agents « API » (pas de wrapper local, donc pas de lock ni de flag .paused) :
+// hermione = deepseek API. Sert à décider si un bouton pause est proposé.
+const POUR_IA_API_AGENTS = ['hermione'];
+// Libellés d'affichage (le JSON peut fournir `disp`, sinon on retombe ici)
+const POUR_IA_DISP = { luna: 'Luna', harry: 'Harry', ron: 'Ron', dobby: 'Dobby', hermione: 'Hermione' };
+const POUR_IA_STATUSES = ['running', 'idle', 'paused', 'offline'];
+
+// Normalise une entrée `agents[]` du JSON (champs tous optionnels → jamais de crash)
+function normalizePourIAAgent(a) {
+  if (!a || typeof a !== 'object') return null;
+  const key = String(a.key || a.agent || '').toLowerCase().trim();
+  if (!key) return null;
+  const rawStatus = String(a.status || '').toLowerCase();
+  return {
+    key: key,
+    disp: a.disp ? String(a.disp) : (POUR_IA_DISP[key] || key.charAt(0).toUpperCase() + key.slice(1)),
+    status: POUR_IA_STATUSES.indexOf(rawStatus) !== -1 ? rawStatus : 'idle',
+    task: a.task ? String(a.task) : '',
+    api: POUR_IA_API_AGENTS.indexOf(key) !== -1 || POUR_IA_AGENTS.indexOf(key) === -1,
+    from_json: true
+  };
+}
+
+// Le `pid` d'une lock est le PID du wrapper SUR L'HÔTE (192.168.3.102), pas un
+// PID du conteneur → `os.kill(pid, 0)` ici testerait le namespace du conteneur
+// (faux). On vérifie donc la vie via la vue en lecture seule /host/proc/<pid>.
+// C'est le même critère que `lock_alive()` dans pour-ia-dispatch.py, appliqué
+// en temps réel côté dashboard (le cron 15 min ne nettoie que par paquets).
+function hostPidAlive(pid) {
+  const n = Number(pid);
+  if (!n || !Number.isFinite(n)) return false;
+  try { return fs.existsSync('/host/proc/' + n); } catch (e) { return false; }
+}
+
+// Host LLM de chaque agent (même mapping que pour-ia-dispatch.py AGENTS). Un agent
+// n'est "en cours" que si son LLM répond — sinon c'est un fantôme (machine redémarrée,
+// wrapper collé mais LLM KO). Complément du check hostPidAlive() ci-dessus.
+const POUR_IA_AGENT_HOSTS = { luna: '192.168.3.57', harry: '192.168.3.224', ron: '192.168.3.206', dobby: '192.168.3.249' };
+const POUR_IA_LLM_TTL_MS = 10000; // 10 s — fraîcheur du statut LLM, sans marteler les nœuds
+const pourIALlmCache = {};        // { <agent>: { up: bool, ts: number } }
+
+function refreshAgentLlmUp(agent) {
+  const host = POUR_IA_AGENT_HOSTS[agent];
+  if (!host) return true; // agent inconnu → on ne bloque pas l'affichage
+  const now = Date.now();
+  const c = pourIALlmCache[agent];
+  if (c && (now - c.ts) < POUR_IA_LLM_TTL_MS) return c.up !== false;
+  const last = (c && typeof c.up === 'boolean') ? c.up : false; // défaut false : pas "en cours" tant que le LLM n'a pas répondu (anti-fantôme, y.c. cold start)
+  pourIALlmCache[agent] = { up: last, ts: now }; // "sonde en cours" → throttle les re-sondes
+  httpGetJson(host, 8080, '/v1/models', 2500, (err) => {
+    pourIALlmCache[agent] = { up: !err, ts: Date.now() };
+  });
+  return last;
+}
+
+function loadPourIA() {
+  const out = { count: 0, tasks: [], updated_at: null, working: [], paused: [], cooldown: [], pending: 0, agents: null, agents_from_json: false };
+  try {
+    if (fs.existsSync(POUR_IA_FILE)) {
+      const d = JSON.parse(fs.readFileSync(POUR_IA_FILE, 'utf8'));
+      out.count = d.count || 0;
+      out.tasks = Array.isArray(d.tasks) ? d.tasks : [];
+      out.updated_at = d.updated_at || null;
+      // Nouveau contrat (13/11/2026) : `agents` peut être absent → repli sur les locks.
+      if (Array.isArray(d.agents) && d.agents.length) {
+        out.agents = d.agents.map(normalizePourIAAgent).filter(Boolean);
+        out.agents_from_json = out.agents.length > 0;
+      }
+    }
+  } catch (e) { console.error('[pour-ia] erreur lecture file:', e.message); }
+  // locks actives = agents locaux en train de traiter (1 par agent, dispatch parallèle)
+  try {
+    if (fs.existsSync(POUR_IA_LOCK_DIR)) {
+      for (const f of fs.readdirSync(POUR_IA_LOCK_DIR)) {
+        if (f.endsWith('.paused')) {
+          out.paused.push(f.replace('.paused', '').toUpperCase());
+          continue;
+        }
+        if (f.endsWith('.cooldown')) {
+          // Cooldown post-échec (30 min, posé par le wrapper / clear_stale_locks) :
+          // le dispatch exclut l'agent mais la carte le montrait « 🟢 dispo » →
+          // Gabriel ne comprenait pas pourquoi Dispatch n'attribuait rien (12/11/2026).
+          try {
+            const age = Date.now() - fs.statSync(path.join(POUR_IA_LOCK_DIR, f)).mtimeMs;
+            const LEFT = 30 * 60 * 1000;
+            if (age < LEFT) {
+              out.cooldown.push({ agent: f.replace('.cooldown', '').toUpperCase(), remaining_min: Math.max(1, Math.ceil((LEFT - age) / 60000)) });
+            }
+          } catch (e) { /* cooldown illisible : on l'ignore */ }
+          continue;
+        }
+        if (!f.endsWith('.lock')) continue;
+        try {
+          const l = JSON.parse(fs.readFileSync(path.join(POUR_IA_LOCK_DIR, f), 'utf8'));
+          // BUG FIX (GTD cmwdty49t002klq01ftwn4abt) : un fichier .lock ≠ agent vivant.
+          // Si le wrapper (pid hôte) est mort — redémarrage, crash, SIGKILL — la lock
+          // est orpheline et le trap du wrapper n'a pas pu la supprimer. Sans ce check,
+          // la carte afficherait « HARRY sur : … » alors que Harry est éteint. On ne la
+          // montre PAS comme « en cours » et on la supprime (overlay rw), comme le fait
+          // clear_stale_locks() côté dispatch, mais en temps réel.
+          if (!hostPidAlive(l.pid)) {
+            try { fs.unlinkSync(path.join(POUR_IA_LOCK_DIR, f)); console.error('[pour-ia] lock orpheline supprimée : ' + f); } catch (e) {}
+            continue;
+          }
+          // Wrapper vivant MAIS LLM éteint (machine redémarrée, hermes collé en attente) :
+          // on ne montre PAS "sur : <tâche>" tant que le LLM ne répond pas de nouveau.
+          if (!refreshAgentLlmUp(f.replace('.lock', ''))) continue;
+          out.working.push({ agent: f.replace('.lock', '').toUpperCase(), task_id: l.task_id || null, task_name: l.task_name || '?', started_at: l.started_at || null });
+        } catch (e) { /* lock illisible : on l'ignore */ }
+      }
+    }
+  } catch (e) { console.error('[pour-ia] erreur lecture locks:', e.message); }
+  // ─── Bloc agents (nouveau contrat) ────────────────────────────────────
+  // Les locks restent la vérité TEMPS RÉEL pour les agents locaux (le JSON est
+  // réécrit au tick du cron) : pause/en cours écrasent le statut du fichier.
+  // Les agents API (hermione) n'ont ni lock ni flag → statut du JSON seul.
+  if (out.agents) {
+    const seen = {};
+    out.agents.forEach(function(a) { seen[a.key] = true; });
+    POUR_IA_AGENTS.forEach(function(k) { // agents locaux absents du JSON → ajoutés (boutons pause conservés)
+      if (seen[k]) return;
+      out.agents.push({ key: k, disp: POUR_IA_DISP[k] || k.toUpperCase(), status: 'idle', task: '', api: false, from_json: false });
+    });
+    out.agents.forEach(function(a) {
+      const A = a.key.toUpperCase();
+      const w = out.working.find(function(x) { return x.agent === A; });
+      const isPaused = out.paused.indexOf(A) !== -1;
+      if (isPaused) a.status = 'paused';
+      else if (w) { a.status = 'running'; if (!a.task) a.task = w.task_name || ''; }
+      const cd = (out.cooldown || []).find(function(c) { return c.agent === A; });
+      if (cd && a.status !== 'running' && a.status !== 'paused' && !a.api) {
+        a.status = 'cooldown';
+        a.cooldown_min = cd.remaining_min;
+      }
+    });
+  }
+  // les tâches en cours sont dans le json (statut encore pour_ia) → on les sort de la file affichée
+  const busy = new Set(out.working.map(function(w) { return w.task_id; }).filter(Boolean));
+  out.tasks = out.tasks.filter(function(t) { return !busy.has(t.id); });
+  out.pending = Math.max(0, out.count - busy.size);
+  return out;
+}
+
+// Échappement HTML côté serveur (le `esc` existant est scopé dans l'handler `/`)
+function escHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+
+// ─── Brique « GTD Pour IA » : badges cible / mode et lignes agents ─────
+// Le JSON porte `target` + `mode` (contrat 13/11/2026) ; si l'un manque, on le
+// déduit des `tags` (agent-<clé>, mode-plan, mode-rapide) — jamais de crash.
+function piaTargetBadge(t) {
+  var target = (t && t.target != null) ? String(t.target).toLowerCase().trim() : '';
+  if (!target && t && Array.isArray(t.tags)) {
+    var tg = t.tags.map(function(x) { return String(x).toLowerCase(); }).filter(function(x) { return x.indexOf('agent-') === 0; })[0];
+    if (tg) target = tg.slice(6);
+  }
+  if (!target || target === 'auto' || target === 'null') {
+    return '<span class="pia-badge pia-target pia-target-auto">→ auto</span>';
+  }
+  var disp = POUR_IA_DISP[target] || (target.charAt(0).toUpperCase() + target.slice(1));
+  var isApi = POUR_IA_API_AGENTS.indexOf(target) !== -1 || POUR_IA_AGENTS.indexOf(target) === -1;
+  return '<span class="pia-badge pia-target">→ ' + escHtml(disp) + (isApi ? ' (API)' : '') + '</span>';
+}
+function piaModeBadge(t) {
+  var mode = (t && t.mode != null) ? String(t.mode).toLowerCase().trim() : '';
+  if (!mode && t && Array.isArray(t.tags)) {
+    if (t.tags.indexOf('mode-plan') !== -1) mode = 'plan';
+    else if (t.tags.indexOf('mode-rapide') !== -1) mode = 'rapide';
+  }
+  if (mode !== 'plan' && mode !== 'rapide') return ''; // mode auto → aucun badge
+  return '<span class="pia-badge pia-mode pia-mode-' + mode + '">' + mode + '</span>';
+}
+// Une ligne par agent : pastille d'état + nom + tâche en cours + bouton pause.
+// Les agents API (hermione) n'ont pas de wrapper local → pas de bouton pause.
+var PIA_STATUS_RENDER = {
+  running:  { dot: '⚙️', txt: 'en cours', cls: 'pia-st-running' },
+  idle:     { dot: '🟢', txt: 'dispo',    cls: 'pia-st-idle' },
+  paused:   { dot: '⏸',  txt: 'pause',    cls: 'pia-st-paused' },
+  offline:  { dot: '⚫', txt: 'hors ligne', cls: 'pia-st-offline' },
+  cooldown: { dot: '🟡', txt: 'cooldown', cls: 'pia-st-paused' }
+};
+function piaAgentRowHtml(a) {
+  var st = PIA_STATUS_RENDER[a.status] || PIA_STATUS_RENDER.idle;
+  var stTxt = st.txt + (a.status === 'cooldown' && a.cooldown_min ? ' (' + a.cooldown_min + ' min)' : '');
+  var title = a.status === 'cooldown' ? ' title="Échec récent — le dispatch réessaie après le cooldown"' : '';
+  var taskTxt = (a.status === 'running' && a.task) ? ' <span class="pia-agent-task" title="' + escHtml(a.task) + '">· ' + escHtml(a.task) + '</span>' : '';
+  var btn;
+  if (a.api) btn = '<span class="val-muted" style="font-size:0.62rem">API</span>';
+  else if (a.status === 'paused') btn = '<button class="extend-btn" onclick="togglePourIAPause(\'' + a.key + '\', false)">▶ reprendre</button>';
+  else btn = '<button class="extend-btn" onclick="togglePourIAPause(\'' + a.key + '\', true)">⏸ pause</button>';
+  return '<div class="row pia-agent-row"><span class="label pia-agent-name"><span class="pia-dot ' + st.cls + '"' + title + '>' + st.dot + '</span> ' + escHtml(a.disp) + ' <span class="' + st.cls + '">' + stTxt + '</span>' + taskTxt + '</span><span class="val">' + btn + '</span></div>';
+}
+
+// HTML du corps de la carte « GTD — Tâches Pour IA » (rendu serveur).
+// Reutilisé par les endpoints pause / dispatch-now pour renvoyer la carte
+// re-rendue au client → mise à jour instantanée, sans rechargement de page.
+function buildPourIACardBody(pourIA) {
+  var PIA_MAX_ROWS = 6; // lignes compactes (carte consultée au téléphone)
+  let pourIARowsHtml = '';
+  if (pourIA.tasks.length > 0) {
+    const top = pourIA.tasks.slice(0, PIA_MAX_ROWS);
+    pourIARowsHtml = top.map(function(t) {
+      var imp = (t.importance != null && t.importance !== '') ? t.importance : '—';
+      return '<div class="row pia-task"><span class="label pia-task-name" title="' + escHtml(t.name) + '">' + escHtml(t.name) + '</span>'
+        + '<span class="val pia-task-meta">' + piaTargetBadge(t) + piaModeBadge(t) + '<span class="pia-imp">imp ' + escHtml(imp) + '</span></span></div>';
+    }).join('') + (pourIA.tasks.length > PIA_MAX_ROWS ? '<div class="note">+' + (pourIA.tasks.length - PIA_MAX_ROWS) + ' autre(s)…</div>' : '');
+  } else {
+    pourIARowsHtml = '<div class="note">File vide — rien à traiter 🎉</div>';
+  }
+  // Ancien affichage des tâches en cours : inutile quand le bloc agents est là
+  // (il porte déjà la tâche en cours), conservé en repli si `agents` est absent.
+  const pourIAWorkingHtml = (!pourIA.agents && pourIA.working.length)
+    ? pourIA.working.map(function(w) {
+        var mins = w.started_at ? Math.max(0, Math.round((Date.now() - new Date(w.started_at).getTime()) / 60000)) : null;
+        return '<div class="note" style="color:#60a5fa">⚙️ ' + w.agent + ' sur : ' + escHtml(w.task_name) + (mins !== null ? ' <span style="opacity:0.7">(' + mins + ' min)</span>' : '') + '</div>';
+      }).join('')
+    : '';
+  const pourIAMajHtml = pourIA.updated_at
+    ? 'maj ' + new Date(pourIA.updated_at).toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris' })
+    : 'jamais mis à jour';
+  // Ligne par agent avec interrupteur pause (flag .paused → dispatch l'exclut).
+  // Si le JSON fournit `agents`, il fait foi (statuts running/idle/paused/offline) ;
+  // sinon on retombe sur l'état déduit des locks (comportement historique).
+  const pourIAAgentsHtml = pourIA.agents
+    ? pourIA.agents.map(piaAgentRowHtml).join('')
+    : POUR_IA_AGENTS.map(function(a) {
+      var A = a.toUpperCase();
+      var isPaused = pourIA.paused.indexOf(A) !== -1;
+      var isWorking = pourIA.working.some(function(w) { return w.agent === A; });
+      var cd = (pourIA.cooldown || []).find(function(c) { return c.agent === A; });
+      var badge = isPaused ? '<span class="pia-st-paused">⏸ pause</span>'
+                : isWorking ? '<span class="pia-st-running">⚙️ en cours</span>'
+                : cd ? '<span class="pia-st-paused" title="Échec récent — le dispatch le réessaie après le cooldown">🟡 cooldown (' + cd.remaining_min + ' min)</span>'
+                : '<span class="pia-st-idle">🟢 dispo</span>';
+      var btn = isPaused
+        ? '<button class="extend-btn" onclick="togglePourIAPause(\'' + a + '\', false)">▶ reprendre</button>'
+        : '<button class="extend-btn" onclick="togglePourIAPause(\'' + a + '\', true)">⏸ pause</button>';
+      return '<div class="row pia-agent-row"><span class="label pia-agent-name">' + A + ' ' + badge + '</span><span class="val">' + btn + '</span></div>';
+    }).join('');
+  return '<div class="big-value" style="color:' + (pourIA.pending > 0 ? '#f472b6' : '#4ade80') + '">' + pourIA.pending + '<span>tâche(s) en attente' + (pourIA.working.length ? ' · ' + pourIA.working.length + ' en cours' : '') + '</span></div>'
+    + pourIAWorkingHtml
+    + '<hr class="divider">'
+    + pourIAAgentsHtml
+    + '<hr class="divider">'
+    + pourIARowsHtml
+    + '<div class="row" style="margin-top:0.5rem"><span class="val-muted">' + pourIAMajHtml + '</span><a href="https://gtd3.duckdns.org" target="_blank" style="color:#60a5fa;font-size:0.72rem;text-decoration:none">↗ GTD</a> <button class="extend-btn" id="pouria-dispatch-btn" onclick="runPourIADispatch()" title="Lance immédiatement un tick de dispatch (même commande que le cron 15 min)">🚀 Dispatch maintenant</button></div>';
+}
+
+// API: mettre un agent GTD en pause / le reprendre (flag <agent>.paused à côté
+// des .lock — pour-ia-dispatch.py exclut les agents pausés au tick suivant).
+// Une tâche EN COURS n'est jamais tuée : la pause prend effet à la tâche suivante.
+app.post('/api/pour-ia/pause', (req, res) => {
+  const agent = String((req.body && req.body.agent) || '').toLowerCase();
+  const paused = !!(req.body && req.body.paused);
+  if (!POUR_IA_AGENTS.includes(agent)) {
+    return res.status(400).json({ ok: false, error: 'agent inconnu (' + POUR_IA_AGENTS.join('/') + ')' });
+  }
+  const flag = path.join(POUR_IA_LOCK_DIR, agent + '.paused');
+  try {
+    if (paused) fs.writeFileSync(flag, new Date().toISOString());
+    else if (fs.existsSync(flag)) fs.unlinkSync(flag);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+  res.json({ ok: true, agent, paused, card_html: buildPourIACardBody(loadPourIA()) });
+});
+
+// API: lancer IMMÉDIATEMENT un tick de dispatch GTD « Pour IA » (même commande
+// que le cron Hermes 15 min du profil ron) — pas besoin d'attendre le tick.
+// Le conteneur ne peut pas exécuter le script hôte (pas d'accès /home/lydstyl,
+// .hermes en 0700) → SSH vers le serveur lui-même (192.168.3.102) avec la clé
+// id_ed25519_marie (déjà montée dans le conteneur, sans passphrase).
+app.post('/api/pour-ia/dispatch-now', (req, res) => {
+  const ssh = 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes -i /root/.ssh/id_ed25519_marie lydstyl@192.168.3.102';
+  try {
+    const out = execSync(ssh + " 'python3 /home/lydstyl/.hermes/profiles/ron/scripts/pour-ia-dispatch.py'", { timeout: 90000 }).toString().trim();
+    res.json({ ok: true, output: out, card_html: buildPourIACardBody(loadPourIA()) });
+  } catch (e) {
+    const out = [e.stdout, e.stderr].filter(Boolean).map(String).join(' ').trim() || String(e.message);
+    res.status(500).json({ ok: false, error: out.slice(0, 600) });
+  }
+});
 
 // ─── Routes ────────────────────────────────────────────────────────────────
 
@@ -701,6 +987,15 @@ function getAutoShutdown(name) {
   return { blocked: false, cronAt: null, shutdownAtMs: eta.getTime(), idleMin: idleMin };
 }
 
+// Worker DSH : PC dont le LLM est réservé par une session dsh en cours
+// (flag dsh_reserved écrit par pc-idle-watchdog.py, même fichier d'état).
+function getDshReserved(name) {
+  const key = WATCHDOG_MAP[name];
+  if (!key) return false;
+  const st = loadWatchdogState();
+  return !!(st && st[key] && st[key].dsh_reserved);
+}
+
 // ─── Réponse /api/pc-* : marque les données figées ───────────────────
 // Le cache survit à la mort du backend. On expose _stale / _age_s pour que le front
 // n'affiche jamais un vieux relevé comme s'il était live.
@@ -712,6 +1007,7 @@ function pcPayload(name) {
   const fresh = pcCache[name + 'Ok'] === true;
   return Object.assign({}, d, {
     auto_shutdown: getAutoShutdown(name),
+    dsh_reserved: getDshReserved(name),
     _stale: !fresh || (ageS !== null && ageS > PC_STALE_AFTER_S),
     _age_s: ageS,
     _fetched_at: ts ? new Date(ts).toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris' }) : null,
@@ -736,6 +1032,31 @@ app.get('/api/pc-marie', (req, res) => {
 // API: PC SkillORP (ex-carte « PC BonCoin » — backend skillorp-dashboard :3036)
 app.get('/api/pc-boncoin', (req, res) => {
   res.json(pcPayload('boncoin'));
+});
+
+// API: prolonger le compte à rebours d'extinction d'un PC de 30 min.
+// Semantique : reset idle_since a maintenant -> nouveau countdown = now + 30 min.
+// Le watchdog (tick 15 min) preserve l'idle_since existant tant que le PC reste
+// inactif, donc l'extension tient au moins 30 min. Ecriture atomique (tmp+rename)
+// pour ne pas casser l'etat que le watchdog lit.
+app.post('/api/pc-:name/extend', (req, res) => {
+  const name = req.params.name;
+  const key = WATCHDOG_MAP[name];
+  if (!key) return res.status(400).json({ ok: false, error: 'PC non gere par le watchdog' });
+  const st = loadWatchdogState();
+  if (!st) return res.status(500).json({ ok: false, error: 'state.json illisible' });
+  const pc = st[key] || {};
+  pc.idle_since = new Date().toISOString();
+  pc.idle_min = 0;
+  st[key] = pc;
+  try {
+    const tmp = WATCHDOG_STATE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(st, null, 2));
+    fs.renameSync(tmp, WATCHDOG_STATE);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+  res.json({ ok: true, key, idle_since: pc.idle_since });
 });
 
 // ─── LLM du PC Gabriel (192.168.3.224) : état réel par HTTP ────────────────
@@ -905,14 +1226,15 @@ function occJson(host, port, urlPath) {
 // /slots[].n_prompt_tokens = le DERNIER prompt traité (ni moyenne ni historique), n_ctx = le
 // contexte DU SLOT (llama.cpp avec -np 2 renvoie le contexte par slot, pas le total).
 function occSlotsStats(slots) {
-  const out = { slots: 0, active: 0, prompt_tokens: null, n_ctx: null };
+  const out = { slots: 0, active: 0, prompt_tokens: null, n_ctx: null, perSlot: [] };
   if (!Array.isArray(slots) || slots.length === 0) return out;
   out.slots = slots.length;
   let best = null;
-  slots.forEach((s) => {
+  slots.forEach((s, i) => {
     if (!s || typeof s !== 'object') return;
     if (s.is_processing === true) out.active += 1;
     const p = (typeof s.n_prompt_tokens === 'number' && s.n_prompt_tokens > 0) ? s.n_prompt_tokens : null;
+    if (p !== null) out.perSlot.push({ id: (typeof s.id === 'number') ? s.id : i, p: p });
     if (p !== null && (best === null || p > best.p)) {
       best = { p: p, n: (typeof s.n_ctx === 'number' && s.n_ctx > 0) ? s.n_ctx : null };
     }
@@ -925,21 +1247,42 @@ function occSlotsStats(slots) {
 }
 
 // ≈ Compactions : un serveur LLM ne voit que des requêtes HTTP, une compaction est un
-// événement du HARNAIS (réécriture de l'historique). Heuristique honnête : une chute de plus
-// de 40 % du prompt entre deux requêtes successives du même nœud = compaction probable —
-// indiscernable d'une nouvelle session, d'où le « ≈ » affiché et le mot « estimées ».
-function occTrackPrompt(id, promptTokens, ts) {
-  const st = OCC.prompts[id] || (OCC.prompts[id] = { seen: null, changedAt: null, prev: null, compactions: 0, lastDropTs: null });
-  if (typeof promptTokens === 'number' && promptTokens > 0 && st.seen !== promptTokens) {
-    if (typeof st.seen === 'number' && promptTokens < st.seen * 0.6) {
-      st.compactions += 1;
-      st.lastDropTs = ts;
+// événement du HARNAIS (réécriture de l'historique). Suivi PAR SLOT : une chute de plus de
+// 40 % du prompt d'UN slot, depuis un contexte gros (> 16 k tokens), = compaction probable.
+// Un slot libéré (n_prompt_tokens 0) remet le suivi à zéro : une nouvelle session sur un
+// slot vide ne compte plus comme compaction (faux positif historique du badge — 12/11/2026).
+function occTrackSlots(nodeId, perSlot, ts, slotsValid) {
+  const agg = { compactions: 0, lastDropTs: null, changedAt: null, prev: null };
+  const seenIds = new Set();
+  (perSlot || []).forEach((s) => {
+    const key = nodeId + ':' + s.id;
+    seenIds.add(key);
+    const st = OCC.prompts[key] || (OCC.prompts[key] = { seen: null, changedAt: null, prev: null, compactions: 0, lastDropTs: null });
+    if (s.p > 0 && st.seen !== s.p) {
+      if (typeof st.seen === 'number' && st.seen > 16384 && s.p < st.seen * 0.6) {
+        st.compactions += 1;
+        st.lastDropTs = ts;
+      }
+      st.prev = st.seen;
+      st.seen = s.p;
+      st.changedAt = ts;
     }
-    st.prev = st.seen;
-    st.seen = promptTokens;
-    st.changedAt = ts;
+    agg.compactions += st.compactions;
+    if (st.lastDropTs && (!agg.lastDropTs || st.lastDropTs > agg.lastDropTs)) agg.lastDropTs = st.lastDropTs;
+    if (st.changedAt && (!agg.changedAt || st.changedAt > agg.changedAt)) agg.changedAt = st.changedAt;
+    if (typeof st.prev === 'number' && (agg.prev === null || st.prev > agg.prev)) agg.prev = st.prev;
+  });
+  // Slot libéré (absent de la liste active) → suivi remis à zéro : la prochaine session
+  // ne doit pas hériter de l'ancien prompt. Sauf si /slots a échoué (pas de reset à l'aveugle).
+  if (slotsValid !== false) {
+    Object.keys(OCC.prompts).forEach((key) => {
+      if (key.startsWith(nodeId + ':') && !seenIds.has(key)) {
+        const st = OCC.prompts[key];
+        st.seen = null; st.prev = null; st.changedAt = null;
+      }
+    });
   }
-  return st;
+  return agg;
 }
 
 // La carte PC (collecteur SSH/Windows) répond-elle encore ? Elle distingue « serveur arrêté »
@@ -994,7 +1337,7 @@ async function occProbeNode(node) {
 
   const promptTokens = stats.prompt_tokens !== null ? stats.prompt_tokens
     : ((st && typeof st.prompt_tokens === 'number') ? st.prompt_tokens : null);
-  const track = occTrackPrompt(node.id, promptTokens, ts);
+  const track = occTrackSlots(node.id, stats.perSlot, ts, slots !== null);
 
   const active = stats.active;
   const busySlots = active > 0;
@@ -1542,6 +1885,10 @@ app.get('/', async (req, res) => {
   const ts  = new Date().toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris', hour12: false });
   const cachePct = ((parseFloat(mem.cache) / parseFloat(mem.total)) * 100).toFixed(1);
 
+  // ─── GTD Pour IA : queue de tâches pour agents locaux ───────────────────
+  const pourIA = loadPourIA();
+  const pourIACardBodyHtml = buildPourIACardBody(pourIA);
+
   // ─── Delegation Tracker (server-rendered) ────────────────────────────
   let delegationHtml = '';
 
@@ -1640,6 +1987,26 @@ app.get('/', async (req, res) => {
   .pc-countdown.warn{color:#fb923c}
   .pc-countdown.soon{color:#f87171}
   .pc-countdown.blocked{color:#94a3b8}
+  .extend-btn{margin-left:.4rem;padding:.1rem .45rem;font-size:.68rem;font-weight:600;color:#e2e8f0;background:#334155;border:1px solid #475569;border-radius:.3rem;cursor:pointer}
+  .extend-btn:hover{background:#475569}
+  .extend-btn:disabled{opacity:.6;cursor:wait}
+  /* GTD Pour IA : lignes compactes (carte lue au téléphone) */
+  .pia-task{margin-top:.45rem;gap:.35rem}
+  .pia-task-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#c8c8c8}
+  .pia-task-meta{display:flex;align-items:center;gap:.25rem;white-space:nowrap;flex:0 0 auto}
+  .pia-badge{display:inline-block;padding:.05rem .35rem;border-radius:.25rem;font-size:.62rem;font-weight:600;line-height:1.3;border:1px solid transparent}
+  .pia-target{background:#0a1a2a;color:#60a5fa;border-color:#1e3a5f}
+  .pia-target-auto{background:#141414;color:#8a8a8a;border-color:#262626}
+  .pia-mode-plan{background:#3b2f00;color:#facc15;border-color:#5c4a00}
+  .pia-mode-rapide{background:#042f2e;color:#2dd4bf;border-color:#115e59}
+  .pia-imp{color:#f472b6;font-size:.64rem}
+  .pia-agent-row{margin-top:.35rem;gap:.35rem}
+  .pia-agent-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#b8b8b8}
+  .pia-agent-task{color:#6b7280;font-size:.7rem}
+  .pia-st-running{color:#60a5fa}
+  .pia-st-idle{color:#4ade80}
+  .pia-st-paused{color:#fbbf24}
+  .pia-st-offline{color:#64748b}
   .proc-row{display:flex;justify-content:space-between;align-items:center;font-size:0.7rem;margin-top:0.25rem;font-family:'SF Mono','Fira Code','Consolas',monospace}
   .proc-row .proc-cpu{color:#4ade80;font-weight:600;min-width:2.2rem;text-align:right}
   .proc-row .proc-cmd{color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;margin-left:0.5rem}
@@ -1838,6 +2205,7 @@ app.get('/', async (req, res) => {
     <label class="settings-row" data-card-id="pc-boncoin"><span class="s-icon">🖥️</span><input type="checkbox"${vis('pc-boncoin')?' checked':''}><span class="s-toggle"></span><span class="s-label">PC SkillORP</span></label>
     <label class="settings-row" data-card-id="chart"><span class="s-icon">📈</span><input type="checkbox"${vis('chart')?' checked':''}><span class="s-toggle"></span><span class="s-label">Graphique</span></label>
     <label class="settings-row" data-card-id="energie"><span class="s-icon">⚡</span><input type="checkbox"${vis('energie')?' checked':''}><span class="s-toggle"></span><span class="s-label">Énergie (solaire + Linky)</span></label>
+    <label class="settings-row" data-card-id="pour-ia"><span class="s-icon">🤖</span><input type="checkbox"${vis('pour-ia')?' checked':''}><span class="s-toggle"></span><span class="s-label">GTD — Tâches Pour IA</span></label>
     <label class="settings-row" data-card-id="meteo"><span class="s-icon">🌦️</span><input type="checkbox"${vis('meteo')?' checked':''}><span class="s-toggle"></span><span class="s-label">Météo (Valenciennes)</span></label>
     <label class="settings-row" data-card-id="liens"><span class="s-icon">🔗</span><input type="checkbox"${vis('liens')?' checked':''}><span class="s-toggle"></span><span class="s-label">Liens</span></label>
   </div>
@@ -1902,6 +2270,12 @@ app.get('/', async (req, res) => {
   </div>
 
   <!-- CREDITS -->
+  <!-- GTD POUR IA : file de tâches pour les agents locaux (luna/harry/ron/dobby) -->
+  <div class="card ${visHidden('pour-ia')}" data-card-id="pour-ia"${orderOf('pour-ia')} >
+    <div class="card-header"><span class="icon">🤖</span><span class="card-title">GTD — Tâches Pour IA</span></div>
+    ${pourIACardBodyHtml}
+  </div>
+
   <div class="card ${visHidden('credits')}" data-card-id="credits"${orderOf('credits')} >
     <div class="card-header"><span class="icon">💳</span><span class="card-title">Crédits — Tous providers</span></div>
     <div class="big-value" style="color:${kc}">${credits.total}<span>$</span></div>
@@ -2581,14 +2955,23 @@ document.addEventListener('click', function(e){
     var slotsTotal = parseInt(data.llm_slots_total, 10);
     var hasSlots = !isNaN(slotsUsed) && !isNaN(slotsTotal) && slotsTotal > 1 && slotsUsed >= 0;
     var llmActivityBadge = '';
+    var dshWorker = data.dsh_reserved === true;
     if (!stale && llmStatus) {
       if (hasSlots) {
         var slotsLbl = slotsUsed + '/' + slotsTotal + (slotsUsed > 1 ? ' tâches' : ' tâche');
-        llmActivityBadge = slotsUsed > 0
-          ? '<span class="pc-status busy">⚡ ' + slotsLbl + ' en cours</span>'
-          : '<span class="pc-status idle">LIBRE · ' + slotsLbl + '</span>';
+        if (slotsUsed > 0) {
+          llmActivityBadge = '<span class="pc-status busy">⚡ ' + slotsLbl + ' en cours' + (dshWorker ? ' · 🤖 DSH' : '') + '</span>';
+        } else if (dshWorker) {
+          llmActivityBadge = '<span class="pc-status busy">🤖 Worker DSH</span>';
+        } else {
+          llmActivityBadge = '<span class="pc-status idle">LIBRE · ' + slotsLbl + '</span>';
+        }
       } else {
-        llmActivityBadge = llmBusy ? '<span class="pc-status busy">⚡ TACHE EN COURS</span>' : '<span class="pc-status idle">LIBRE</span>';
+        if (dshWorker) {
+          llmActivityBadge = '<span class="pc-status busy">🤖 Worker DSH</span>';
+        } else {
+          llmActivityBadge = llmBusy ? '<span class="pc-status busy">⚡ TACHE EN COURS</span>' : '<span class="pc-status idle">LIBRE</span>';
+        }
       }
     }
     // Vision multimodale (mmproj) : meme badge que la carte .224, mais deduit du process vivant.
@@ -2672,10 +3055,10 @@ document.addEventListener('click', function(e){
       } else if (asd.shutdownAtMs) {
         var remaining = Math.round((asd.shutdownAtMs - Date.now()) / 60000);
         if (remaining <= 0) {
-          countdownHtml = '<div class="pc-countdown soon">⏻ Extinction imminente</div>';
+          countdownHtml = '<div class="pc-countdown soon">⏻ Extinction imminente <button class="extend-btn" onclick="extendPcShutdown(\\'' + name + '\\')">⏸ +30 min</button></div>';
         } else {
           var cdCls = remaining <= 5 ? ' soon' : (remaining <= 10 ? ' warn' : '');
-          countdownHtml = '<div class="pc-countdown' + cdCls + '">⏻ Extinction dans ' + remaining + ' min</div>';
+          countdownHtml = '<div class="pc-countdown' + cdCls + '">⏻ Extinction dans ' + remaining + ' min <button class="extend-btn" onclick="extendPcShutdown(\\'' + name + '\\')">⏸ +30 min</button></div>';
         }
       }
     }
@@ -2903,6 +3286,95 @@ document.addEventListener('click', function(e){
     fetchLlmSpeed();
     fetchSolaire();
   }
+
+  // Prolonger le compte à rebours d'extinction d'un PC de 30 min (reset idle_since
+  // dans le state.json du watchdog). Appelée par le bouton « ⏸ +30 min » des cartes.
+  function extendPcShutdown(name) {
+    var btn = document.querySelector('#card-' + name + ' .extend-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ …'; }
+    fetch('/api/pc-' + name + '/extend', { method: 'POST' })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (d.ok) {
+          refreshAll();
+        } else {
+          if (btn) { btn.disabled = false; btn.textContent = '⏸ +30 min'; }
+          alert('Extension echouee : ' + (d.error || 'inconnu'));
+        }
+      })
+      .catch(function(e){
+        if (btn) { btn.disabled = false; btn.textContent = '⏸ +30 min'; }
+        alert('Extension echouee : ' + e);
+      });
+  }
+  window.extendPcShutdown = extendPcShutdown;
+
+  // Pause/reprise d'un agent GTD « Pour IA » (flag .paused lu par pour-ia-dispatch.py).
+  // Le serveur renvoie la carte re-rendue (card_html) → mise à jour instantanée,
+  // sans rechargement de page.
+  function setPourIACard(html) {
+    var card = document.querySelector('.card[data-card-id="pour-ia"]');
+    if (card && html) card.innerHTML = html;
+  }
+  // Note de statut éphémère dans la carte (auto-supprimée après 10 s)
+  function pourIACardFlash(msg, ok) {
+    var card = document.querySelector('.card[data-card-id="pour-ia"]');
+    if (!card) return;
+    var old = document.getElementById('pouria-status-note');
+    if (old) old.remove();
+    var div = document.createElement('div');
+    div.id = 'pouria-status-note';
+    div.className = 'note';
+    div.style.color = ok ? '#4ade80' : '#f87171';
+    div.style.whiteSpace = 'pre-wrap';
+    div.textContent = msg;
+    card.appendChild(div);
+    setTimeout(function(){ var el = document.getElementById('pouria-status-note'); if (el) el.remove(); }, 10000);
+  }
+  function togglePourIAPause(agent, paused) {
+    var btn = document.querySelector('.card[data-card-id="pour-ia"] button[onclick*="togglePourIAPause(' + agent + '"]');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ …'; }
+    fetch('/api/pour-ia/pause', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent: agent, paused: paused })
+    })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (d.ok) { setPourIACard(d.card_html); }
+        else {
+          if (btn) { btn.disabled = false; btn.textContent = paused ? '⏸ pause' : '▶ reprendre'; }
+          alert('Pause echouee : ' + (d.error || 'inconnu'));
+        }
+      })
+      .catch(function(e){
+        if (btn) { btn.disabled = false; btn.textContent = paused ? '⏸ pause' : '▶ reprendre'; }
+        alert('Pause echouee : ' + e);
+      });
+  }
+  // Lancer immédiatement un tick de dispatch (même commande que le cron 15 min)
+  // — pas besoin d'attendre le prochain tick.
+  function runPourIADispatch() {
+    var btn = document.getElementById('pouria-dispatch-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Dispatch en cours…'; }
+    fetch('/api/pour-ia/dispatch-now', { method: 'POST' })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (d.ok) {
+          setPourIACard(d.card_html);
+          pourIACardFlash(d.output ? ('🚀 ' + d.output) : '🚀 Tick lancé — file vide, rien à dispatcher', true);
+        } else {
+          if (btn) { btn.disabled = false; btn.textContent = '🚀 Dispatch maintenant'; }
+          pourIACardFlash('⚠️ Dispatch echoué : ' + d.error, false);
+        }
+      })
+      .catch(function(e){
+        if (btn) { btn.disabled = false; btn.textContent = '🚀 Dispatch maintenant'; }
+        pourIACardFlash('⚠️ Dispatch echoué : ' + e, false);
+      });
+  }
+  window.togglePourIAPause = togglePourIAPause;
+  window.runPourIADispatch = runPourIADispatch;
 
   // Auto-kill config helpers
   function getAutoKillConfig() {

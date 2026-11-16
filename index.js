@@ -222,6 +222,40 @@ function calcSpendingLast24h() {
   }
 }
 
+// ─── Spending calculation (last 7 days) ──────────────────────────────────
+function calcSpendingLast7d() {
+  try {
+    const entries = loadHistory();
+    const periodMs = 7 * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - periodMs;
+    const recent = entries.filter(e => new Date(e.timestamp).getTime() >= cutoff);
+
+    if (recent.length < 2) return { or: 0, kimi: 0, deepseek: 0, total: 0 };
+
+    let orSpent = 0, kimiSpent = 0, dsSpent = 0;
+
+    for (let i = 1; i < recent.length; i++) {
+      const prev = recent[i - 1], curr = recent[i];
+
+      const prevOR = parseFloat(prev.balances?.or ?? prev.balance ?? 0);
+      const currOR = parseFloat(curr.balances?.or ?? curr.balance ?? 0);
+      if (!isNaN(prevOR) && !isNaN(currOR)) orSpent += Math.max(0, prevOR - currOR);
+
+      const prevK = parseFloat(prev.balances?.kimi ?? 0);
+      const currK = parseFloat(curr.balances?.kimi ?? 0);
+      if (!isNaN(prevK) && !isNaN(currK) && (prev.balances?.kimi != null)) kimiSpent += Math.max(0, prevK - currK);
+
+      const prevD = parseFloat(prev.balances?.deepseek ?? 0);
+      const currD = parseFloat(curr.balances?.deepseek ?? 0);
+      if (!isNaN(prevD) && !isNaN(currD) && (prev.balances?.deepseek != null)) dsSpent += Math.max(0, prevD - currD);
+    }
+
+    return { or: orSpent, kimi: kimiSpent, deepseek: dsSpent, total: orSpent + kimiSpent + dsSpent };
+  } catch (e) {
+    return { or: 0, kimi: 0, deepseek: 0, total: 0 };
+  }
+}
+
 // ─── OpenRouter live usage (from /auth/key) ──────────────────────────────
 async function getLiveUsage() {
   try {
@@ -409,7 +443,7 @@ const DEFAULT_VISIBILITY = {
   'credits': true, 'depenses': true,
   'systeme': true, 'ollama': true,
   'pc-gabriel': true, 'pc-louis': true, 'pc-marie': true, 'pc-boncoin': true, 'chart': true,
-  'energie': true, 'pour-ia': true
+  'energie': true, 'pour-ia': true, 'pc-history': true
 };
 
 function loadCardVisibility() {
@@ -432,7 +466,7 @@ const ORDER_FILE = path.join(DATA_DIR, 'card_order.json');
 
 // Ordre par defaut = ordre de rendu du template (cartes + graphique)
 const DEFAULT_ORDER = [
-  'energie', 'pour-ia', 'meteo', 'liens', 'credits', 'depenses',
+  'energie', 'pour-ia', 'pc-history', 'meteo', 'liens', 'credits', 'depenses',
   'systeme', 'ollama', 'pc-gabriel', 'pc-louis', 'pc-marie', 'pc-boncoin', 'chart'
 ];
 
@@ -740,14 +774,25 @@ function piaAgentRowHtml(a) {
 // Reutilisé par les endpoints pause / dispatch-now pour renvoyer la carte
 // re-rendue au client → mise à jour instantanée, sans rechargement de page.
 function buildPourIACardBody(pourIA) {
-  var PIA_MAX_ROWS = 6; // lignes compactes (carte consultée au téléphone)
+  var PIA_MAX_ROWS = 8; // lignes (carte consultée au téléphone)
   let pourIARowsHtml = '';
   if (pourIA.tasks.length > 0) {
     const top = pourIA.tasks.slice(0, PIA_MAX_ROWS);
     pourIARowsHtml = top.map(function(t) {
       var imp = (t.importance != null && t.importance !== '') ? t.importance : '—';
-      return '<div class="row pia-task"><span class="label pia-task-name" title="' + escHtml(t.name) + '">' + escHtml(t.name) + '</span>'
-        + '<span class="val pia-task-meta">' + piaTargetBadge(t) + piaModeBadge(t) + '<span class="pia-imp">imp ' + escHtml(imp) + '</span></span></div>';
+      var impColor = (imp >= 200) ? '#f472b6' : (imp >= 100 ? '#fbbf24' : '#888');
+      var noteBrief = '';
+      if (t.note) {
+        // Extrait le texte brut de la note (strip HTML), max 80 chars
+        var plain = String(t.note).replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+        if (plain.length > 80) plain = plain.slice(0, 77) + '…';
+        if (plain) noteBrief = '<div class="pia-task-note">' + escHtml(plain) + '</div>';
+      }
+      return '<div class="pia-task-block">'
+        + '<div class="row pia-task"><span class="label pia-task-name" title="' + escHtml(t.name) + '">' + escHtml(t.name) + '</span>'
+        + '<span class="val pia-task-meta">' + piaTargetBadge(t) + piaModeBadge(t) + '<span class="pia-imp" style="color:' + impColor + '">imp ' + escHtml(imp) + '</span></span></div>'
+        + noteBrief
+        + '</div>';
     }).join('') + (pourIA.tasks.length > PIA_MAX_ROWS ? '<div class="note">+' + (pourIA.tasks.length - PIA_MAX_ROWS) + ' autre(s)…</div>' : '');
   } else {
     pourIARowsHtml = '<div class="note">File vide — rien à traiter 🎉</div>';
@@ -848,6 +893,120 @@ app.get('/api/delegation-stats', (req, res) => {
     res.json({ error: 'Stats not available', summary: { totalCost: 0, totalCalls: 0, last24hCost: 0, last24hCalls: 0 } });
   }
 });
+
+// ─── Historique tâches par PC (stats 30 j) ─────────────────────────────────
+// API: stats 30 jours par PC — modèle pc-task-history/v1 (tâche [1/4], Luna).
+// Source : /host/home/lydstyl/.hermes/state/pour-ia/pc-task-history.json (mount
+// rw du conteneur). Les stats 30 j sont RECALCULÉES à chaque appel depuis les
+// events (fenêtre fraîche « maintenant − 30 j »), indépendamment du moment où le
+// collecteur (collect-pc-task-history.py) a dernier tourné. Formules identiques
+// au collecteur : travail = Σ dur_s des events dans la fenêtre, énergie =
+// power_w.working × durée de travail, coût = kWh × prix.
+const PC_TASK_HISTORY_FILE = '/host/home/lydstyl/.hermes/state/pour-ia/pc-task-history.json';
+
+// Calcule les stats 30 j par PC depuis le modèle (fenêtre « maintenant − 30 j »
+// recalculée à CHAQUE appel, indépendant du dernier run du collecteur).
+// Utilisé par l'endpoint /api/pc-task-history ET la carte « Historique tâches par PC ».
+function loadPcTaskHistory() {
+  const doc = JSON.parse(fs.readFileSync(PC_TASK_HISTORY_FILE, 'utf8'));
+  const now = new Date();
+  const windowDays = doc.window_days || 30;
+  const cutoff = new Date(now.getTime() - windowDays * 24 * 3600 * 1000);
+  const price = doc.energy_price_eur_kwh != null ? doc.energy_price_eur_kwh : 0.25;
+
+  const outPcs = {};
+  for (const [agent, pc] of Object.entries(doc.pcs || {})) {
+    const events = pc.events || [];
+    const inWin = events.filter(e => e.start && new Date(e.start) >= cutoff);
+    let last = null;
+    for (const e of events) {
+      if (e.start && (!last || new Date(e.start) > new Date(last.start))) last = e;
+    }
+    const workS = inWin.reduce((s, e) => s + (e.dur_s || 0), 0);
+    const workH = workS / 3600;
+    const kwh = ((pc.power_w && pc.power_w.working) || 0) * workS / 3600 / 1000;
+    outPcs[agent] = {
+      label: pc.label,
+      host: pc.host,
+      power_w: pc.power_w,
+      metrics: {
+        last_task_at: last ? last.start : null,
+        last_task_name: last ? (last.name || null) : null,
+        tasks_30d: new Set(inWin.map(e => e.task_id)).size,
+        runs_30d: inWin.length,
+        work_hours_30d: Math.round(workH * 100) / 100,
+        idle_hours_30d: Math.round((windowDays * 24 - workH) * 100) / 100,
+        energy_kwh_30d: Math.round(kwh * 1000) / 1000,
+        cost_eur_30d: Math.round(kwh * price * 1000) / 1000,
+      },
+      events_30d: inWin,
+    };
+  }
+  return {
+    schema: doc.schema,
+    generated_at: doc.generated_at,   // dernier run du collecteur (fraîcheur des données)
+    computed_at: now.toISOString(),   // calcul de la fenêtre 30 j
+    window_days: windowDays,
+    energy_price_eur_kwh: price,
+    pcs: outPcs,
+  };
+}
+
+app.get('/api/pc-task-history', (req, res) => {
+  try {
+    const h = loadPcTaskHistory();
+    if (req.query.events === '0') {
+      for (const pc of Object.values(h.pcs)) delete pc.events_30d;
+    }
+    res.json({ ok: true, ...h });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// HTML du corps de la carte « Historique tâches par PC (30 j) » (rendu serveur,
+// tâche [4/4]). Un bloc par PC avec les 6 métriques demandées : dernière tâche
+// (date + nom), nb tâches 30 j, durée travail 30 j, durée sans travail 30 j,
+// coût élec 30 j (kWh + €). Grid 3×2 lisible au téléphone.
+function buildPcHistoryCardBody() {
+  try {
+    const h = loadPcTaskHistory();
+    const agents = Object.keys(h.pcs);
+    if (!agents.length) return '<div class="note">⚠️ Aucun PC dans le modèle (pc-task-history.json).</div>';
+    const fmtDT = s => s
+      ? new Date(s).toLocaleString('fr-FR', { timeZone: 'Europe/Paris', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+      : '—';
+    const fmtH = v => (v == null ? '—' : (Math.round(v * 10) / 10).toLocaleString('fr-FR') + ' h');
+    const blocks = agents.map(function(a) {
+      const pc = h.pcs[a];
+      const m = pc.metrics;
+      const watts = pc.power_w && pc.power_w.working ? pc.power_w.working + ' W' : '—';
+      const calib = pc.power_w && pc.power_w.calibrated === false ? ' (est.)' : '';
+      const lastName = m.last_task_name ? '« ' + escHtml(m.last_task_name) + ' »' : '—';
+      const cell = (k, v, color) => '<div><div class="pch-k">' + k + '</div><div class="pch-v"' + (color ? ' style="color:' + color + '"' : '') + '>' + v + '</div></div>';
+      return '<div class="pch-block">'
+        + '<div class="pch-head"><span class="pch-label">🖥 ' + escHtml(pc.label || a) + '</span>'
+        + '<span class="pch-agent">' + escHtml(a) + ' · ⚡ ' + escHtml(watts) + escHtml(calib) + '</span></div>'
+        + '<div class="pch-grid">'
+        +   cell('Tâches 30 j', m.tasks_30d + (m.runs_30d > m.tasks_30d ? ' <span style="font-size:.62rem;font-weight:400;color:#777">(' + m.runs_30d + ' runs)</span>' : ''))
+        +   cell('Travail 30 j', fmtH(m.work_hours_30d))
+        +   cell('Sans travail', fmtH(m.idle_hours_30d))
+        +   cell('Énergie 30 j', m.energy_kwh_30d.toLocaleString('fr-FR') + ' kWh')
+        +   cell('Coût élec.', m.cost_eur_30d.toLocaleString('fr-FR') + ' €', '#fbbf24')
+        +   cell('Dernière tâche', fmtDT(m.last_task_at))
+        + '</div>'
+        + '<div class="pch-last" title="' + escHtml(lastName) + '">→ ' + lastName + '</div>'
+        + '</div>';
+    }).join('');
+    const genTs = h.generated_at
+      ? new Date(h.generated_at).toLocaleString('fr-FR', { timeZone: 'Europe/Paris', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+      : '—';
+    return blocks
+      + '<div class="row" style="margin-top:0.55rem"><span class="val-muted">Données du ' + genTs + ' · ' + h.energy_price_eur_kwh.toLocaleString('fr-FR') + ' €/kWh · watts estimés (calibrables dans collect-pc-task-history.py)</span></div>';
+  } catch (e) {
+    return '<div class="note">⚠️ Historique indisponible : ' + escHtml(String(e.message || e)).slice(0, 120) + '</div>';
+  }
+}
 
 // ─── PC Health Cache ─────────────────────────────────────────────────
 const pcCache = { gabriel: null, louis: null, marie: null, boncoin: null, gabrielOk: false, louisOk: false, marieOk: false, boncoinOk: false };
@@ -1046,13 +1205,23 @@ app.post('/api/pc-:name/extend', (req, res) => {
   const st = loadWatchdogState();
   if (!st) return res.status(500).json({ ok: false, error: 'state.json illisible' });
   const pc = st[key] || {};
-  pc.idle_since = new Date().toISOString();
+  // Le watchdog ecrit des heures LOCALES de Paris SANS fuseau (datetime.now()).
+  // On ecrit le meme format : un Z (UTC) ferait crasher le watchdog au tick
+  // suivant (fromisoformat -> aware, soustraction naive - aware -> TypeError),
+  // ce qui tue l'extinction auto du PC.
+  pc.idle_since = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Paris', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  }).format(new Date()).replace(/,\s*/, 'T');
   pc.idle_min = 0;
   st[key] = pc;
   try {
     const tmp = WATCHDOG_STATE + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(st, null, 2));
     fs.renameSync(tmp, WATCHDOG_STATE);
+    // Invalide le cache 60 s : sans ca, le GET suivant renvoie l'ancien etat
+    // et le compte a rebours ne bouge pas -> le bouton parait mort.
+    _wdState = null; _wdStateTs = 0;
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e) });
   }
@@ -1430,6 +1599,83 @@ app.get('/api/llm-speed', (req, res) => {
     res.json(parsed);
   } catch (e) {
     res.json({ ok: false, by_node: {}, max_gen_tps: null, error: 'aucune mesure: ' + e.message });
+  }
+});
+
+// ─── Collecteur de t/s réels → data/llm-speed-history.json ──────────────────
+// Échantillon = tokens_per_s mesuré PAR LE SERVEUR LUI-MÊME (lu dans le cache
+// d'occupation /api/llm-occupancy) quand un nœud est en génération. Coût zéro :
+// aucune requête en plus vers les PC, aucun bench lancé. La moyenne 7 j en est
+// la consolidation (endpoint /api/llm-speed-7d).
+const LLM_SPEED_HISTORY_FILE = '/app/data/llm-speed-history.json';
+const SPEED_SAMPLE_MS = 5 * 60 * 1000;           // 1 passage toutes les 5 min
+const SPEED_KEEP_MS = 14 * 24 * 3600 * 1000;     // on garde 14 jours (fenêtre 7 j + marge)
+
+function loadSpeedHistory() {
+  try {
+    const p = JSON.parse(require('fs').readFileSync(LLM_SPEED_HISTORY_FILE, 'utf8'));
+    return (p && Array.isArray(p.samples)) ? p : { samples: [] };
+  } catch (e) { return { samples: [] }; }
+}
+
+function sampleLlmSpeed() {
+  getOccupancy().then((payload) => {
+    const now = Date.now();
+    const hist = loadSpeedHistory();
+    (payload.nodes || []).forEach((n) => {
+      if (!n || !n.id) return;
+      if (typeof n.tokens_per_s === 'number' && n.tokens_per_s > 0) {
+        hist.samples.push({
+          ts: now,
+          node: n.id,
+          tps: Math.round(n.tokens_per_s * 10) / 10,
+          prompt_tokens: (typeof n.prompt_tokens === 'number' && n.prompt_tokens > 0) ? n.prompt_tokens : null
+        });
+      }
+    });
+    hist.samples = hist.samples.filter((s) => (now - s.ts) <= SPEED_KEEP_MS);
+    try {
+      require('fs').writeFileSync(LLM_SPEED_HISTORY_FILE, JSON.stringify(hist, null, 1));
+    } catch (e) { console.error('llm-speed-history write:', e.message); }
+  }).catch(() => {});
+}
+setInterval(sampleLlmSpeed, SPEED_SAMPLE_MS);
+setTimeout(sampleLlmSpeed, 30 * 1000);   // 1er passage 30 s après le démarrage
+
+// API: moyenne t/s sur 7 jours par nœud (source : data/llm-speed-history.json,
+// alimenté par sampleLlmSpeed — t/s RÉELS en génération, pas le bench statique).
+app.get('/api/llm-speed-7d', (req, res) => {
+  try {
+    const hist = loadSpeedHistory();
+    const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
+    const byNode = {};
+    let n = 0, sum = 0, firstTs = null, lastTs = null;
+    (hist.samples || []).forEach((s) => {
+      if (!s || typeof s.tps !== 'number' || s.ts < cutoff) return;
+      const e = byNode[s.node] || (byNode[s.node] = { sum: 0, count: 0, last_ts: null });
+      e.sum += s.tps; e.count += 1;
+      if (!e.last_ts || s.ts > e.last_ts) e.last_ts = s.ts;
+      n += 1; sum += s.tps;
+      if (!firstTs || s.ts < firstTs) firstTs = s.ts;
+      if (!lastTs || s.ts > lastTs) lastTs = s.ts;
+    });
+    Object.keys(byNode).forEach((k) => {
+      byNode[k] = {
+        avg_tps: Math.round((byNode[k].sum / byNode[k].count) * 10) / 10,
+        samples: byNode[k].count,
+        last_ts: new Date(byNode[k].last_ts).toISOString()
+      };
+    });
+    res.json({
+      ok: true,
+      window_days: 7,
+      by_node: byNode,
+      overall: n > 0
+        ? { avg_tps: Math.round((sum / n) * 10) / 10, samples: n, first_ts: new Date(firstTs).toISOString(), last_ts: new Date(lastTs).toISOString() }
+        : null
+    });
+  } catch (e) {
+    res.json({ ok: false, by_node: {}, overall: null, error: e.message });
   }
 });
 
@@ -1872,6 +2118,7 @@ app.post('/api/pc-toggle-plug', async (req, res) => {
 app.get('/', async (req, res) => {
   const spending = calcSpending();
   const spending24h = calcSpendingLast24h();
+  const spending7d = calcSpendingLast7d();
   const [credits, sys, ollama, live, weather, links] = await Promise.all([
     getAllCredits(), Promise.resolve(getSystem()), getOllamaUsage(), getLiveUsage(),
     getWeather(), Promise.resolve(loadLinks())
@@ -1888,6 +2135,9 @@ app.get('/', async (req, res) => {
   // ─── GTD Pour IA : queue de tâches pour agents locaux ───────────────────
   const pourIA = loadPourIA();
   const pourIACardBodyHtml = buildPourIACardBody(pourIA);
+
+  // ─── Historique tâches par PC (30 j) : carte serveur rendue depuis le modèle ─
+  const pcHistoryCardBodyHtml = buildPcHistoryCardBody();
 
   // ─── Delegation Tracker (server-rendered) ────────────────────────────
   let delegationHtml = '';
@@ -1992,8 +2242,20 @@ app.get('/', async (req, res) => {
   .extend-btn:disabled{opacity:.6;cursor:wait}
   /* GTD Pour IA : lignes compactes (carte lue au téléphone) */
   .pia-task{margin-top:.45rem;gap:.35rem}
-  .pia-task-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#c8c8c8}
+  .pia-task-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e8e8e8;font-weight:600;font-size:.82rem}
   .pia-task-meta{display:flex;align-items:center;gap:.25rem;white-space:nowrap;flex:0 0 auto}
+  .pia-task-block{margin-top:.55rem;padding:.4rem .5rem;background:#141414;border-radius:6px;border-left:3px solid #2a2a2a}
+  .pia-task-block .pia-task{margin-top:0}
+  .pia-task-note{font-size:.68rem;color:#777;margin-top:.3rem;line-height:1.3;padding-left:.1rem}
+  /* ── Carte Historique tâches par PC (30 j) ── */
+  .pch-block{margin-top:.55rem;padding:.45rem .5rem;background:#141414;border-radius:6px;border-left:3px solid #2a2a2a}
+  .pch-head{display:flex;justify-content:space-between;align-items:baseline;gap:.5rem}
+  .pch-label{font-weight:700;color:#e8e8e8;font-size:.82rem}
+  .pch-agent{font-size:.66rem;color:#777;white-space:nowrap}
+  .pch-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:.35rem .5rem;margin-top:.4rem}
+  .pch-k{font-size:.6rem;color:#888;text-transform:uppercase;letter-spacing:.03em}
+  .pch-v{font-size:.85rem;font-weight:700;color:#d4d4d4;margin-top:.05rem}
+  .pch-last{font-size:.68rem;color:#777;margin-top:.4rem;line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .pia-badge{display:inline-block;padding:.05rem .35rem;border-radius:.25rem;font-size:.62rem;font-weight:600;line-height:1.3;border:1px solid transparent}
   .pia-target{background:#0a1a2a;color:#60a5fa;border-color:#1e3a5f}
   .pia-target-auto{background:#141414;color:#8a8a8a;border-color:#262626}
@@ -2072,6 +2334,8 @@ app.get('/', async (req, res) => {
   .pc-btn:disabled{opacity:0.4;cursor:not-allowed}
   .pc-btn-danger{background:#2a0a0a;color:#f87171;border-color:#7f1d1d}
   .pc-btn-danger:hover{background:#3b0a0a;border-color:#dc2626}
+  .pc-btn-soft{background:#2a2205;color:#facc15;border-color:#713f12}
+  .pc-btn-soft:hover{background:#3b3008;border-color:#ca8a04}
   .pc-btn-boot{background:#0a1a2a;color:#93c5fd;border-color:#1e3a5f}
   .pc-btn-boot:hover{background:#0f2540;border-color:#2563eb}
   .pc-plug-toggle{display:inline-flex;align-items:center;gap:0.3rem;cursor:pointer;font-size:0.72rem;color:#888;padding:0.15rem 0.35rem;user-select:none}
@@ -2206,6 +2470,7 @@ app.get('/', async (req, res) => {
     <label class="settings-row" data-card-id="chart"><span class="s-icon">📈</span><input type="checkbox"${vis('chart')?' checked':''}><span class="s-toggle"></span><span class="s-label">Graphique</span></label>
     <label class="settings-row" data-card-id="energie"><span class="s-icon">⚡</span><input type="checkbox"${vis('energie')?' checked':''}><span class="s-toggle"></span><span class="s-label">Énergie (solaire + Linky)</span></label>
     <label class="settings-row" data-card-id="pour-ia"><span class="s-icon">🤖</span><input type="checkbox"${vis('pour-ia')?' checked':''}><span class="s-toggle"></span><span class="s-label">GTD — Tâches Pour IA</span></label>
+    <label class="settings-row" data-card-id="pc-history"><span class="s-icon">📊</span><input type="checkbox"${vis('pc-history')?' checked':''}><span class="s-toggle"></span><span class="s-label">Historique tâches par PC (30 j)</span></label>
     <label class="settings-row" data-card-id="meteo"><span class="s-icon">🌦️</span><input type="checkbox"${vis('meteo')?' checked':''}><span class="s-toggle"></span><span class="s-label">Météo (Valenciennes)</span></label>
     <label class="settings-row" data-card-id="liens"><span class="s-icon">🔗</span><input type="checkbox"${vis('liens')?' checked':''}><span class="s-toggle"></span><span class="s-label">Liens</span></label>
   </div>
@@ -2276,6 +2541,12 @@ app.get('/', async (req, res) => {
     ${pourIACardBodyHtml}
   </div>
 
+  <!-- HISTORIQUE TÂCHES PAR PC (30 j) : 6 métriques par PC (tâche [4/4]) -->
+  <div class="card ${visHidden('pc-history')}" data-card-id="pc-history"${orderOf('pc-history')} >
+    <div class="card-header"><span class="icon">📊</span><span class="card-title">Historique tâches par PC (30 j)</span></div>
+    ${pcHistoryCardBodyHtml}
+  </div>
+
   <div class="card ${visHidden('credits')}" data-card-id="credits"${orderOf('credits')} >
     <div class="card-header"><span class="icon">💳</span><span class="card-title">Crédits — Tous providers</span></div>
     <div class="big-value" style="color:${kc}">${credits.total}<span>$</span></div>
@@ -2291,12 +2562,13 @@ app.get('/', async (req, res) => {
     <div class="card-header"><span class="icon">💰</span><span class="card-title">Dépenses LLM</span></div>
     <div class="big-value" style="color:#fbbf24;font-size:2.2rem">${spending.total.toFixed(2)}<span>$ · 30 j</span></div>
     <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:0.4rem;font-size:0.8rem"><span style="color:#888">Dernières 24 h</span><span style="color:#fbbf24;font-weight:700">${spending24h.total.toFixed(3)} $</span></div>
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:0.25rem;font-size:0.8rem"><span style="color:#888">7 derniers jours</span><span style="color:#fb923c;font-weight:700">${spending7d.total.toFixed(3)} $</span></div>
     <hr class="divider">
-    <div class="row" style="opacity:0.65"><span class="label">Provider</span><span class="val-muted">30 j · 24 h</span></div>
-    <div class="row"><span class="label">OpenRouter</span><span class="val" style="color:#60a5fa">${spending.or.toFixed(2)} $ · ${spending24h.or.toFixed(3)} $</span></div>
+    <div class="row" style="opacity:0.65"><span class="label">Provider</span><span class="val-muted">30 j · 7 j · 24 h</span></div>
+    <div class="row"><span class="label">OpenRouter</span><span class="val" style="color:#60a5fa">${spending.or.toFixed(2)} $ · ${spending7d.or.toFixed(3)} $ · ${spending24h.or.toFixed(3)} $</span></div>
     <div class="row"><span class="label">OpenRouter (ce mois, API)</span><span class="val" style="color:#60a5fa">${live.ok ? live.usageMonthly.toFixed(2) + ' $' : '—'}</span></div>
-    <div class="row"><span class="label">Kimi</span><span class="val" style="color:#a78bfa">${spending.kimi.toFixed(2)} $ · ${spending24h.kimi.toFixed(3)} $</span></div>
-    <div class="row"><span class="label">DeepSeek</span><span class="val" style="color:#4ade80">${spending.deepseek.toFixed(2)} $ · ${spending24h.deepseek.toFixed(3)} $</span></div>
+    <div class="row"><span class="label">Kimi</span><span class="val" style="color:#a78bfa">${spending.kimi.toFixed(2)} $ · ${spending7d.kimi.toFixed(3)} $ · ${spending24h.kimi.toFixed(3)} $</span></div>
+    <div class="row"><span class="label">DeepSeek</span><span class="val" style="color:#4ade80">${spending.deepseek.toFixed(2)} $ · ${spending7d.deepseek.toFixed(3)} $ · ${spending24h.deepseek.toFixed(3)} $</span></div>
     <div class="note">Somme des baisses de solde · relevés ~6 h.</div>
   </div>
 
@@ -2351,6 +2623,7 @@ app.get('/', async (req, res) => {
       <button class="pc-btn pc-btn-boot" onclick="bootPc('gabriel')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('gabriel','start_llm')">▶ Démarrer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('gabriel','kill_llm')">⏹ Arrêter LLM</button>
+      <button class="pc-btn pc-btn-soft" onclick="pcAction('gabriel','stop_task_soft')" title="Récap LLM → tâche GTD de reprise (Pour IA), puis kill du LLM. 30-60 s.">🧠 Arrêt soft</button>
       <button class="pc-btn pc-btn-danger" onclick="shutPc('gabriel')" title="Kill le LLM, éteindre le PC, vérifier l'extinction, couper la prise">⏻ Éteindre + prise</button>
       <label class="pc-plug-toggle" id="pc-gabriel-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-gabriel-plug-slider"></span><span class="pc-plug-status" id="pc-gabriel-plug-status">❓</span><span class="pc-plug-power" id="pc-gabriel-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
@@ -2370,6 +2643,7 @@ app.get('/', async (req, res) => {
       <button class="pc-btn pc-btn-boot" onclick="bootPc('louis')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('louis','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('louis','kill_llm')">⏹ Kill LLM</button>
+      <button class="pc-btn pc-btn-soft" onclick="pcAction('louis','stop_task_soft')" title="Récap LLM → tâche GTD de reprise (Pour IA), puis kill du LLM. 30-60 s.">🧠 Arrêt soft</button>
       <button class="pc-btn pc-btn-danger" onclick="shutPc('louis')" title="Kill le LLM, éteindre le PC, vérifier l'extinction, couper la prise">⏻ Éteindre + prise</button>
       <label class="pc-plug-toggle" id="pc-louis-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-louis-plug-slider"></span><span class="pc-plug-status" id="pc-louis-plug-status">❓</span><span class="pc-plug-power" id="pc-louis-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
@@ -2389,6 +2663,7 @@ app.get('/', async (req, res) => {
       <button class="pc-btn pc-btn-boot" onclick="bootPc('marie')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('marie','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('marie','kill_llm')">⏹ Kill LLM</button>
+      <button class="pc-btn pc-btn-soft" onclick="pcAction('marie','stop_task_soft')" title="Récap LLM → tâche GTD de reprise (Pour IA), puis kill du LLM. 30-60 s.">🧠 Arrêt soft</button>
       <button class="pc-btn pc-btn-danger" onclick="shutPc('marie')" title="Kill le LLM, éteindre le PC, vérifier l'extinction, couper la prise">⏻ Éteindre + prise</button>
       <label class="pc-plug-toggle" id="pc-marie-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-marie-plug-slider"></span><span class="pc-plug-status" id="pc-marie-plug-status">❓</span><span class="pc-plug-power" id="pc-marie-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM > 90%">
@@ -2408,6 +2683,7 @@ app.get('/', async (req, res) => {
       <button class="pc-btn pc-btn-boot" onclick="bootPc('boncoin')" title="Allumer la prise, attendre le boot, puis lancer le LLM">⚡ Boot + LLM</button>
       <button class="pc-btn" onclick="pcAction('boncoin','start_llm')">▶ Lancer LLM</button>
       <button class="pc-btn pc-btn-danger" onclick="pcAction('boncoin','kill_llm')">⏹ Kill LLM</button>
+      <button class="pc-btn pc-btn-soft" onclick="pcAction('boncoin','stop_task_soft')" title="Récap LLM → tâche GTD de reprise (Pour IA), puis kill du LLM. 30-60 s.">🧠 Arrêt soft</button>
       <button class="pc-btn pc-btn-danger" onclick="shutPc('boncoin')" title="Kill le LLM, éteindre le PC, vérifier l'extinction, couper la prise">⏻ Éteindre + prise</button>
       <label class="pc-plug-toggle" id="pc-boncoin-plug-toggle" title="Allumer/éteindre la prise">🔌 <span class="pc-plug-slider" id="pc-boncoin-plug-slider"></span><span class="pc-plug-status" id="pc-boncoin-plug-status">❓</span><span class="pc-plug-power" id="pc-boncoin-plug-power"></span></label>
       <label class="pc-auto-label" title="Kill automatique du LLM si RAM >90%">
@@ -2817,6 +3093,7 @@ document.addEventListener('click', function(e){
   // Un chiffre par nœud, barre remplie au prorata du PLUS RAPIDE (100 % = le plus rapide).
   // ⚠️ Bloc dans une template literal : pas de backtick, pas d'antislash.
   var _llmSpeed = null;
+  var _llmSpeed7d = null;
 
   function speedInnerHtml(name) {
     var s = _llmSpeed;
@@ -2839,30 +3116,21 @@ document.addEventListener('click', function(e){
       ? '<div class="pc-speed-row pc-speed-sub" style="margin-top:0.15rem"><span>texte libre ' + n.gen_tps +
         ' t/s · sortie répétitive ' + n.gen_tps_repeat + ' t/s</span></div>'
       : '';
+    // Deux chiffres vivants en plus du bench : 7 j = moyenne des t/s RÉELS mesurés
+    // (data/llm-speed-history.json, collecteur 5 min) · live = tokens_per_s courant
+    // lu dans l'occupation (3 s). Le bench reste la référence max de la barre.
+    var n7 = (_llmSpeed7d && _llmSpeed7d.by_node) ? _llmSpeed7d.by_node[name] : null;
+    var occN = _occNodes[name];
+    var liveTps = (occN && typeof occN.tokens_per_s === 'number' && occN.tokens_per_s > 0) ? occN.tokens_per_s : null;
+    var liveTxt = liveTps !== null ? liveTps + ' t/s' : (occN && occN.busy ? 'en cours…' : 'libre');
+    var histRow = '<div class="pc-speed-row" style="margin-top:0.2rem"><span class="pc-speed-sub">7 j ' +
+      (n7 ? n7.avg_tps + ' t/s · ' + n7.samples + ' mes.' : '— (pas encore de mesures)') + '</span>' +
+      '<span class="pc-speed-val" style="font-size:0.85em">live ' + liveTxt + '</span></div>';
     return '<div class="pc-speed-row"><span>⚡ Vitesse <span class="pc-speed-sub">texte libre @' + ctxTxt + ' ctx</span></span>' +
       '<span class="pc-speed-val">' + n.gen_tps + ' t/s</span></div>' +
       '<div class="pc-speed-bar"><div class="pc-speed-fill" style="width:' + pct.toFixed(1) + '%;background:' + col + '"></div></div>' +
       '<div class="pc-speed-row pc-speed-sub" style="margin-top:0.2rem"><span>' + sub + '</span>' +
-      '<span>' + Math.round(pct) + '% du max</span></div>' + reg +
-      intelInnerHtml(name);
-  }
-
-  // Seconde barre (prévue) : intelligence mesurée. N'apparaît que si la mesure existe
-  // dans data/llm-speed.json (champ by_node.<pc>.intel.score), donc rien à faire tant
-  // que le banc d'intelligence n'a pas tourné.
-  function intelInnerHtml(name) {
-    var s = _llmSpeed;
-    if (!s || !s.by_node || !s.by_node[name]) return '';
-    var it = s.by_node[name].intel;
-    if (!it || !it.score) return '';
-    var max = parseFloat(s.max_intel_score) || it.score;
-    var pct = Math.max(3, Math.min(100, (it.score / max) * 100));
-    var col = (pct > 99) ? '#a78bfa' : (pct >= 60 ? '#818cf8' : '#f472b6');
-    return '<div class="pc-speed-row" style="margin-top:0.4rem"><span>🧠 Intelligence <span class="pc-speed-sub">' + (it.bench || 'score') + '</span></span>' +
-      '<span class="pc-speed-val">' + it.score + (it.unit || '%') + '</span></div>' +
-      '<div class="pc-speed-bar"><div class="pc-speed-fill" style="width:' + pct.toFixed(1) + '%;background:' + col + '"></div></div>' +
-      '<div class="pc-speed-row pc-speed-sub" style="margin-top:0.2rem"><span>' + (it.detail || '') + '</span>' +
-      '<span>absolu / 100</span></div>';
+      '<span>' + Math.round(pct) + '% du max</span></div>' + histRow + reg;
   }
 
   function speedBlockHtml(name) {
@@ -2879,6 +3147,13 @@ document.addEventListener('click', function(e){
   function fetchLlmSpeed() {
     fetch('/api/llm-speed').then(function(r) { return r.json(); }).then(function(d) {
       _llmSpeed = d;
+      refreshSpeedBars();
+    }).catch(function() {});
+  }
+
+  function fetchLlmSpeed7d() {
+    fetch('/api/llm-speed-7d').then(function(r) { return r.json(); }).then(function(d) {
+      _llmSpeed7d = d;
       refreshSpeedBars();
     }).catch(function() {});
   }
@@ -3182,7 +3457,11 @@ document.addEventListener('click', function(e){
       var det = '';
       if (occNum(n.tokens_per_s) !== null) { det = det + n.tokens_per_s + ' t/s'; }
       if (occNum(n.generated) !== null && n.generated > 0) { det = det + (det ? ' · ' : '') + n.generated + ' tok'; }
-      if (occNum(n.elapsed_s) !== null) { det = det + (det ? ' · ' : '') + n.elapsed_s + ' s'; }
+      if (occNum(n.elapsed_s) !== null && n.elapsed_s > 0) {
+        var elS = n.elapsed_s;
+        var elTxt = elS < 60 ? elS + ' s' : elS < 3600 ? Math.round(elS / 60) + ' min' : Math.floor(elS / 3600) + ' h ' + Math.round((elS % 3600) / 60) + ' min';
+        det = det + (det ? ' · ' : '') + '⏱ ' + elTxt;
+      }
       if (det) { html = html + ' <span class="pc-status idle">' + det + '</span>'; }
       if (n.phase) { html = html + '<div class="pc-occ-phase">' + occEsc(n.phase) + '</div>'; }
     } else if (queued > 0) {
@@ -3266,6 +3545,7 @@ document.addEventListener('click', function(e){
         if (nodes[i] && nodes[i].id) { _occNodes[nodes[i].id] = nodes[i]; }
       }
       renderOccAll();
+      refreshSpeedBars();   // la ligne « live t/s » de la barre vitesse suit le badge
     }).catch(function() {
       clearTimeout(tid);
       _occBusy = false;   // jamais de verrou permanent : le tick suivant retente
@@ -3284,13 +3564,14 @@ document.addEventListener('click', function(e){
     fetchPlugState('marie');
     fetchPlugState('boncoin');
     fetchLlmSpeed();
+    fetchLlmSpeed7d();
     fetchSolaire();
   }
 
   // Prolonger le compte à rebours d'extinction d'un PC de 30 min (reset idle_since
   // dans le state.json du watchdog). Appelée par le bouton « ⏸ +30 min » des cartes.
   function extendPcShutdown(name) {
-    var btn = document.querySelector('#card-' + name + ' .extend-btn');
+    var btn = document.querySelector('#pc-' + name + '-card .extend-btn');
     if (btn) { btn.disabled = true; btn.textContent = '⏳ …'; }
     fetch('/api/pc-' + name + '/extend', { method: 'POST' })
       .then(function(r){ return r.json(); })
@@ -3395,6 +3676,7 @@ document.addEventListener('click', function(e){
     // Feedback visuel immédiat pendant la requête (start_llm peut prendre plusieurs secondes)
     if (resultEl && action === 'start_llm') resultEl.textContent = '⏳ Lancement…';
     if (resultEl && action === 'kill_llm' && pc === 'gabriel') resultEl.textContent = '⏳ Arrêt en cours…';
+    if (resultEl && action === 'stop_task_soft') resultEl.textContent = '⏳ Arrêt soft : récap LLM + tâche GTD (30-60 s)…';
 
     fetch('/api/pc-action', {
       method: 'POST',
@@ -3416,7 +3698,7 @@ document.addEventListener('click', function(e){
       }
       // État réel du LLM (le .224 ne se lit pas dans les process) : on re-sonde tout de suite,
       // puis refreshLlm224 se reprogramme toutes les 5 s tant que c'est « en cours de démarrage ».
-      if (pc === 'gabriel' && (action === 'start_llm' || action === 'kill_llm')) refreshLlm224();
+      if (pc === 'gabriel' && (action === 'start_llm' || action === 'kill_llm' || action === 'stop_task_soft')) refreshLlm224();
       // Rafraîchir les métriques du PC concerné ~3-4s après (temps de démarrage + collecte)
       if (action === 'start_llm') {
         setTimeout(function() {
@@ -3697,6 +3979,18 @@ function fetchSolaire() {
       var frac = Math.max(0, Math.min(1, (d.prodW || 0) / 1000));
       gauge.style.transform = 'rotate(' + (-90 + 180 * frac) + 'deg)';
       prodW.style.color = prod > 1000 ? '#ef4444' : '#fbbf24';
+    }
+    // Tooltip autonomie : si prod > 50 W, combien de fois la production pour couvrir la maison ?
+    var autonomyTip = '';
+    if (prod > 50 && gw > 0) {
+      var mult = Math.ceil((gw + prod) / prod);
+      autonomyTip = ' title="Autonomie : ' + mult + 'x la production actuelle (' + prod + ' W) nécessaire pour couvrir les ' + (gw + prod) + ' W de la maison"';
+    } else if (prod > 50 && gw === 0) {
+      autonomyTip = ' title="✅ Maison autonome — production (' + prod + ' W) supérieure à la consommation"';
+    }
+    if (autonomyTip) {
+      var prodWParent = prodW.parentElement;
+      if (prodWParent) prodWParent.setAttribute('title', autonomyTip.slice(7));
     }
     prodKw.textContent = ((d.prodW || 0) / 1000).toFixed(2).replace('.', ',') + ' kW';
     prodEur.textContent = '💰 ' + eur(d.prodEurH) + ' / h · ≈ ' + eur(d.prodEurMonth) + ' / mois économisés';
@@ -4321,6 +4615,64 @@ app.get('/api/pc-shut/:pc', (req, res) => {
   res.json(shutPublic(shutJobs[req.params.pc]));
 });
 
+// ─── Arrêt soft : chemins qui marchent dans le conteneur Docker ET en local.
+// Dans le conteneur, le disque hote est monte en lecture seule sur /host,
+// et l'API GTD (portee par le hote, port 3001) est joignable via le gateway bridge.
+const POUR_IA_DIR = fs.existsSync('/host/home/lydstyl/.hermes/state/pour-ia')
+  ? '/host/home/lydstyl/.hermes/state/pour-ia'
+  : '/home/lydstyl/.hermes/state/pour-ia';
+const GTD_TOKEN_FILE = fs.existsSync('/host/home/lydstyl/.hermes/secrets/gtd-api-token')
+  ? '/host/home/lydstyl/.hermes/secrets/gtd-api-token'
+  : '/home/lydstyl/.hermes/secrets/gtd-api-token';
+async function gtdFetch(urlPath, options) {
+  // Une reponse HTTP (401 inclus) renvoie sans reessayer ; seul un echec reseau
+  // fait basculer sur la base suivante.
+  const bases = process.env.GTD_API_BASE ? [process.env.GTD_API_BASE] : ['http://172.17.0.1:3001', 'http://localhost:3001'];
+  let lastErr = null;
+  for (const base of bases) {
+    try { return await fetch(base + urlPath, options); }
+    catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('API GTD injoignable');
+}
+
+// ─── Kill LLM sur un PC — logique commune aux actions kill_llm et stop_task_soft.
+// Retourne le payload { ok, state?, result?, error? } à renvoyer au client.
+async function killLlmOnPc(pc) {
+  if (pc === 'gabriel') {
+    // .224 : deux moteurs possibles, un seul à la fois. stop-strata.sh gère Strata
+    // (serve/server.py + engine/strata) ; pkill -x llama-server gère llama.cpp.
+    // ⛔ jamais 'pkill -f llama' : les chemins des builds nvcc contiennent 'llama.cpp'.
+    const stopCmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 '~/script/stop-strata.sh >/tmp/stop-strata-dashboard.log 2>&1; pkill -x llama-server 2>/dev/null; echo OK'";
+    spawnDetached(stopCmd);   // détaché : stop-strata.sh attend la VRAM jusqu'à 60 s
+    // Retour HONNÊTE : la commande qui répond OK ne prouve rien. On interroge le port
+    // jusqu'à ce qu'il se taise, et on ne dit « Arrêté » que là.
+    let last = null;
+    for (let i = 0; i < 12; i++) {
+      await sleepMs(2000);
+      last = await probeLlama224Async(true);
+      if (!last || last.health !== true) break;
+    }
+    clearLlama224Window();
+    if (last && last.health === true) {
+      return { ok: false, state: 'running', error: 'Le port 8080 repond encore sur 192.168.3.224 (modele ' + (last.model || 'inconnu') + ') — arret NON confirme.' };
+    }
+    return { ok: true, state: 'stopped', result: 'LLM arrete — 192.168.3.224:8080 ne repond plus' };
+  }
+  let cmd;
+  if (pc === 'marie') {
+    cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.57 'pkill llama-server 2>/dev/null; echo OK'";
+  } else if (pc === 'louis') {
+    cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206 'pkill llama-server 2>/dev/null; echo OK'";
+  } else if (pc === 'boncoin') {
+    cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.249 'pkill llama-server 2>/dev/null; echo OK'";
+  } else {
+    cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'pkill llama-server 2>/dev/null; echo OK'";
+  }
+  const result = execSync(cmd, { timeout: 10000 }).toString().trim();
+  return { ok: true, result: result };
+}
+
 // ─── PC Action (POST) — direct SSH to target machine
 app.post('/api/pc-action', async (req, res) => {
   try {
@@ -4346,38 +4698,84 @@ app.post('/api/pc-action', async (req, res) => {
     }
     
     if (action === 'kill_llm') {
-      if (pc === 'gabriel') {
-        // .224 : deux moteurs possibles, un seul à la fois. stop-strata.sh gère Strata
-        // (serve/server.py + engine/strata) ; pkill -x llama-server gère llama.cpp.
-        // ⛔ jamais 'pkill -f llama' : les chemins des builds nvcc contiennent 'llama.cpp'.
-        const stopCmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 '~/script/stop-strata.sh >/tmp/stop-strata-dashboard.log 2>&1; pkill -x llama-server 2>/dev/null; echo OK'";
-        spawnDetached(stopCmd);   // détaché : stop-strata.sh attend la VRAM jusqu'à 60 s
-        // Retour HONNÊTE : la commande qui répond OK ne prouve rien. On interroge le port
-        // jusqu'à ce qu'il se taise, et on ne dit « Arrêté » que là.
-        let last = null;
-        for (let i = 0; i < 12; i++) {
-          await sleepMs(2000);
-          last = await probeLlama224Async(true);
-          if (!last || last.health !== true) break;
-        }
-        clearLlama224Window();
-        if (last && last.health === true) {
-          return res.json({ ok: false, state: 'running', error: 'Le port 8080 repond encore sur 192.168.3.224 (modele ' + (last.model || 'inconnu') + ') — arret NON confirme.' });
-        }
-        return res.json({ ok: true, state: 'stopped', result: 'LLM arrete — 192.168.3.224:8080 ne repond plus' });
+      return res.json(await killLlmOnPc(pc));
+    }
+    
+    if (action === 'stop_task_soft') {
+      // Arrêt soft : 1) récap LLM du travail en cours, 2) tâche GTD de reprise
+      // (status Pour IA), 3) kill du LLM. Si 1 ou 2 échouent, le LLM n'est PAS arrêté.
+      const pcToAgent = { marie: 'luna', gabriel: 'harry', louis: 'ron', boncoin: 'dobby' };
+      const pcToHost = { marie: '192.168.3.57', gabriel: '192.168.3.224', louis: '192.168.3.206', boncoin: '192.168.3.249' };
+      const agent = pcToAgent[pc];
+      const host = pcToHost[pc];
+      if (!agent || !host) return res.status(400).json({ ok: false, error: 'PC inconnu' });
+
+      // Source de vérité : le lock du dispatch Pour IA (tâche en cours sur ce PC)
+      const lockPath = path.join(POUR_IA_DIR, agent + '.lock');
+      if (!fs.existsSync(lockPath)) {
+        return res.json({ ok: false, error: 'Aucune tâche en cours sur ' + pc + ' (pas de lock ' + agent + ') — rien à sauvegarder' });
       }
-      let cmd;
-      if (pc === 'marie') {
-        cmd = "ssh -o StrictHostKeyChecking=no -i /root/.ssh/id_ed25519_marie gab@192.168.3.57 'pkill llama-server 2>/dev/null; echo OK'";
-      } else if (pc === 'louis') {
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.206 'pkill llama-server 2>/dev/null; echo OK'";
-      } else if (pc === 'boncoin') {
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.249 'pkill llama-server 2>/dev/null; echo OK'";
-      } else {
-        cmd = "ssh -o StrictHostKeyChecking=no gab@192.168.3.224 'pkill llama-server 2>/dev/null; echo OK'";
+      let lock;
+      try { lock = JSON.parse(fs.readFileSync(lockPath, 'utf8')); }
+      catch (e) { return res.json({ ok: false, error: 'Lock illisible : ' + e.message }); }
+      let prompt = '';
+      try { prompt = fs.readFileSync(path.join(POUR_IA_DIR, agent + '.prompt'), 'utf8').slice(0, 12000); } catch (e) { /* prompt optionnel */ }
+
+      // 1) Récap demandé au LLM lui-même (API OpenAI-compatible :8080).
+      // Le contexte est PASSE dans le prompt : llama.cpp est stateless,
+      // le LLM ne se souvient pas de la session qui le fait tourner.
+      let recap = '';
+      try {
+        const llmRes = await fetch('http://' + host + ':8080/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: [
+              { role: 'system', content: "Tu aides à interrompre proprement la tâche d'un agent LLM. Réponds en français en 3 blocs courts préfixés FAIT: / RESTE: / FICHIERS: — max 120 mots, sans préambule. Base-toi uniquement sur le prompt fourni." },
+              { role: 'user', content: 'Tâche en cours : ' + (lock.task_name || 'inconnue') + '\n\nPrompt reçu par l\'agent :\n' + prompt }
+            ],
+            max_tokens: 500,
+            temperature: 0.2
+          })
+        });
+        if (!llmRes.ok) throw new Error('HTTP ' + llmRes.status);
+        const llmJson = await llmRes.json();
+        recap = (llmJson.choices && llmJson.choices[0] && llmJson.choices[0].message && llmJson.choices[0].message.content) || '';
+        if (!recap.trim()) throw new Error('récap vide');
+      } catch (e) {
+        return res.json({ ok: false, error: 'Récap LLM impossible (' + e.message + ') — rien créé, LLM non arrêté' });
       }
-      const result = execSync(cmd, { timeout: 10000 }).toString().trim();
-      return res.json({ ok: true, result: result });
+
+      // 2) Tâche GTD de reprise (status Pour IA = remise en dispatch pour reprendre)
+      let gtdToken;
+      try { gtdToken = fs.readFileSync(GTD_TOKEN_FILE, 'utf8').trim(); }
+      catch (e) { return res.json({ ok: false, error: 'Token GTD illisible (' + e.message + ') — LLM non arrêté' }); }
+      const now = new Date().toLocaleString('fr-FR', { timeZone: 'Europe/Paris' });
+      const resumeNote = '<p><strong>Arrêt soft</strong> — ' + now + ' — PC ' + pc + ' (agent ' + agent + ')</p><p>Tâche d\'origine : <code>' + (lock.task_id || '?') + '</code> — « ' + (lock.task_name || '?') + ' »</p><h3>🧠 Récap (généré avant kill)</h3><pre>' + recap + '</pre><p>Pour reprendre : remettre cette tâche au status <strong>Pour IA</strong>.</p>';
+      let newTask;
+      try {
+        const gtdRes = await gtdFetch('/api/tasks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + gtdToken },
+          body: JSON.stringify({
+            name: '⏸ Reprise : ' + (lock.task_name || 'tâche ' + pc),
+            note: resumeNote,
+            status: 'pour_ia',
+            importance: 100
+          })
+        });
+        if (!gtdRes.ok) throw new Error('HTTP ' + gtdRes.status + ' ' + (await gtdRes.text()).slice(0, 200));
+        newTask = await gtdRes.json();
+      } catch (e) {
+        return res.json({ ok: false, error: 'Création GTD impossible (' + e.message + ') — LLM non arrêté' });
+      }
+
+      // 3) Kill du LLM (même logique que kill_llm)
+      const kill = await killLlmOnPc(pc);
+      if (!kill.ok) {
+        return res.json({ ok: true, state: kill.state, warning: 'Tâche de reprise « ' + newTask.name + ' » (' + newTask.id + ') créée MAIS kill LLM en échec : ' + (kill.error || kill.result) });
+      }
+      return res.json({ ok: true, state: kill.state, result: 'Récap → GTD « ' + newTask.name + ' » (' + newTask.id + ') — LLM arrêté' });
     }
     
     if (action === 'start_llm') {

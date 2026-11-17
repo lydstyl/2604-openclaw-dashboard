@@ -1715,6 +1715,62 @@ app.get('/api/llm-speed-7d', (req, res) => {
   }
 });
 
+// API: tâches/heure par PC — INDICATEUR DE VITESSE « nombre de tâches par heure »
+// (demande Gabriel 17/11/2026). Source de vérité : pc-task-history.json, écrit par
+// collect-pc-task-history.py (cron */15 min, déjà en place pour ce dashboard).
+// Méthode : 100 dernières tâches terminées (dur_s connu, fenêtre 30 j) → médiane de
+// durée → tâches/h = 60 min / médiane. Le détail du calcul (n, fenêtre, quartiles,
+// min/max) part dans le tooltip de survol de la jauge (côté frontend).
+app.get('/api/llm-tasks-per-hour', (req, res) => {
+  try {
+    const h = loadPcTaskHistory();
+    // Max pour l'échelle des jauges : UNIQUEMENT les 3 agents qui ont une carte PC
+    // (marie=luna, louis=ron, gabriel=harry) — sinon un agent sans carte (ex. serveur
+    // hermione, 1 tâche de 1,4 min → 43 tâches/h) fausse l'échelle relative.
+    const CARD_AGENTS = new Set(['luna', 'harry', 'ron']);
+    const byAgent = {};
+    let maxTph = 0;
+    Object.keys(h.pcs).forEach((agent) => {
+      const evs = (h.pcs[agent].events_30d || [])
+        .filter(e => e.dur_s != null)
+        .sort((a, b) => new Date(b.start) - new Date(a.start));
+      const last100 = evs.slice(0, 100);
+      if (!last100.length) {
+        byAgent[agent] = { ok: false, n: 0 };
+        return;
+      }
+      const durs = last100.map(e => e.dur_s).sort((a, b) => a - b);
+      const median = durs.length % 2
+        ? durs[(durs.length - 1) / 2]
+        : (durs[durs.length / 2 - 1] + durs[durs.length / 2]) / 2;
+      const q = (p) => durs[Math.min(durs.length - 1, Math.floor(p * durs.length))];
+      const tph = Math.round((3600 / median) * 10) / 10;
+      if (CARD_AGENTS.has(agent) && tph > maxTph) maxTph = tph;
+      byAgent[agent] = {
+        ok: true,
+        n: last100.length,
+        median_s: Math.round(median),
+        median_min: Math.round((median / 60) * 10) / 10,
+        p25_min: Math.round((q(0.25) / 60) * 10) / 10,
+        p75_min: Math.round((q(0.75) / 60) * 10) / 10,
+        min_min: Math.round((durs[0] / 60) * 10) / 10,
+        max_min: Math.round((durs[durs.length - 1] / 60) * 10) / 10,
+        tasks_per_hour: tph,
+        window: { from: last100[last100.length - 1].start, to: last100[0].start },
+      };
+    });
+    res.json({
+      ok: true,
+      generated_at: h.generated_at,
+      computed_at: h.computed_at,
+      by_agent: byAgent,
+      max_tasks_per_hour: maxTph,
+    });
+  } catch (e) {
+    res.json({ ok: false, by_agent: {}, error: e.message });
+  }
+});
+
 // Lance une commande shell DÉTACHÉE : la requête HTTP rend la main tout de suite
 // (un démarrage Strata dure 66-120 s, impossible à attendre dans une réponse HTTP).
 function spawnDetached(cmd) {
@@ -3204,6 +3260,7 @@ document.addEventListener('click', function(e){
   // ⚠️ Bloc dans une template literal : pas de backtick, pas d'antislash.
   var _llmSpeed = null;
   var _llmSpeed7d = null;
+  var _tasksPerHour = null;
 
   function speedInnerHtml(name) {
     var s = _llmSpeed;
@@ -3240,7 +3297,44 @@ document.addEventListener('click', function(e){
       '<span class="pc-speed-val">' + n.gen_tps + ' t/s</span></div>' +
       '<div class="pc-speed-bar"><div class="pc-speed-fill" style="width:' + pct.toFixed(1) + '%;background:' + col + '"></div></div>' +
       '<div class="pc-speed-row pc-speed-sub" style="margin-top:0.2rem"><span>' + sub + '</span>' +
-      '<span>' + Math.round(pct) + '% du max</span></div>' + histRow + reg;
+      '<span>' + Math.round(pct) + '% du max</span></div>' + histRow + tasksPerHourRow(name) + reg;
+  }
+
+  // ── Jauge TÂCHES/HEURE (vitesse « nombre de tâches par heure ») ────────────
+  // Source : /api/llm-tasks-per-hour → pc-task-history.json (collect-pc-task-history.py,
+  // cron 15 min). 100 dernières tâches terminées → médiane → tâches/h = 60 min / médiane.
+  // Survvol = détail du calcul (n, fenêtre, quartiles, min/max, fraîcheur).
+  // ⚠️ Template literal : pas de backtick, pas d'antislash, pas d'apostrophe
+  // dans les chaînes simples (texte du tooltip volontairement sans apostrophe).
+  var _tphCardAgent = { marie: 'luna', louis: 'ron', gabriel: 'harry' };
+  function tasksPerHourRow(name) {
+    var agent = _tphCardAgent[name];
+    if (!agent) return '';
+    if (!_tasksPerHour || !_tasksPerHour.by_agent) {
+      return '<div class="pc-speed-row" style="margin-top:0.2rem"><span>🐢 Tâches/h <span class="pc-speed-sub">médiane 100 dernières tâches</span></span><span class="pc-speed-sub">…</span></div>';
+    }
+    var t = _tasksPerHour.by_agent[agent];
+    if (!t || !t.ok) {
+      return '<div class="pc-speed-row" style="margin-top:0.2rem"><span>🐢 Tâches/h <span class="pc-speed-sub">médiane 100 dernières tâches</span></span><span class="pc-speed-sub">— (pas de données)</span></div>';
+    }
+    var max = parseFloat(_tasksPerHour.max_tasks_per_hour) || t.tasks_per_hour;
+    var pct = Math.max(3, Math.min(100, (t.tasks_per_hour / max) * 100));
+    var col = (pct > 99) ? '#22c55e' : (pct >= 60 ? '#38bdf8' : '#f59e0b');
+    var fmtDT = function(s) {
+      return new Date(s).toLocaleString('fr-FR', { timeZone: 'Europe/Paris', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+    };
+    // Entités &#10; (jamais de backslash ici : le bloc passe par une template
+    // literal serveur — le &#10; devient un saut de ligne dans le tooltip).
+    var tip = 'Vitesse = 60 min / médiane par tâche&#10;'
+      + 'Médiane : ' + t.median_min + ' min (' + t.n + ' tâches, max 100)&#10;'
+      + 'Fenêtre : ' + fmtDT(t.window.from) + ' → ' + fmtDT(t.window.to) + '&#10;'
+      + 'Quartiles : p25 ' + t.p25_min + ' min → p75 ' + t.p75_min + ' min&#10;'
+      + 'Min ' + t.min_min + ' min · Max ' + t.max_min + ' min&#10;'
+      + '→ ' + t.tasks_per_hour + ' tâches/h&#10;'
+      + 'Données : ' + (_tasksPerHour.generated_at ? fmtDT(_tasksPerHour.generated_at) : '—') + ' (collecte cron 15 min)';
+    return '<div class="pc-speed-row" style="margin-top:0.25rem"><span title="' + tip + '"><u style="text-decoration-color:#444">🐢 Tâches/h</u> <span class="pc-speed-sub">médiane ' + t.median_min + ' min</span></span>' +
+      '<span class="pc-speed-val">' + t.tasks_per_hour + ' tâche/h</span></div>' +
+      '<div class="pc-speed-bar" style="height:6px" title="' + tip + '"><div class="pc-speed-fill" style="width:' + pct.toFixed(1) + '%;background:' + col + '"></div></div>';
   }
 
   function speedBlockHtml(name) {
@@ -3264,6 +3358,13 @@ document.addEventListener('click', function(e){
   function fetchLlmSpeed7d() {
     fetch('/api/llm-speed-7d').then(function(r) { return r.json(); }).then(function(d) {
       _llmSpeed7d = d;
+      refreshSpeedBars();
+    }).catch(function() {});
+  }
+
+  function fetchLlmTasksPerHour() {
+    fetch('/api/llm-tasks-per-hour').then(function(r) { return r.json(); }).then(function(d) {
+      _tasksPerHour = d;
       refreshSpeedBars();
     }).catch(function() {});
   }
@@ -3675,6 +3776,7 @@ document.addEventListener('click', function(e){
     fetchPlugState('boncoin');
     fetchLlmSpeed();
     fetchLlmSpeed7d();
+    fetchLlmTasksPerHour();
     fetchSolaire();
   }
 

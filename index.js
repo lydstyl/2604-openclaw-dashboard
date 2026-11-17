@@ -721,7 +721,29 @@ function loadPourIA() {
   return out;
 }
 
-// Échappement HTML côté serveur (le `esc` existant est scopé dans l'handler `/`)
+// ─── ETA file Pour IA — médiane des 100 dernières tâches du PC Marie (luna) ───
+// Base de l'estimation : pc-task-history.json (collect-pc-task-history.py, cron).
+// Les 100 events luna les plus récents avec dur_s valide → médiane en minutes.
+// L'estimation affichée = pending × médiane (1 agent dispo, traitement séquentiel).
+function pourIAEstimate() {
+  try {
+    const doc = JSON.parse(fs.readFileSync(PC_TASK_HISTORY_FILE, 'utf8'));
+    const luna = (doc.pcs && doc.pcs.luna) || null;
+    const events = ((luna && luna.events) || [])
+      .filter(e => e.start && e.dur_s > 0)
+      .sort((a, b) => new Date(b.start) - new Date(a.start));
+    const last = events.slice(0, 100);
+    if (!last.length) return null;
+    const durs = last.map(e => e.dur_s).sort((a, b) => a - b);
+    const mid = Math.floor(durs.length / 2);
+    const medianS = durs.length % 2 ? durs[mid] : (durs[mid - 1] + durs[mid]) / 2;
+    return { median_min: Math.round(medianS / 60 * 10) / 10, n: last.length };
+  } catch (e) {
+    return null; // fichier absent/illisible → pas de ligne ETA, pas de crash
+  }
+}
+
+// Échappement HTML côté serveur (le `esc` existant est scopé dans le handler `/`)
 function escHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 
 // ─── Brique « GTD Pour IA » : badges cible / mode et lignes agents ─────
@@ -827,7 +849,19 @@ function buildPourIACardBody(pourIA) {
         : '<button class="extend-btn" onclick="togglePourIAPause(\'' + a + '\', true)">⏸ pause</button>';
       return '<div class="row pia-agent-row"><span class="label pia-agent-name">' + A + ' ' + badge + '</span><span class="val">' + btn + '</span></div>';
     }).join('');
+  // ETA avec 1 agent dispo : pending × médiane des 100 dernières tâches PC Marie
+  // (médiane recalculée à chaque rendu depuis pc-task-history.json).
+  let etaHtml = '';
+  if (pourIA.pending > 0) {
+    const est = pourIAEstimate();
+    if (est) {
+      const totalMin = pourIA.pending * est.median_min;
+      const etaH = Math.round(totalMin / 60 * 10) / 10;
+      etaHtml = '<div class="row" style="margin-top:0.4rem"><span class="val-muted" style="font-size:0.72rem">⏱ ≈ ' + etaH.toLocaleString('fr-FR') + ' h avec 1 agent dispo · ' + pourIA.pending + ' × ' + est.median_min.toLocaleString('fr-FR') + ' min (médiane ' + est.n + ' dernières, PC Marie)</span></div>';
+    }
+  }
   return '<div class="big-value" style="color:' + (pourIA.pending > 0 ? '#f472b6' : '#4ade80') + '">' + pourIA.pending + '<span>tâche(s) en attente' + (pourIA.working.length ? ' · ' + pourIA.working.length + ' en cours' : '') + '</span></div>'
+    + etaHtml
     + pourIAWorkingHtml
     + '<hr class="divider">'
     + pourIAAgentsHtml
@@ -1001,7 +1035,9 @@ function buildPcHistoryCardBody() {
     const genTs = h.generated_at
       ? new Date(h.generated_at).toLocaleString('fr-FR', { timeZone: 'Europe/Paris', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
       : '—';
-    return blocks
+    const pieHtml = '<div class="pch-pie-title">🥧 Répartition des tâches par PC (30 j)</div>'
+      + '<div class="pch-pie-box"><canvas id="pcHistoryPie"></canvas></div>';
+    return pieHtml + blocks
       + '<div class="row" style="margin-top:0.55rem"><span class="val-muted">Données du ' + genTs + ' · ' + h.energy_price_eur_kwh.toLocaleString('fr-FR') + ' €/kWh · watts estimés (calibrables dans collect-pc-task-history.py)</span></div>';
   } catch (e) {
     return '<div class="note">⚠️ Historique indisponible : ' + escHtml(String(e.message || e)).slice(0, 120) + '</div>';
@@ -2256,6 +2292,9 @@ app.get('/', async (req, res) => {
   .pch-k{font-size:.6rem;color:#888;text-transform:uppercase;letter-spacing:.03em}
   .pch-v{font-size:.85rem;font-weight:700;color:#d4d4d4;margin-top:.05rem}
   .pch-last{font-size:.68rem;color:#777;margin-top:.4rem;line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pch-pie-title{font-size:.7rem;color:#999;text-transform:uppercase;letter-spacing:.04em;margin-bottom:.35rem}
+  .pch-pie-box{position:relative;height:210px;max-width:300px;margin:0 auto .6rem auto;background:#141414;border-radius:6px;padding:.4rem}
+  .pch-pie-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#555;font-size:.8rem}
   .pia-badge{display:inline-block;padding:.05rem .35rem;border-radius:.25rem;font-size:.62rem;font-weight:600;line-height:1.3;border:1px solid transparent}
   .pia-target{background:#0a1a2a;color:#60a5fa;border-color:#1e3a5f}
   .pia-target-auto{background:#141414;color:#8a8a8a;border-color:#262626}
@@ -2798,6 +2837,77 @@ app.get('/', async (req, res) => {
       console.error('Erreur chargement graphique:', err);
       const placeholder = document.getElementById('chart-placeholder');
       placeholder.textContent = 'Erreur de chargement du graphique.';
+    });
+})();
+</script>
+
+<script>
+// Camembert — répartition des tâches 30 j par PC (tâche Dashboard camembert)
+(function() {
+  var canvas = document.getElementById('pcHistoryPie');
+  if (!canvas || typeof Chart === 'undefined') return;
+  fetch('/api/pc-task-history?events=0')
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (!data || !data.pcs) return;
+      var agents = Object.keys(data.pcs);
+      var labels = [], values = [];
+      agents.forEach(function(a){
+        var pc = data.pcs[a];
+        labels.push(pc.label || a);
+        values.push(pc.metrics && pc.metrics.tasks_30d ? pc.metrics.tasks_30d : 0);
+      });
+      var total = values.reduce(function(s,v){ return s + v; }, 0);
+      if (total === 0) {
+        canvas.parentElement.innerHTML = '<div class="pch-pie-empty">Aucune tâche sur 30 j.</div>';
+        return;
+      }
+      var palette = ['#4ade80','#60a5fa','#a78bfa','#fbbf24','#f87171','#22d3ee','#fb923c','#e0e0e0'];
+      var colors = labels.map(function(_,i){ return palette[i % palette.length]; });
+      new Chart(canvas.getContext('2d'), {
+        type: 'doughnut',
+        data: {
+          labels: labels,
+          datasets: [{
+            data: values,
+            backgroundColor: colors,
+            borderColor: '#111',
+            borderWidth: 2,
+            hoverOffset: 6
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          cutout: '55%',
+          plugins: {
+            legend: {
+              position: 'bottom',
+              labels: { color: '#ccc', boxWidth: 12, padding: 8, font: { size: 11 } }
+            },
+            tooltip: {
+              backgroundColor: '#1a1a1a',
+              titleColor: '#e0e0e0',
+              bodyColor: '#4ade80',
+              borderColor: '#333',
+              borderWidth: 1,
+              padding: 10,
+              displayColors: false,
+              callbacks: {
+                label: function(context) {
+                  var v = context.parsed;
+                  var pct = total ? Math.round(v / total * 100) : 0;
+                  return context.label + ' : ' + v + ' tâches (' + pct + ' %)';
+                }
+              }
+            }
+          }
+        }
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur camembert tâches:', err);
+      canvas.parentElement.innerHTML = '<div class="pch-pie-empty">Erreur de chargement.</div>';
     });
 })();
 </script>

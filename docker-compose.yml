@@ -12,6 +12,13 @@ services:
       - ./data:/app/data
       - ./.env:/app/.env:ro
       - /:/host:ro
+      # Le dossier d'etat du watchdog doit etre ECRIT par le dashboard (bouton
+      # "+30 min" : reset idle_since). Ce mount rw plus specifique masque le
+      # :ro du / general pour ce dossier uniquement.
+      - /home/lydstyl/.hermes/cron/output/pc-idle-watchdog:/host/home/lydstyl/.hermes/cron/output/pc-idle-watchdog
+      # Etat des agents GTD « Pour IA » : le dashboard ecrit les flags .paused
+      # (toggle pause de la carte). Mount rw specifique, masque le :ro du / general.
+      - /home/lydstyl/.hermes/state/pour-ia:/host/home/lydstyl/.hermes/state/pour-ia
       - ~/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
       - ~/.ssh/id_ed25519.pub:/root/.ssh/id_ed25519.pub:ro
       - ~/.ssh/id_ed25519_marie:/root/.ssh/id_ed25519_marie:ro

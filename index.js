@@ -657,12 +657,12 @@ function loadPourIA() {
           continue;
         }
         if (f.endsWith('.cooldown')) {
-          // Cooldown post-échec (30 min, posé par le wrapper / clear_stale_locks) :
+          // Cooldown post-échec (15 min, posé par le wrapper / clear_stale_locks) :
           // le dispatch exclut l'agent mais la carte le montrait « 🟢 dispo » →
           // Gabriel ne comprenait pas pourquoi Dispatch n'attribuait rien (12/11/2026).
           try {
             const age = Date.now() - fs.statSync(path.join(POUR_IA_LOCK_DIR, f)).mtimeMs;
-            const LEFT = 30 * 60 * 1000;
+            const LEFT = 15 * 60 * 1000;
             if (age < LEFT) {
               out.cooldown.push({ agent: f.replace('.cooldown', '').toUpperCase(), remaining_min: Math.max(1, Math.ceil((LEFT - age) / 60000)) });
             }
@@ -1873,6 +1873,23 @@ function getPlugPowerEntity(name) {
   return null;
 }
 
+// Anti-clignotement : les prises Zigbee (TS011F) rapportent périodiquement 0 W
+// entre deux mesures (~10 s toutes les 4-5 min, mesuré 17-18/11/2026 sur
+// prise_1_sous_tableau avec le PC à 200-300 W). On mémorise la dernière
+// puissance non nulle par entité ; une lecture 0 avec switch ON et un cache
+// récent (<90 s) renvoie le cache au lieu de faire clignoter « 0 W » sur la carte.
+const plugPowerCache = new Map(); // entityId -> { w, ts }
+function smoothedPower(entityId, power, switchOn) {
+  const now = Date.now();
+  if (power !== null && power > 0) {
+    plugPowerCache.set(entityId, { w: power, ts: now });
+    return power;
+  }
+  const c = plugPowerCache.get(entityId);
+  if (switchOn && power === 0 && c && (now - c.ts) < 90000) return c.w;
+  return power;
+}
+
 // API: get plug state + power
 app.get('/api/pc-plug-state/:name', async (req, res) => {
   const entityId = getPlugEntity(req.params.name);
@@ -1890,6 +1907,7 @@ app.get('/api/pc-plug-state/:name', async (req, res) => {
       const parsed = parseFloat(p.data.state);
       power = isNaN(parsed) ? null : parsed;
     }
+    power = smoothedPower(powerEntityId, power, r.data.state === 'on');
     // Coût au rythme actuel, au prix du kWh en vigueur (HP/HC courant)
     const priceInfo = currentEnergyPrice(loadEnergyPrices(), new Date());
     const eurH = power === null ? null : (power / 1000) * priceInfo.price;
@@ -2144,6 +2162,85 @@ app.get('/api/solaire', async (req, res) => {
   try {
     const data = await fetchSolarData();
     _solaireCache = { ts: now, data: data };
+    res.json(data);
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// ─── Solaire : historique (besoin maison = production + import EDF) ──────
+// ─── Solar history (house demand = production + grid import) ─────────────
+let _solaireHistCache = { ts: 0, data: null };
+
+async function fetchSolarHistory(hours) {
+  const h = Math.max(1, Math.min(72, parseInt(hours, 10) || 24));
+  const end = new Date();
+  const start = new Date(end.getTime() - h * 3600 * 1000);
+  const entities = [
+    'sensor.prise_solaire_puissance',
+    'sensor.prise4_cabanon_solaire_puissance',
+    'sensor.lixee_zlinky_tic_puissance_apparente'
+  ];
+  const responses = await Promise.all(
+    entities.map(id =>
+      axios.get(
+        HA_BASE + '/api/history/period/' + start.toISOString()
+          + '?end_time=' + end.toISOString()
+          + '&minimal_changes=1&entity_id=' + id
+          + '&filter_entity_id=' + id,
+        { headers: HA_HEADERS, timeout: 15000 }
+      ).catch(() => null)
+    )
+  );
+  // Rééchantillonnage en buckets de 5 min (moyenne des points du bucket)
+  const stepMs = 5 * 60 * 1000;
+  const n = Math.round((end.getTime() - start.getTime()) / stepMs);
+  const buckets = Array.from({ length: n + 1 }, (_, i) => ({
+    t: start.getTime() + i * stepMs,
+    sums: [0, 0, 0],
+    counts: [0, 0, 0]
+  }));
+  responses.forEach((res, idx) => {
+    if (!res || !res.data) return;
+    (Array.isArray(res.data) ? res.data : []).forEach(series => {
+      series.forEach(p => {
+        const v = parseFloat(p.state);
+        if (isNaN(v)) return;
+        const t = new Date(p.last_changed).getTime();
+        const bi = Math.floor((t - start.getTime()) / stepMs);
+        if (bi < 0 || bi > n) return;
+        buckets[bi].sums[idx] += v;
+        buckets[bi].counts[idx] += 1;
+      });
+    });
+  });
+  // Forward-fill : un bucket vide reprend la valeur précédente
+  const lastVal = [0, 0, 0];
+  const points = buckets.map(b => {
+    for (let i = 0; i < 3; i++) {
+      if (b.counts[i] > 0) {
+        lastVal[i] = b.sums[i] / b.counts[i];
+      }
+    }
+    const prod = lastVal[0] + lastVal[1];
+    const grid = lastVal[2];
+    const need = prod + grid;
+    const sat = need > 1 ? Math.round((prod / need) * 100) : 100;
+    return { t: b.t, prod: Math.round(prod), grid: Math.round(grid), need: Math.round(need), sat: sat };
+  });
+  return { ok: true, hours: h, stepMin: 5, points: points };
+}
+
+app.get('/api/solaire-history', async (req, res) => {
+  const hours = parseInt(req.query.hours, 10) || 24;
+  const key = 'h' + hours;
+  const now = Date.now();
+  if (_solaireHistCache.data && _solaireHistCache.key === key && (now - _solaireHistCache.ts) < 10000) {
+    return res.json(_solaireHistCache.data);
+  }
+  try {
+    const data = await fetchSolarHistory(hours);
+    _solaireHistCache = { ts: now, key: key, data: data };
     res.json(data);
   } catch (e) {
     res.json({ ok: false, error: e.message });
@@ -2603,6 +2700,10 @@ app.get('/', async (req, res) => {
         <div class="solaire-eur" id="energie-grid-eur" style="color:#60a5fa">—</div>
         <div class="solaire-detail" id="energie-grid-detail">—</div>
       </div>
+    </div>
+    <div style="margin-top:0.9rem">
+      <div class="solaire-col-label">📈 Besoin de la maison — 24 h <span style="color:#444">(production + import EDF)</span></div>
+      <div style="height:170px;position:relative"><canvas id="energie-history-chart"></canvas></div>
     </div>
     <div class="solaire-grid-sub" id="energie-net" style="margin-top:0.6rem">—</div>
     <div class="solaire-grid-badge" id="energie-badge"></div>
@@ -3778,6 +3879,7 @@ document.addEventListener('click', function(e){
     fetchLlmSpeed7d();
     fetchLlmTasksPerHour();
     fetchSolaire();
+    fetchSolaireHistory();
   }
 
   // Prolonger le compte à rebours d'extinction d'un PC de 30 min (reset idle_since
@@ -4129,6 +4231,53 @@ document.addEventListener('click', function(e){
 
 function fetchSolaire() {
     fetch('/api/solaire').then(function(r){return r.json();}).then(function(d){renderEnergie(d);}).catch(function(e){console.error('solaire:',e);});
+  }
+
+  var _energyHistChart = null;
+  function renderEnergyHistory(d) {
+    var canvas = document.getElementById('energie-history-chart');
+    if (!canvas) return;
+    if (!d || !d.ok || !d.points || !d.points.length) return;
+    var labels = d.points.map(function(p) {
+      return new Date(p.t).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' });
+    });
+    var cfg = {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [
+          { label: 'Production', data: d.points.map(function(p){ return p.prod; }), backgroundColor: 'rgba(251,191,36,0.35)', borderColor: '#fbbf24', borderWidth: 1, pointRadius: 0, fill: true, stack: 'need', tension: 0.3, yAxisID: 'y' },
+          { label: 'Import EDF', data: d.points.map(function(p){ return p.grid; }), backgroundColor: 'rgba(96,165,250,0.35)', borderColor: '#60a5fa', borderWidth: 1, pointRadius: 0, fill: true, stack: 'need', tension: 0.3, yAxisID: 'y' },
+          { label: 'Production / besoin', data: d.points.map(function(p){ return p.sat; }), borderColor: '#22c55e', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.3, yAxisID: 'y1' }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { labels: { color: '#888', boxWidth: 12, font: { size: 10 } } },
+          tooltip: { callbacks: { label: function(ctx) {
+            var v = ctx.parsed.y;
+            return ctx.dataset.label + ' : ' + (ctx.datasetIndex === 2 ? v + ' %' : Math.round(v) + ' W');
+          } } }
+        },
+        scales: {
+          x: { ticks: { color: '#555', maxTicksLimit: 8, font: { size: 9 } }, grid: { color: '#1a1a1a' } },
+          y: { stacked: true, ticks: { color: '#555', callback: function(v){ return v >= 1000 ? (v / 1000).toLocaleString('fr-FR') + ' kW' : v + ' W'; } }, grid: { color: '#1a1a1a' } },
+          y1: { position: 'right', min: 0, max: 100, ticks: { color: '#22c55e', callback: function(v){ return v + ' %'; } }, grid: { drawOnChartArea: false } }
+        }
+      }
+    };
+    if (_energyHistChart) {
+      _energyHistChart.data = cfg.data;
+      _energyHistChart.update('none');
+    } else {
+      _energyHistChart = new Chart(canvas, cfg);
+    }
+  }
+  function fetchSolaireHistory() {
+    fetch('/api/solaire-history?hours=24').then(function(r){return r.json();}).then(renderEnergyHistory).catch(function(e){console.error('solaire-history:',e);});
   }
 
   function renderEnergie(d) {

@@ -74,3 +74,46 @@ describe('e2e smoke', () => {
     expect(r.status).toBe(404);
   });
 });
+
+// Routes API locales (lues via __dirname/data, sans I/O réseau) — e2e hôte.
+// Les routes /app/... et /host/... (llm-speed, pc-task-history, watchdog) sont
+// conteneur-only (mounts) → testées via l'instance dev, pas ici.
+describe('e2e — routes API locales', () => {
+  it('GET /api/card-visibility → 200 + objet', async () => {
+    const r = await fetch(`${BASE}/api/card-visibility`);
+    expect(r.status).toBe(200);
+    const data = await r.json();
+    expect(typeof data).toBe('object');
+    expect(Array.isArray(data)).toBe(false);
+  });
+
+  it('GET /api/card-order → 200 + { ok, order: [] }', async () => {
+    const r = await fetch(`${BASE}/api/card-order`);
+    expect(r.status).toBe(200);
+    const data = await r.json();
+    expect(data.ok).toBe(true);
+    expect(Array.isArray(data.order)).toBe(true);
+  });
+
+  it('GET /api/links → 200 + { ok, links: [] }', async () => {
+    const r = await fetch(`${BASE}/api/links`);
+    expect(r.status).toBe(200);
+    const data = await r.json();
+    expect(data.ok).toBe(true);
+    expect(Array.isArray(data.links)).toBe(true);
+  });
+
+  it('GET /api/energy-prices → 200 + { ok: true }', async () => {
+    const r = await fetch(`${BASE}/api/energy-prices`);
+    expect(r.status).toBe(200);
+    const data = await r.json();
+    expect(data.ok).toBe(true);
+  });
+
+  it('GET /api/top-processes → 200 + JSON', async () => {
+    const r = await fetch(`${BASE}/api/top-processes`);
+    expect(r.status).toBe(200);
+    const data = await r.json();
+    expect(data).toBeTruthy();
+  });
+});

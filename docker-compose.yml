@@ -25,4 +25,5 @@ services:
       - ~/.ssh/id_ed25519_marie.pub:/root/.ssh/id_ed25519_marie.pub:ro
       - ~/.ssh/known_hosts:/root/.ssh/known_hosts:ro
       - ./index.js:/app/index.js:ro
+      - ./lib:/app/lib:ro
       - ./sortable.min.js:/app/sortable.min.js:ro

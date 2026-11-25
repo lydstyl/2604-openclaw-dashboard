@@ -25,28 +25,30 @@ sans aucun affichage de fraîcheur côté page :
    c'est le seuil demandé par Gabriel.
 4. Test unitaire du calcul « il y a X min » + du badge stale (lib/dates.js existe déjà).
 
-## 2. Archi — clean archi + tests + env dev
+## 2. Archi — clean archi + tests + env dev  ✅ (25/11/2026, Luna)
 
-**État actuel (git status)** :
-```
- M index.js            2521 lignes (~200 fonctions) — monolithe partiel
- M docker-compose.yml  (prod uniquement, port 3015)
-?? lib/                EXTRAITS NON COMMITTÉS : dates, energy, pc, pour-ia, render, usage, page.js (2369 l.)
-?? __tests__/          7 fichiers NON COMMITTÉS — 86 tests PASSENT (vitest, 3,4 s)
-```
+**Fait (commits f3f48cd → 676fd68 → ce commit) :**
+1. ✅ **Refacto commitée** : `lib/` (dates, energy, pc, pour-ia, render, usage, page)
+   + `__tests__/` + `index.js` + compose + package — dans le dépôt (plus « volé »).
+2. ✅ **Env dev dockerisé** : `docker-compose.dev.yml` (miroir prod, port 3028,
+   `./index.js` + `./lib` en ro). Bug corrigé : le nginx stale routait
+   `dev.dashboard.lan` → 3027 (« Liste Sites ») au lieu de 3028 ; régénéré via
+   `gen-gab-lan.py`. Le process pm2 nu (openclaw-dash-dev) remplacé par le conteneur
+   (`restart: unless-stopped`, survit au reboot). Vérifié : `dev.dashboard.lan` 200
+   « Dashboard », prod 3015 intact.
+3. ✅ **Tests e2e étendus** : +5 routes locales (card-visibility, card-order, links,
+   energy-prices, top-processes). Les routes `/app/…` et `/host/…` = conteneur-only.
+4. ⏳ **Extraction index.js** : `lib/plugs.js` (getPlugEntity, getPlugPowerEntity,
+   smoothedPower — anti-clignotement testable via `now` injectable) + `lib/occ.js`
+   (occSlotsStats) extraits. **106 tests verts** (vitest, ~3,2 s).
 
-**À faire** :
-1. **Committer la refacto en cours** : `lib/` + `__tests__/` sont en untracked —
-   le travail est fait mais volé au dépôt.
-2. **Terminer l'extraction d'index.js** : isoler les adaptateurs I/O restants
-   (SSH sonde, watchdog, LLM224, pour-ia locks) dans `lib/` ; index.js ne doit
-   contenir que routes + wiring (convention du header index.js).
-3. **Tests** : unitaires OK (86 ✅) ; ajouter des tests e2e sur les routes
-   principales (`/`, `/api/*`) — un `e2e.test.js` existe, l'étendre.
-4. **Env dev manquant** : créer `docker-compose.dev.yml` + `dev.openclaw-dash.lan`
-   (convention `dev.<app>.lan`, cf. skill dev-env et le `dashboard` app qui a le sien).
-   Le compose prod mount `./index.js` et `./lib` en ro → l'env dev doit pointer
-   sur le même dossier pour tester le code live.
+**Reste (prochain incrément — adaptateurs I/O, plus risqué) :**
+- Isoler les adaptateurs I/O restants dans `lib/` : sonde SSH (sshReachable,
+  sshLlmReady, runBootJob, runShutJob, killLlmOnPc), watchdog (loadWatchdogState),
+  LLM224 (probeLlama224, occProbeNode, getOccupancy), HTTP HA (haSwitch*, haPlugPowerW),
+  credits (getOllamaUsage, getKimi/DeepSeekCredits). index.js → routes + wiring.
+- Chaque extraction : function auto-contenue + unit test + boot dev vérifié (pattern plugs/occ).
+
 
 ## 3. Freelance — commits + workly + synthèse heures + facture
 

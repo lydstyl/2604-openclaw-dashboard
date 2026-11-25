@@ -17,6 +17,8 @@ const { parseParisNaive, hhmmNaive,
         hcWindows: hcWindowsFrom, hcWindowsLabel: hcWindowsLabelFrom } = require('./lib/dates');
 const { currentEnergyPrice: currentEnergyPriceFrom, parseSolarValue } = require('./lib/energy');
 const { renderPage } = require('./lib/page');
+const { getPlugEntity, getPlugPowerEntity, smoothedPower } = require('./lib/plugs');
+const { occSlotsStats } = require('./lib/occ');
 
 
 const app  = express();
@@ -1111,26 +1113,7 @@ function occJson(host, port, urlPath) {
 
 // /slots[].n_prompt_tokens = le DERNIER prompt traité (ni moyenne ni historique), n_ctx = le
 // contexte DU SLOT (llama.cpp avec -np 2 renvoie le contexte par slot, pas le total).
-function occSlotsStats(slots) {
-  const out = { slots: 0, active: 0, prompt_tokens: null, n_ctx: null, perSlot: [] };
-  if (!Array.isArray(slots) || slots.length === 0) return out;
-  out.slots = slots.length;
-  let best = null;
-  slots.forEach((s, i) => {
-    if (!s || typeof s !== 'object') return;
-    if (s.is_processing === true) out.active += 1;
-    const p = (typeof s.n_prompt_tokens === 'number' && s.n_prompt_tokens > 0) ? s.n_prompt_tokens : null;
-    if (p !== null) out.perSlot.push({ id: (typeof s.id === 'number') ? s.id : i, p: p });
-    if (p !== null && (best === null || p > best.p)) {
-      best = { p: p, n: (typeof s.n_ctx === 'number' && s.n_ctx > 0) ? s.n_ctx : null };
-    }
-  });
-  if (best) {
-    out.prompt_tokens = best.p;
-    out.n_ctx = best.n;
-  }
-  return out;
-}
+// occSlotsStats → lib/occ.js (extrait monolithe, [1/3] Archi 25/11)
 
 // ≈ Compactions : un serveur LLM ne voit que des requêtes HTTP, une compaction est un
 // événement du HARNAIS (réécriture de l'historique). Suivi PAR SLOT : une chute de plus de
@@ -1538,38 +1521,8 @@ app.get('/api/top-processes', (req, res) => {
 const HA_BASE = 'http://192.168.3.167:8123';
 const HA_HEADERS = { Authorization: `Bearer ${HA_TOKEN}`, 'Content-Type': 'application/json' };
 
-function getPlugEntity(name) {
-  if (name === 'gabriel') return 'switch.prise_1_sous_tableau_commutateur';
-  if (name === 'louis') return 'switch.bouilloire_commutateur';
-  if (name === 'marie') return 'switch.prise3';
-  if (name === 'boncoin') return 'switch.cuisine_prisepcboncoin';
-  return null;
-}
-
-function getPlugPowerEntity(name) {
-  if (name === 'gabriel') return 'sensor.prise_1_sous_tableau_puissance';
-  if (name === 'louis') return 'sensor.bouilloire_puissance';
-  if (name === 'marie') return 'sensor.prise3_puissance';
-  if (name === 'boncoin') return 'sensor.cuisine_prisepcboncoin_puissance';
-  return null;
-}
-
-// Anti-clignotement : les prises Zigbee (TS011F) rapportent périodiquement 0 W
-// entre deux mesures (~10 s toutes les 4-5 min, mesuré 17-18/11/2026 sur
-// prise_1_sous_tableau avec le PC à 200-300 W). On mémorise la dernière
-// puissance non nulle par entité ; une lecture 0 avec switch ON et un cache
-// récent (<90 s) renvoie le cache au lieu de faire clignoter « 0 W » sur la carte.
-const plugPowerCache = new Map(); // entityId -> { w, ts }
-function smoothedPower(entityId, power, switchOn) {
-  const now = Date.now();
-  if (power !== null && power > 0) {
-    plugPowerCache.set(entityId, { w: power, ts: now });
-    return power;
-  }
-  const c = plugPowerCache.get(entityId);
-  if (switchOn && power === 0 && c && (now - c.ts) < 90000) return c.w;
-  return power;
-}
+// getPlugEntity / getPlugPowerEntity / smoothedPower → lib/plugs.js
+// (extrait monolithe, [1/3] Archi 25/11 — mapping entités HA + anti-clignotement)
 
 // API: get plug state + power
 app.get('/api/pc-plug-state/:name', async (req, res) => {
